@@ -1,0 +1,8 @@
+{
+  "name": "wave-realtime-edge",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "deploy": "wrangler deploy" },
+  "devDependencies": { "wrangler": "^4.50.0" }
+}

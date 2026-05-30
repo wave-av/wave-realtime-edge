@@ -1,0 +1,6 @@
+# wave-realtime-edge — code owners (review required on every PR).
+# Layer-1 Edge: WebRTC SFU for browser-first 2-way interactive media. Sibling to wave-moq-edge.
+* @wave-av/streaming-team
+/src/      @wave-av/streaming-team
+/.github/  @wave-av/streaming-team
+/wrangler.toml @wave-av/streaming-team

@@ -1,0 +1,9 @@
+name = "wave-realtime-edge"
+main = "src/worker.ts"
+compatibility_date = "2026-04-15"
+compatibility_flags = ["nodejs_compat"]
+
+[[unsafe.bindings]]
+type = "plain_text"
+name = "FOUNDATION_VERSION"
+text = "scaffold"
