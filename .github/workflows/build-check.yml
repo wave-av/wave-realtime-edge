@@ -1,0 +1,40 @@
+name: build-check
+
+# Thin package-era WAVE spoke. The source consumes @wave-av/spoke-chassis (GitHub Packages, org-
+# Internal), so `npm install` needs registry auth: `packages: read` on GITHUB_TOKEN + NODE_AUTH_TOKEN
+# (consumed by the repo .npmrc, which points the @wave-av scope at npm.pkg.github.com). The package
+# must be org-Internal-visible for a sibling repo's GITHUB_TOKEN to read it.
+#
+# The gate proves the spoke compiles and bundles for deploy WITHOUT publishing or CF creds:
+#   npm install → tsc --noEmit → wrangler deploy --dry-run
+# It is matched to THIS spoke's real scripts (no pages/ workspace, no vitest) per its generated shape —
+# requiring nonexistent checks would just fail-red forever.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  build:
+    name: build (typecheck · dry-run)
+    runs-on: ubuntu-latest
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: install
+        run: npm install
+      - name: typecheck (tsc --noEmit)
+        run: npm run typecheck
+      - name: wrangler deploy --dry-run (no publish, no CF creds)
+        run: npm run deploy:dry

@@ -1,0 +1,41 @@
+# WAVE subdomain spoke — deploy workflow (lift this into the spoke's OWN repo as
+# .github/workflows/deploy.yml). wave-foundation is NOT a product host — spokes deploy from their repo.
+#
+# Deploys via Cloudflare Wrangler using repo/org secrets (already configured: CLOUDFLARE_API_TOKEN,
+# CLOUDFLARE_ACCOUNT_ID). Manual by default (workflow_dispatch) so a production subdomain never goes
+# live on an accidental push; flip the `push` trigger on once you want continuous deploy.
+#
+# Action refs use tags; Renovate/pinact will pin them to SHAs in-repo.
+
+name: deploy spoke
+
+on:
+  workflow_dispatch: {} # one-click, controlled production deploy
+  # push:
+  #   branches: [main]   # uncomment for deploy-on-merge once the subdomain is meant to be live
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-spoke-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci || npm install
+      - name: Deploy with Wrangler
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        # wrangler reads wrangler.jsonc (name, main, the <sub>.wave.online/* route)

@@ -1,8 +1,19 @@
 {
   "name": "wave-realtime-edge",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
-  "scripts": { "deploy": "wrangler deploy" },
-  "devDependencies": { "wrangler": "^4.50.0" }
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "deploy": "wrangler deploy",
+    "deploy:dry": "wrangler deploy --dry-run --outdir /tmp/dry"
+  },
+  "dependencies": {
+    "@wave-av/spoke-chassis": "^0.1.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240000.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.50.0"
+  }
 }

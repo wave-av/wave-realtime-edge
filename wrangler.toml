@@ -1,9 +1,25 @@
+# wave-realtime-edge — WAVE Realtime control/event plane on Cloudflare Durable Objects.
 name = "wave-realtime-edge"
 main = "src/worker.ts"
 compatibility_date = "2026-04-15"
 compatibility_flags = ["nodejs_compat"]
+workers_dev = false
 
-[[unsafe.bindings]]
-type = "plain_text"
-name = "FOUNDATION_VERSION"
-text = "scaffold"
+# Production route (bound on deploy; gated until then).
+routes = [{ pattern = "realtime.wave.online", custom_domain = true }]
+
+[observability]
+enabled = true
+
+[vars]
+GATEWAY_ORIGIN = "https://api.wave.online"
+
+# One Durable Object per channel = the authoritative live room (presence + sockets + history ring).
+[[durable_objects.bindings]]
+name = "CHANNEL"
+class_name = "Channel"
+
+# SQLite-backed DO storage (current default) so the history ring survives hibernation.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Channel"]
