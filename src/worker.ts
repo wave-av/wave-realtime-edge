@@ -20,16 +20,11 @@
 import { Channel } from "./channel";
 import { landingPage } from "./landing";
 import type { Env } from "./types";
+import { federateVerify } from "./auth";
 
 export { Channel };
 
 const CHANNEL_RE = /^[a-z0-9]([a-z0-9:_-]{0,127})$/i; // namespaced ids like "stream:abc", "room:xyz"
-
-function bearer(req: Request): string | null {
-  const h = req.headers.get("Authorization") || "";
-  const m = /^Bearer\s+(.+)$/i.exec(h);
-  return m ? m[1].trim() : null;
-}
 
 function unauthorized(): Response {
   return Response.json(
@@ -56,9 +51,13 @@ export default {
       return new Response(landingPage(), { headers: { "content-type": "text/html; charset=utf-8" } });
     }
 
-    // ── /v1 realtime API (auth required) ─────────────────────────────────────────
+    // ── /v1 realtime API (auth required — federated to the gateway, ADR-1) ───────
     if (p.startsWith("/v1/")) {
-      if (!bearer(req)) return unauthorized();
+      // Realtime never validates keys locally: the gateway's /v1/verify is the canonical resolver.
+      const who = await federateVerify(req, env);
+      if (!who) return unauthorized();
+      // NOTE: per-op scope (realtime:read on connect, realtime:publish on publish) is enforced once the
+      // gateway scope map carries realtime scopes (#108 follow-up); today a valid entitled key suffices.
 
       // WS subscribe
       if (p === "/v1/connect") {
@@ -67,7 +66,10 @@ export default {
         }
         const channel = url.searchParams.get("channel") || "";
         if (!CHANNEL_RE.test(channel)) return Response.json({ error: "BAD_CHANNEL", detail: "channel must match [a-z0-9][a-z0-9:_-]{0,127}" }, { status: 400 });
-        return routeToChannel(env, channel, req);
+        // Attribute presence to the caller's key prefix when no explicit member id was given.
+        const fwd = new URL(req.url);
+        if (!fwd.searchParams.get("as")) fwd.searchParams.set("as", who.keyPrefix || who.organizationId);
+        return routeToChannel(env, channel, new Request(fwd.toString(), req));
       }
 
       // REST channel ops: /v1/channels/:id/(publish|presence|history)
