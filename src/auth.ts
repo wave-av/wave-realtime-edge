@@ -12,9 +12,18 @@ export interface Principal {
 
 const GATEWAY_DEFAULT = "https://api.wave.online";
 
-/** Verify the request's Bearer against the gateway's /v1/verify. Returns the principal or null. */
+/**
+ * Verify the request's Bearer against the gateway's /v1/verify. Returns the principal or null.
+ * Accepts the key via the `Authorization: Bearer` header OR a `?access_token=` query param — browser
+ * WebSocket clients (and the SDK's RealtimeChannel) can't set headers on the upgrade, so the token
+ * rides the query over wss. The token is forwarded to the gateway as a Bearer; never logged.
+ */
 export async function federateVerify(req: Request, env: Env): Promise<Principal | null> {
-  const auth = req.headers.get("Authorization");
+  let auth = req.headers.get("Authorization");
+  if (!auth) {
+    const qp = new URL(req.url).searchParams.get("access_token");
+    if (qp) auth = `Bearer ${qp}`;
+  }
   if (!auth || !/^Bearer\s+\S/i.test(auth)) return null;
   const origin = (env.GATEWAY_ORIGIN || GATEWAY_DEFAULT).replace(/\/+$/, "");
   try {
