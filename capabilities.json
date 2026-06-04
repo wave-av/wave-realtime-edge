@@ -1,0 +1,28 @@
+{
+  "schemaVersion": "1",
+  "repo": "wave-av/wave-realtime-edge",
+  "version": "0.1.0",
+  "lifecycle": "alpha",
+  "planeLayer": 1,
+  "foundationPin": "v1",
+  "maintainers": [{ "team": "core" }],
+  "exposes": {
+    "apis": [
+      { "protocol": "webrtc-whip", "endpoint": "https://rt.wave.online/whip/{stream-key}", "auth": "wave-token-v1", "metered": true },
+      { "protocol": "webrtc-whep", "endpoint": "https://rt.wave.online/whep/{slug}", "auth": "wave-token-v1", "metered": true }
+    ]
+  },
+  "consumes": {
+    "thirdParty": [
+      { "service": "cloudflare-realtime", "licenseGated": false }
+    ],
+    "foundationFrameworks": ["frameworks/protocol-plane", "frameworks/platform-registry"]
+  },
+  "events": {
+    "publishes": [
+      { "topic": "rtc.session.opened", "transport": "x402-meter" },
+      { "topic": "rtc.session.closed", "transport": "x402-meter" }
+    ]
+  },
+  "tags": ["edge", "public", "webrtc", "sfu", "x402-metered", "protocol-plane-layer-1"]
+}
