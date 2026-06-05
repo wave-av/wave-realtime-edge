@@ -3,6 +3,13 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "scripts": { "deploy": "wrangler deploy" },
-  "devDependencies": { "wrangler": "^4.50.0" }
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "vitest": "3.2.3",
+    "wrangler": "^4.50.0"
+  }
 }
