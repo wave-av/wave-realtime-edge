@@ -51,4 +51,6 @@ program exists to eliminate).
 ## ⛔ Gating
 
 Spokes built from this template depend on Wave 0. Do not point a live `*.wave.online` route at a spoke
-until the wave-gateway is merged + live, or requests will reach the origin with NO enforcement plane.
+until the wave-gateway is deployed in front of it. The gateway is a hard prerequisite: spoke
+origins are designed to trust that authentication, authorization, and payment enforcement have
+already happened upstream, so a spoke must never be the first hop for a live route.
