@@ -1,0 +1,323 @@
+openapi: 3.1.0
+info:
+  title: WAVE Realtime API
+  version: 0.0.0
+  description: |
+    Edge WebRTC SFU for browser-first, bidirectional interactive media — rooms,
+    voice agents, and calls. Layer 1 (Edge) of the WAVE Protocol Plane.
+
+    **Status: scaffold / alpha.** The Worker currently implements `/health` only.
+    All protocol routes (`/whip`, `/whep`, and WebSocket connect) return
+    `501 REALTIME_NOT_IMPLEMENTED` pending the substrate decision
+    (custom SFU on Durable Objects vs. LiveKit).  Endpoints for those routes are
+    documented below based on `capabilities.json` intent; each carries an
+    `x-lifecycle: planned` extension and a `501` response to reflect the current
+    state.
+
+    ### Authentication
+    Requests carry a `wave-token-v1` Bearer token.  Auth and entitlement
+    enforcement are **delegated to the wave-gateway** upstream; the edge worker
+    forwards `Authorization` untouched without making access decisions.
+
+    ### x402 / Payment metering
+    Per-connection metering is planned (`x402-metered` tag in capabilities.json;
+    events `rtc.session.opened` / `rtc.session.closed` on the `x402-meter`
+    transport).  The `402 Payment Required` + `WWW-Authenticate: Payment` flow
+    is documented below for the WHIP/WHEP endpoints to match the forthcoming
+    gateway enforcement pattern; it is **not yet enforced by this worker**.
+
+  contact:
+    name: WAVE Online
+    url: https://wave.online
+  license:
+    name: See LICENSE
+    url: https://github.com/wave-av/wave-realtime-edge/blob/master/LICENSE
+
+servers:
+  - url: https://rt.wave.online
+    description: Production edge (Cloudflare Workers)
+
+tags:
+  - name: observability
+    description: Health and liveness checks
+  - name: ingest
+    description: WebRTC WHIP — publish a media track
+  - name: egress
+    description: WebRTC WHEP — subscribe to a media track
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Health check
+      description: |
+        Returns liveness state for the worker.  No auth required.
+        This is the **only endpoint currently implemented** (all others return 501).
+      tags: [observability]
+      security: []
+      responses:
+        "200":
+          description: Worker is live
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                ok: true
+                service: wave-realtime-edge
+                layer: edge
+                protocol: webrtc-sfu
+                version: dev
+        "429":
+          description: Rate limited by Cloudflare or the upstream gateway
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /whip/{streamKey}:
+    post:
+      operationId: whipPublish
+      summary: Publish a WebRTC track (WHIP)
+      description: |
+        WebRTC-HTTP Ingestion Protocol (WHIP, draft-ietf-wish-whip) endpoint.
+        The client POSTs an SDP offer; the server responds with an SDP answer and
+        creates a Cloudflare Realtime session.
+
+        **Not yet implemented — returns 501.**  The endpoint and auth model are
+        captured here from `capabilities.json`.
+      tags: [ingest]
+      x-lifecycle: planned
+      parameters:
+        - $ref: "#/components/parameters/StreamKey"
+      security:
+        - waveTokenV1: []
+        - x402Payment: []
+      requestBody:
+        required: true
+        content:
+          application/sdp:
+            schema:
+              type: string
+              description: SDP offer body
+      responses:
+        "201":
+          description: SDP answer; ICE candidates follow via Link header
+          content:
+            application/sdp:
+              schema:
+                type: string
+                description: SDP answer
+          headers:
+            Location:
+              description: Resource URL for the established WHIP session
+              schema:
+                type: string
+                format: uri
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "402":
+          $ref: "#/components/responses/PaymentRequired"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /whep/{slug}:
+    post:
+      operationId: whepSubscribe
+      summary: Subscribe to a WebRTC track (WHEP)
+      description: |
+        WebRTC-HTTP Egress Protocol (WHEP, draft-ietf-wish-whep) endpoint.
+        The client POSTs an SDP offer for a named media resource identified by
+        `slug`; the server responds with an SDP answer.
+
+        **Not yet implemented — returns 501.**
+      tags: [egress]
+      x-lifecycle: planned
+      parameters:
+        - $ref: "#/components/parameters/Slug"
+      security:
+        - waveTokenV1: []
+        - x402Payment: []
+      requestBody:
+        required: true
+        content:
+          application/sdp:
+            schema:
+              type: string
+              description: SDP offer body
+      responses:
+        "201":
+          description: SDP answer
+          content:
+            application/sdp:
+              schema:
+                type: string
+                description: SDP answer
+          headers:
+            Location:
+              description: Resource URL for the established WHEP session
+              schema:
+                type: string
+                format: uri
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "402":
+          $ref: "#/components/responses/PaymentRequired"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+components:
+  parameters:
+    StreamKey:
+      name: streamKey
+      in: path
+      required: true
+      description: Opaque publish key identifying the stream slot
+      schema:
+        type: string
+        minLength: 1
+
+    Slug:
+      name: slug
+      in: path
+      required: true
+      description: Opaque slug identifying the media resource to subscribe to
+      schema:
+        type: string
+        minLength: 1
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid `wave-token-v1` Bearer token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: UNAUTHORIZED
+            message: "Missing or invalid Authorization header"
+
+    PaymentRequired:
+      description: |
+        x402 payment challenge. The gateway issues this when the caller has not
+        pre-authorized the per-connection charge.  The client should settle
+        on-chain and retry with `Authorization: Payment <settlement>`.
+      headers:
+        WWW-Authenticate:
+          description: |
+            Payment challenge parameters:
+            `realm`, `amount` (in minor units), `asset` (token contract),
+            `network` (chain ID), `payTo` (treasury address), `nonce`.
+          schema:
+            type: string
+            example: >-
+              Payment realm="wave", amount="1000", asset="0xUSDC",
+              network="8453", payTo="0xTREASURY", nonce="abc123"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/PaymentChallenge"
+
+    NotImplemented:
+      description: Endpoint not yet implemented (scaffold stage)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: REALTIME_NOT_IMPLEMENTED
+            path: /whip/my-key
+
+  schemas:
+    HealthResponse:
+      type: object
+      required: [ok, service, layer, protocol, version]
+      properties:
+        ok:
+          type: boolean
+          description: Always `true` when the worker is live
+        service:
+          type: string
+          description: Service identifier
+          example: wave-realtime-edge
+        layer:
+          type: string
+          description: Protocol Plane layer identifier
+          example: edge
+        protocol:
+          type: string
+          description: Protocol handled by this worker
+          example: webrtc-sfu
+        version:
+          type: string
+          description: Deployed version string
+          example: dev
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Machine-readable error code
+          example: REALTIME_NOT_IMPLEMENTED
+        message:
+          type: string
+          description: Human-readable description (optional)
+        path:
+          type: string
+          description: Request path that triggered the error (present on 501s)
+
+    PaymentChallenge:
+      type: object
+      description: |
+        Structured form of the x402 payment challenge returned in the 402 body.
+        The canonical challenge is in the `WWW-Authenticate: Payment …` header;
+        this JSON body is a convenience for clients that cannot read raw headers.
+      required: [realm, amount, asset, network, payTo, nonce]
+      properties:
+        realm:
+          type: string
+          description: Service realm
+          example: wave
+        amount:
+          type: string
+          description: Charge amount in token minor units (e.g. USDC 6-decimal)
+          example: "1000"
+        asset:
+          type: string
+          description: On-chain token contract address
+          example: "0xUSDC"
+        network:
+          type: string
+          description: EIP-155 chain ID as a string
+          example: "8453"
+        payTo:
+          type: string
+          description: Treasury address to pay
+          example: "0xTREASURY"
+        nonce:
+          type: string
+          description: One-time nonce; must be included in the settlement proof
+          example: abc123
+
+  securitySchemes:
+    waveTokenV1:
+      type: http
+      scheme: bearer
+      description: |
+        `wave-token-v1` Bearer token issued by the WAVE gateway.
+        Pass as `Authorization: Bearer <token>`.
+        The edge worker forwards this header to the gateway; auth decisions
+        are made upstream, not in the edge worker itself.
+
+    x402Payment:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: |
+        On-chain payment settlement for metered connections (x402).
+        After receiving a `402` challenge, settle the on-chain charge and retry
+        with `Authorization: Payment <base64-settlement-proof>`.
+        The edge worker forwards the `X-Payment` / `Authorization: Payment`
+        header upstream for verification.
