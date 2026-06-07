@@ -1,41 +1,56 @@
 # wave-realtime-edge
 
-**WAVE realtime edge** — an edge WebRTC SFU for browser-first, 2-way interactive media (rooms, calls, voice agents). It is Layer 1 (Edge) of the [WAVE Protocol Plane](https://github.com/wave-av/wave-foundation/blob/master/frameworks/protocol-plane/README.md) and the sibling to `wave-moq-edge` (1-to-many broadcast).
+> **WAVE realtime edge — browser-first 2-way interactive media.** Edge WebRTC SFU for rooms, calls,
+> and voice agents. Layer 1 of the WAVE Protocol Plane.
 
-Runs on Cloudflare Workers.
+Like Stripe is for payments and Resend is for email — **WAVE is for live streaming and video.** This
+spoke is the interactive media layer: 2-way N-N calls and voice agents, the complement to
+`wave-moq-edge` (1-to-many broadcast).
 
 ## Status
 
-**Early / scaffold.** The Worker currently serves only `/health`; all other routes return `501 REALTIME_NOT_IMPLEMENTED`. The substrate decision — a custom SFU on Workers + Durable Objects vs. consuming LiveKit (see the `realtime-media` framework) — is Wave-1 work and not yet made.
+**Early scaffold.** The Worker serves `/health`; all other routes return `501 REALTIME_NOT_IMPLEMENTED`.
+The substrate decision — custom SFU on Workers + Durable Objects vs. LiveKit — is Wave-1 work and
+not yet made.
 
-## Which edge to use
+An OpenAPI 3.1 spec (`docs/api/openapi.yaml`) and contract test suite exist and are passing (#10/#12);
+the runtime implementation is the open work.
 
-| Use case | Substrate |
+## Which spoke to use
+
+| Use case | Spoke |
 |---|---|
 | 1-1 or N-N call (rooms, voice agents) | **wave-realtime-edge** |
-| 1-many livestream (podcast publish) | `wave-moq-edge` or MUX |
-| Studio-grade broadcast (NDI/Dante/SRT) | [`wave-bridge-edge`](https://github.com/wave-av/wave-bridge-edge) |
-| Browser tab watching pre-recorded | `wave-clip-engine` + MUX |
+| 1-to-many livestream | `wave-moq-edge` |
+| Studio-grade broadcast (NDI/Dante/SRT) | `wave-bridge-edge` |
+| Browser playback of recorded content | `wave-clip-engine` |
+
+## Architecture
+
+```
+browser ──WebRTC──▶ wave-realtime-edge (this spoke)
+                      │  edge SFU · CF Workers + DOs (substrate TBD)
+                      │  /api/* → api.wave.online (gateway-enforced)
+                      ▼
+                  wave-gateway → auth · scope · meter
+```
 
 ## Develop
 
-Requires Node.js and a Cloudflare account.
-
 ```bash
 npm install
-npx wrangler dev      # local dev
+npx wrangler dev      # local dev (health only until substrate lands)
+npm run typecheck
+npm run test          # contract tests (vitest)
 npm run deploy        # wrangler deploy
 ```
 
-Configuration lives in [`wrangler.toml`](wrangler.toml). Secrets handling is documented in [SECRETS.md](SECRETS.md).
-
 ## See also
 
-- [Protocol Plane framework](https://github.com/wave-av/wave-foundation/blob/master/frameworks/protocol-plane/README.md)
-- [Real-time media framework](https://github.com/wave-av/wave-foundation/tree/master/frameworks/realtime-media) — LiveKit/MUX substrate decision rules
-- [threat-model.md](threat-model.md) · [SECURITY.md](SECURITY.md) · [CONTRIBUTING.md](CONTRIBUTING.md)
+- `docs/api/openapi.yaml` — OpenAPI 3.1 contract (passing contract tests)
+- `docs/REALTIME.md` — substrate decision notes
+- `threat-model.md` · `SECURITY.md` · `CONTRIBUTING.md`
 
-## Links
-- [wave.online](https://wave.online) · [Docs](https://docs.wave.online) · [Developer portal](https://dev.wave.online)
+---
 
-Operated by WAVE Online, LLC.
+[wave.online](https://wave.online) · [Docs](https://wave.online/docs)
