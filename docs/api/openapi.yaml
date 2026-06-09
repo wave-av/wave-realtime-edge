@@ -16,7 +16,7 @@ info:
 
     ### Authentication
     Requests carry a `wave-token-v1` Bearer token.  Auth and entitlement
-    enforcement are **delegated to the wave-gateway** upstream; the edge worker
+    enforcement are **delegated to the WAVE API gateway** upstream; the edge worker
     forwards `Authorization` untouched without making access decisions.
 
     ### x402 / Payment metering

@@ -10,7 +10,7 @@
  *   <any other>   → 501  {error:"REALTIME_NOT_IMPLEMENTED",path}
  *
  * Auth is NOT enforced by this worker — auth/entitlement decisions are delegated
- * to wave-gateway upstream (see openapi.yaml §Authentication). Tests confirm the
+ * to the WAVE API gateway upstream (see openapi.yaml §Authentication). Tests confirm the
  * worker never issues 401/403 regardless of the Authorization header value.
  *
  * TODO (follow-ups once endpoints are implemented):

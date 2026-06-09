@@ -2,7 +2,7 @@
 
 A spoke is a **thin** WAVE Protocol Plane edge surface. Its security posture is deliberately small: it
 reverse-proxies `/api/*` to `api.wave.online` and serves a few static pages. **All authentication,
-authorization, scope, entitlement, metering, and payment settlement are DELEGATED to the wave-gateway**
+authorization, scope, entitlement, metering, and payment settlement are DELEGATED to the WAVE API gateway**
 (Sub-Project A). This document is the per-spoke security contract; the live summary is at `/threat-model`.
 
 Legend: ✅ mitigated · ⚠️ partial / by-design · ☐ delegated (out of scope for the spoke).
@@ -15,7 +15,7 @@ Legend: ✅ mitigated · ⚠️ partial / by-design · ☐ delegated (out of sco
                                                    │  + X-Wave-Product / X-Wave-Protocol / X-Wave-Spoke
                                                    │  Authorization forwarded UNTOUCHED
                                                    ▼
-                                               wave-gateway  ── authorize · scope · entitlement · meter
+                                      the WAVE API gateway  ── authorize · scope · entitlement · meter
                                                    ▼
                                                api.wave.online  (the WAVE hub / @wave/core)
 ```
@@ -35,7 +35,7 @@ program exists to eliminate).
 | 5 | Credential leakage in logs / config | ✅ | No secrets in `wrangler.toml`; auth secrets are NOT a spoke concern. `Authorization` is forwarded but never read, logged, or persisted. `.dev.vars` is gitignored. |
 | 6 | CORS credential exposure | ⚠️ | Default `*` is safe because the spoke carries NO cookies/credentials (auth is an explicit Bearer header). When a spoke needs a restricted origin set, configure `SPOKE_CORS_ORIGINS`. |
 | 7 | Credential validation | ⚠️ by-design | The spoke forwards `Authorization` untouched and does NOT validate it. An invalid key is rejected downstream by the gateway/origin, not here. |
-| 8 | AuthN / scope / entitlement / metering | ☐ delegated | Enforced by the **wave-gateway** (`authorize → scope → entitlement → rateLimit → meter`). |
+| 8 | AuthN / scope / entitlement / metering | ☐ delegated | Enforced by the **WAVE API gateway** (`authorize → scope → entitlement → rateLimit → meter`). |
 | 9 | x402 pay-per-use settlement | ☐ delegated | Challenge + on-chain settlement verification happen at the gateway / WAVE hub. The spoke forwards `X-Payment` untouched. |
 | 10 | DDoS / volumetric abuse | ☐ delegated | Cloudflare WAF + the gateway's per-org rate limiter. The spoke adds no per-caller counters. |
 
@@ -51,6 +51,6 @@ program exists to eliminate).
 ## ⛔ Gating
 
 Spokes built from this template depend on Wave 0. Do not point a live `*.wave.online` route at a spoke
-until the wave-gateway is deployed in front of it. The gateway is a hard prerequisite: spoke
+until the WAVE API gateway is deployed in front of it. The gateway is a hard prerequisite: spoke
 origins are designed to trust that authentication, authorization, and payment enforcement have
 already happened upstream, so a spoke must never be the first hop for a live route.
