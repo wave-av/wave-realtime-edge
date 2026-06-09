@@ -14,7 +14,7 @@ Durable Objects vs. LiveKit). This document describes the intended API surface.
 client ──Authorization: Bearer <wave-token-v1>──▶  rt.wave.online  (this worker)
                                                         │ forwards auth untouched
                                                         ▼
-                                                   wave-gateway  ──authorize·meter·x402──▶  origin
+                                          the WAVE API gateway  ──authorize·meter·x402──▶  origin
 ```
 
 The edge worker is deliberately thin:  it does not validate tokens or make access

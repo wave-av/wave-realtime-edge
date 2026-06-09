@@ -23,7 +23,7 @@ the runtime implementation is the open work.
 | 1-1 or N-N call (rooms, voice agents) | **wave-realtime-edge** |
 | 1-to-many livestream | `wave-moq-edge` |
 | Studio-grade broadcast (NDI/Dante/SRT) | `wave-bridge-edge` |
-| Browser playback of recorded content | `wave-clip-engine` |
+| Browser playback of recorded content | the clip service |
 
 ## Architecture
 
@@ -32,7 +32,7 @@ browser ──WebRTC──▶ wave-realtime-edge (this spoke)
                       │  edge SFU · CF Workers + DOs (substrate TBD)
                       │  /api/* → api.wave.online (gateway-enforced)
                       ▼
-                  wave-gateway → auth · scope · meter
+                  the WAVE API gateway → auth · scope · meter
 ```
 
 ## Develop
