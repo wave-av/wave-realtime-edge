@@ -3,6 +3,14 @@ main = "src/worker.ts"
 compatibility_date = "2026-04-15"
 compatibility_flags = ["nodejs_compat"]
 
+[vars]
+# CF-3.1.2 — RealtimeKit (CF Realtime) config. RTK_APP_ID is a non-secret app identifier.
+RTK_APP_ID = "6dee33e5-cd89-41e8-a81c-9a8cd48bb9c3"
+# CF_ACCOUNT_ID is injected at deploy (CI var or `wrangler deploy --var CF_ACCOUNT_ID:<id>`),
+# kept out of source per the account-id scrub policy (CF-0 D1).
+# CF_API_TOKEN is a SECRET — `wrangler secret put CF_API_TOKEN` (account API token w/ Calls/Realtime
+# scope). Never commit it; the worker returns ONLY the per-participant join token, never this token.
+
 [[unsafe.bindings]]
 type = "plain_text"
 name = "FOUNDATION_VERSION"
