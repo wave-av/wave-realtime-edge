@@ -55,7 +55,7 @@ async function rtkPost(cfg: RtkConfig, path: string, body: unknown, fetchImpl: F
   }
   if (!res.ok || !json?.success || !json.data) {
     // Never leak the upstream body or our token — just a stable code + status.
-    throw new RtkError("REALTIME_UPSTREAM", `RealtimeKit ${path} returned ${res.status}`, res.status === 401 || res.status === 403 ? 502 : 502);
+    throw new RtkError("REALTIME_UPSTREAM", `RealtimeKit ${path} returned ${res.status}`, 502);
   }
   return json.data;
 }
