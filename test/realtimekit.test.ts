@@ -1,6 +1,6 @@
 // CF-3.1.2 — unit tests for the RealtimeKit join flow (mocked fetch, no network).
 import { describe, it, expect, vi } from "vitest";
-import { join, RtkError } from "../src/realtimekit.js";
+import { join, turn, clampTurnTtl, RtkError } from "../src/realtimekit.js";
 
 const CFG = {
 	accountId: "d674452f756fe46885a0d6ce7bc23f0a", // 32-hex (matches HEX32 guard)
@@ -88,5 +88,62 @@ describe("realtimekit.join", () => {
 			return new Response(JSON.stringify({ success: true, data: { id: "aaa-1" } }), { status: 200 }); // no token
 		});
 		await expect(join(CFG, { name: "Ada" }, f as never)).rejects.toMatchObject({ code: "REALTIME_UPSTREAM", status: 502 });
+	});
+});
+
+// CF-3 — TURN/ICE credentials. Fake 32-hex key id (never the real account uid in a public repo).
+const TURN_CFG = { keyId: "0123456789abcdef0123456789abcdef", token: "turn-api-token" };
+function turnFetchStub(status = 201) {
+	return vi.fn(async (_urlStr: string, _init?: RequestInit) =>
+		new Response(JSON.stringify({ iceServers: { urls: ["stun:stun.cloudflare.com:3478", "turn:turn.cloudflare.com:3478"], username: "u-eph", credential: "c-eph" } }), { status }),
+	);
+}
+
+describe("realtimekit.clampTurnTtl", () => {
+	it("defaults garbage / missing to 86400, and clamps to [60, 86400]", () => {
+		expect(clampTurnTtl(undefined)).toBe(86400);
+		expect(clampTurnTtl("not-a-number")).toBe(86400);
+		expect(clampTurnTtl(NaN)).toBe(86400);
+		expect(clampTurnTtl(999999)).toBe(86400); // over max
+		expect(clampTurnTtl(-5)).toBe(60); // under min
+		expect(clampTurnTtl(30)).toBe(60); // under min
+		expect(clampTurnTtl(3600)).toBe(3600); // in range
+		expect(clampTurnTtl("7200")).toBe(7200); // numeric string
+	});
+});
+
+describe("realtimekit.turn", () => {
+	it("happy path → {iceServers, ttl}, ONE call to the fixed TURN host (SSRF-safe)", async () => {
+		const f = turnFetchStub();
+		const r = await turn(TURN_CFG, 3600, f as never);
+		expect(r.iceServers.username).toBe("u-eph");
+		expect(r.iceServers.credential).toBe("c-eph");
+		expect(Array.isArray(r.iceServers.urls)).toBe(true);
+		expect(r.ttl).toBe(3600);
+		expect(f).toHaveBeenCalledTimes(1);
+		const u = f.mock.calls[0][0] as string;
+		expect(u.startsWith(`https://rtc.live.cloudflare.com/v1/turn/keys/${TURN_CFG.keyId}/credentials/generate`)).toBe(true);
+	});
+
+	it("clamps the ttl it sends upstream AND echoes the clamped value", async () => {
+		const f = turnFetchStub();
+		const r = await turn(TURN_CFG, 999999, f as never);
+		const sentBody = JSON.parse((f.mock.calls[0][1] as unknown as { body: string }).body) as { ttl: number };
+		expect(sentBody.ttl).toBe(86400);
+		expect(r.ttl).toBe(86400);
+	});
+
+	it("unconfigured key id (not 32-hex) or empty token → 503 REALTIME_NOT_CONFIGURED", async () => {
+		await expect(turn({ keyId: "short", token: "t" }, 60, turnFetchStub() as never)).rejects.toMatchObject({ code: "REALTIME_NOT_CONFIGURED", status: 503 });
+		await expect(turn({ keyId: TURN_CFG.keyId, token: "" }, 60, turnFetchStub() as never)).rejects.toMatchObject({ code: "REALTIME_NOT_CONFIGURED", status: 503 });
+	});
+
+	it("upstream non-2xx → 502", async () => {
+		await expect(turn(TURN_CFG, 60, turnFetchStub(500) as never)).rejects.toMatchObject({ code: "REALTIME_UPSTREAM", status: 502 });
+	});
+
+	it("upstream 200 but missing iceServers fields → 502", async () => {
+		const f = vi.fn(async () => new Response(JSON.stringify({ iceServers: { urls: ["turn:x"] } }), { status: 201 })); // no username/credential
+		await expect(turn(TURN_CFG, 60, f as never)).rejects.toMatchObject({ code: "REALTIME_UPSTREAM", status: 502 });
 	});
 });
