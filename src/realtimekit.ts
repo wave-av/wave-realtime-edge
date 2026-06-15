@@ -54,8 +54,13 @@ async function rtkPost(cfg: RtkConfig, path: string, body: unknown, fetchImpl: F
     json = null; // non-JSON upstream
   }
   if (!res.ok || !json?.success || !json.data) {
+    // Observability (no secrets, no body): status + first upstream error code, for debugging.
+    const code = json && Array.isArray((json as { errors?: { code?: unknown }[] }).errors)
+      ? (json as { errors?: { code?: unknown }[] }).errors?.[0]?.code
+      : undefined;
+    console.warn(`rtk-upstream path=${path} status=${res.status} ok=${res.ok} success=${json?.success} err=${code}`);
     // Never leak the upstream body or our token — just a stable code + status.
-    throw new RtkError("REALTIME_UPSTREAM", `RealtimeKit ${path} returned ${res.status}`, res.status === 401 || res.status === 403 ? 502 : 502);
+    throw new RtkError("REALTIME_UPSTREAM", `RealtimeKit ${path} returned ${res.status}`, 502);
   }
   return json.data;
 }
@@ -76,10 +81,13 @@ export async function join(cfg: RtkConfig, req: JoinRequest, fetchImpl: FetchLik
   const meetingId = String(meeting.id ?? "");
   if (!UUIDISH.test(meetingId)) throw new RtkError("REALTIME_UPSTREAM", "meeting id missing/invalid", 502);
 
+  // custom_participant_id is REQUIRED by RealtimeKit (400 "Custom participant ID is required" without
+  // it). Default to a fresh UUID so a caller that only passes a display name still joins.
+  const customParticipantId = req.customParticipantId ?? crypto.randomUUID();
   const participant = await rtkPost(
     cfg,
     `/meetings/${meetingId}/participants`,
-    { name: req.name, preset_name: req.presetName ?? DEFAULT_PRESET, custom_participant_id: req.customParticipantId },
+    { name: req.name, preset_name: req.presetName ?? DEFAULT_PRESET, custom_participant_id: customParticipantId },
     fetchImpl,
   );
   const token = String(participant.token ?? "");
