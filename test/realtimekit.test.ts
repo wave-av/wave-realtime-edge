@@ -10,7 +10,7 @@ const CFG = {
 
 // Build a fetch stub that returns the RealtimeKit `data`-envelope shapes (verified live).
 function fetchStub(meetingId = "bbb63343-59f8-448c-95c6-6b0fd25b3561", token = "participant-jwt") {
-	return vi.fn(async (urlStr: string) => {
+	return vi.fn(async (urlStr: string, _init?: RequestInit) => {
 		if (urlStr.endsWith("/meetings")) {
 			return new Response(JSON.stringify({ success: true, data: { id: meetingId, status: "ACTIVE" } }), { status: 201 });
 		}
@@ -41,6 +41,21 @@ describe("realtimekit.join", () => {
 		expect(urls[0]).toContain(`/accounts/${CFG.accountId}/realtime/kit/${CFG.appId}/meetings`);
 		expect(urls[1]).toContain(`/meetings/bbb63343-59f8-448c-95c6-6b0fd25b3561/participants`);
 		expect(urls[0].startsWith("https://api.cloudflare.com/")).toBe(true); // SSRF: fixed host
+	});
+
+	it("ALWAYS sends a custom_participant_id (RealtimeKit requires it; 400 without)", async () => {
+		const f = fetchStub();
+		await join(CFG, { name: "Ada" }, f as never); // no customParticipantId provided
+		const participantBody = JSON.parse((f.mock.calls[1][1] as unknown as { body: string }).body) as Record<string, unknown>;
+		expect(typeof participantBody.custom_participant_id).toBe("string");
+		expect((participantBody.custom_participant_id as string).length).toBeGreaterThan(0);
+	});
+
+	it("uses the caller's custom_participant_id when provided", async () => {
+		const f = fetchStub();
+		await join(CFG, { name: "Ada", customParticipantId: "u-42" }, f as never);
+		const participantBody = JSON.parse((f.mock.calls[1][1] as unknown as { body: string }).body) as Record<string, unknown>;
+		expect(participantBody.custom_participant_id).toBe("u-42");
 	});
 
 	it("missing config → 503 REALTIME_NOT_CONFIGURED", async () => {
