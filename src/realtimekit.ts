@@ -100,7 +100,10 @@ export async function join(cfg: RtkConfig, req: JoinRequest, fetchImpl: FetchLik
 // A WebRTC client that does its OWN peer connection (raw SFU / WHIP-WHEP, or any custom RTCPeerConnection)
 // needs short-lived ICE servers to traverse NAT. CF mints them on a SEPARATE host from the REST API:
 //   POST https://rtc.live.cloudflare.com/v1/turn/keys/{keyId}/credentials/generate  {ttl}
-//     → 201 { iceServers: { urls:[stun:…, turn:…, turns:…], username, credential } }   (contract verified live)
+//     → 201 { iceServers: { urls:[stun:…, turn:…, turns:…], username, credential } }   (CF contract verified live)
+// CF returns ONE iceServers OBJECT, but the W3C RTCPeerConnection API expects `iceServers` to be an
+// RTCIceServer[] ARRAY. We normalize to the array so a client can pass our result straight to
+// `new RTCPeerConnection({ iceServers })` — one clean WAVE contract, no client-side reshaping.
 // The TURN api TOKEN is an account secret; only the EPHEMERAL username/credential (time-bounded by ttl) are
 // ever returned to the client — never the token. Fixed host literal (SSRF-safe); keyId is HEX32-validated
 // before interpolation; ttl is clamped to a bounded integer.
@@ -119,7 +122,7 @@ export interface IceServers {
   credential: string;
 }
 export interface TurnResult {
-  iceServers: IceServers;
+  iceServers: IceServers[]; // W3C RTCIceServer[] — drop-in for `new RTCPeerConnection({ iceServers })`
   ttl: number;
 }
 
@@ -156,5 +159,6 @@ export async function turn(cfg: TurnConfig, ttlSeconds: unknown, fetchImpl: Fetc
     console.warn(`turn-upstream status=${res.status} ok=${res.ok} hasIce=${!!ice}`);
     throw new RtkError("REALTIME_UPSTREAM", `TURN credentials/generate returned ${res.status}`, 502);
   }
-  return { iceServers: { urls: ice.urls, username: ice.username, credential: ice.credential }, ttl };
+  // Normalize CF's single object → a W3C RTCIceServer[] array (client-ready for RTCPeerConnection).
+  return { iceServers: [{ urls: ice.urls, username: ice.username, credential: ice.credential }], ttl };
 }

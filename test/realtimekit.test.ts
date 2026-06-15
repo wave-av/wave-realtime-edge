@@ -113,12 +113,14 @@ describe("realtimekit.clampTurnTtl", () => {
 });
 
 describe("realtimekit.turn", () => {
-	it("happy path → {iceServers, ttl}, ONE call to the fixed TURN host (SSRF-safe)", async () => {
+	it("happy path → W3C RTCIceServer[] array + ttl, ONE call to the fixed TURN host (SSRF-safe)", async () => {
 		const f = turnFetchStub();
 		const r = await turn(TURN_CFG, 3600, f as never);
-		expect(r.iceServers.username).toBe("u-eph");
-		expect(r.iceServers.credential).toBe("c-eph");
-		expect(Array.isArray(r.iceServers.urls)).toBe(true);
+		expect(Array.isArray(r.iceServers)).toBe(true); // normalized to the W3C array shape (drop-in for RTCPeerConnection)
+		expect(r.iceServers).toHaveLength(1);
+		expect(r.iceServers[0].username).toBe("u-eph");
+		expect(r.iceServers[0].credential).toBe("c-eph");
+		expect(Array.isArray(r.iceServers[0].urls)).toBe(true);
 		expect(r.ttl).toBe(3600);
 		expect(f).toHaveBeenCalledTimes(1);
 		const u = f.mock.calls[0][0] as string;
