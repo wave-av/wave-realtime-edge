@@ -42,3 +42,30 @@ describe("/rtk/join internal-auth guard", () => {
 		expect(res.status).toBe(200);
 	});
 });
+
+function turnReq(headers: Record<string, string> = {}): Request {
+	return new Request("https://rt.wave.online/rtk/turn", {
+		method: "POST",
+		headers: { "content-type": "application/json", ...headers },
+		body: JSON.stringify({ ttl: 3600 }),
+	});
+}
+
+describe("/rtk/turn internal-auth guard (same chokepoint as /rtk/join)", () => {
+	it("guard ON + missing x-wave-internal → 401", async () => {
+		const res = await worker.fetch(turnReq(), { WAVE_INTERNAL_SECRET: "s3cret" } as never, ctx);
+		expect(res.status).toBe(401);
+		expect(((await res.json()) as Record<string, unknown>).error).toBe("UNAUTHORIZED");
+	});
+
+	it("guard ON + WRONG x-wave-internal → 401", async () => {
+		const res = await worker.fetch(turnReq({ "x-wave-internal": "nope" }), { WAVE_INTERNAL_SECRET: "s3cret" } as never, ctx);
+		expect(res.status).toBe(401);
+	});
+
+	it("guard ON + CORRECT x-wave-internal → passes the guard (503 TURN unconfigured, not 401)", async () => {
+		const res = await worker.fetch(turnReq({ "x-wave-internal": "s3cret" }), { WAVE_INTERNAL_SECRET: "s3cret" } as never, ctx);
+		expect(res.status).not.toBe(401); // cleared the guard; turn() then 503s on empty TURN config
+		expect(res.status).toBe(503);
+	});
+});

@@ -4,8 +4,8 @@ compatibility_date = "2026-04-15"
 compatibility_flags = ["nodejs_compat"]
 
 # CF-3 — customer-facing realtime surface (url-naming convention: <proto>.wave.online).
-# Safe to route directly: /rtk/join is internal-secret-gated (401 without the gateway header);
-# /health is public. The PAID public path is api.wave.online (gateway charges, then forwards).
+# Safe to route directly: /rtk/join and /rtk/turn are internal-secret-gated (401 without the gateway
+# header); /health is public. The PAID public path is api.wave.online (gateway charges, then forwards).
 routes = [{ pattern = "rt.wave.online", custom_domain = true }]
 
 [vars]
@@ -15,6 +15,13 @@ RTK_APP_ID = "6dee33e5-cd89-41e8-a81c-9a8cd48bb9c3"
 # kept out of source per the account-id scrub policy (CF-0 D1).
 # CF_API_TOKEN is a SECRET — `wrangler secret put CF_API_TOKEN` (account API token w/ Calls/Realtime
 # scope). Never commit it; the worker returns ONLY the per-participant join token, never this token.
+#
+# CF-3 TURN (/rtk/turn) — BOTH are wrangler SECRETS (kept out of this public repo + persist across
+# deploys, avoiding the CF_ACCOUNT_ID --var footgun). `wrangler secret put`:
+#   TURN_KEY_ID     — the CF TURN key uid (32-hex). Identifier, not a credential on its own.
+#   TURN_KEY_TOKEN  — the TURN key's api token (created via POST /accounts/{acc}/calls/turn_keys, shown
+#                     once). The worker returns ONLY the ephemeral ICE username/credential, never this token.
+# Unset → /rtk/turn fails closed (503 REALTIME_NOT_CONFIGURED).
 
 [[unsafe.bindings]]
 type = "plain_text"

@@ -95,3 +95,70 @@ export async function join(cfg: RtkConfig, req: JoinRequest, fetchImpl: FetchLik
 
   return { meetingId, token, appId: cfg.appId };
 }
+
+// ── TURN / ICE credentials (CF-3) ──────────────────────────────────────────────────────────────────
+// A WebRTC client that does its OWN peer connection (raw SFU / WHIP-WHEP, or any custom RTCPeerConnection)
+// needs short-lived ICE servers to traverse NAT. CF mints them on a SEPARATE host from the REST API:
+//   POST https://rtc.live.cloudflare.com/v1/turn/keys/{keyId}/credentials/generate  {ttl}
+//     → 201 { iceServers: { urls:[stun:…, turn:…, turns:…], username, credential } }   (CF contract verified live)
+// CF returns ONE iceServers OBJECT, but the W3C RTCPeerConnection API expects `iceServers` to be an
+// RTCIceServer[] ARRAY. We normalize to the array so a client can pass our result straight to
+// `new RTCPeerConnection({ iceServers })` — one clean WAVE contract, no client-side reshaping.
+// The TURN api TOKEN is an account secret; only the EPHEMERAL username/credential (time-bounded by ttl) are
+// ever returned to the client — never the token. Fixed host literal (SSRF-safe); keyId is HEX32-validated
+// before interpolation; ttl is clamped to a bounded integer.
+const TURN_API = "https://rtc.live.cloudflare.com/v1/turn/keys"; // fixed host — no request-derived URLs (SSRF-safe)
+const TURN_TTL_DEFAULT = 86400; // 24h — a sensible session lifetime when the caller doesn't ask
+const TURN_TTL_MIN = 60;        // floor: a credential shorter than a minute is useless
+const TURN_TTL_MAX = 86400;     // ceiling: cap how long a single minted credential stays valid
+
+export interface TurnConfig {
+  keyId: string;
+  token: string;
+}
+export interface IceServers {
+  urls: string[];
+  username: string;
+  credential: string;
+}
+export interface TurnResult {
+  iceServers: IceServers[]; // W3C RTCIceServer[] — drop-in for `new RTCPeerConnection({ iceServers })`
+  ttl: number;
+}
+
+/** Clamp a (possibly client-supplied, possibly garbage) ttl to a bounded integer in [MIN, MAX]. */
+export function clampTurnTtl(v: unknown): number {
+  const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+  if (!Number.isFinite(n)) return TURN_TTL_DEFAULT;
+  return Math.min(TURN_TTL_MAX, Math.max(TURN_TTL_MIN, Math.floor(n)));
+}
+
+/**
+ * Mint short-lived TURN/ICE credentials. Pure w.r.t. injected `fetchImpl` (unit-tests with no network).
+ * FAIL-CLOSED on an unconfigured key (503). Returns ONLY the ephemeral iceServers — never the api token.
+ */
+export async function turn(cfg: TurnConfig, ttlSeconds: unknown, fetchImpl: FetchLike = fetch): Promise<TurnResult> {
+  if (!HEX32.test(cfg.keyId || "") || !cfg.token) {
+    throw new RtkError("REALTIME_NOT_CONFIGURED", "realtime-edge TURN is not configured (key id/token)", 503);
+  }
+  const ttl = clampTurnTtl(ttlSeconds);
+  const res = await fetchImpl(`${TURN_API}/${cfg.keyId}/credentials/generate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.token}` },
+    body: JSON.stringify({ ttl }),
+  });
+  let json: { iceServers?: Partial<IceServers> } | null = null;
+  try {
+    json = (await res.json()) as { iceServers?: Partial<IceServers> };
+  } catch {
+    json = null; // non-JSON upstream
+  }
+  const ice = json?.iceServers;
+  if (!res.ok || !ice || !Array.isArray(ice.urls) || !ice.username || !ice.credential) {
+    // Observability only — never the token or the upstream body.
+    console.warn(`turn-upstream status=${res.status} ok=${res.ok} hasIce=${!!ice}`);
+    throw new RtkError("REALTIME_UPSTREAM", `TURN credentials/generate returned ${res.status}`, 502);
+  }
+  // Normalize CF's single object → a W3C RTCIceServer[] array (client-ready for RTCPeerConnection).
+  return { iceServers: [{ urls: ice.urls, username: ice.username, credential: ice.credential }], ttl };
+}
