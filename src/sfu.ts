@@ -123,11 +123,22 @@ export class SfuClient {
 
   /** POST helper → JSON object, or SfuError on any non-2xx / non-JSON / unparseable boundary. */
   private async call<T>(method: "POST" | "PUT", path: string, body: unknown): Promise<T> {
-    const res = await this.fetchImpl(`${this.baseUrl}/apps/${this.appId}${path}`, {
-      method,
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.appSecret}` },
-      body: JSON.stringify(body ?? {}),
-    });
+    // Detach from `this` before invoking: calling `this.fetchImpl(...)` would set the callee's `this` to
+    // this SfuClient instance, and the global `fetch` builtin throws "Illegal invocation" unless called
+    // with its own (global) receiver. A local binding makes `this` undefined (module strict mode), which
+    // both the real fetch and any injected mock accept. Regression: test/sfu.test.ts asserts this.
+    const doFetch = this.fetchImpl;
+    // Send a request body ONLY when there is one. CF Realtime rejects an empty JSON object on its
+    // body-optional endpoints: POST /sessions/new WITHOUT an offer returns 400 "decoding_error: Body
+    // JSON validation error: sessionDescription" for `{}`, but 201 for no body at all. So pass the body
+    // (and the JSON Content-Type) only when `body != null`; a no-offer newSession sends neither.
+    const headers: Record<string, string> = { Authorization: `Bearer ${this.appSecret}` };
+    const init: RequestInit = { method, headers };
+    if (body != null) {
+      headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(body);
+    }
+    const res = await doFetch(`${this.baseUrl}/apps/${this.appId}${path}`, init);
     let json: unknown = null;
     try {
       json = await res.json();
@@ -147,7 +158,7 @@ export class SfuClient {
     const data = await this.call<{ sessionId?: string; sessionDescription?: SessionDescription }>(
       "POST",
       "/sessions/new",
-      offer ? { sessionDescription: offer } : {},
+      offer ? { sessionDescription: offer } : undefined, // no offer → no body (CF rejects `{}` here)
     );
     const sessionId = String(data.sessionId ?? "");
     if (!SESSIONID.test(sessionId)) throw new SfuError("REALTIME_UPSTREAM", "session id missing/invalid", 502);

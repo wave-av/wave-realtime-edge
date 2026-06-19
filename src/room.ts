@@ -12,8 +12,11 @@
 // it does not talk to the SFU or the network here. Tests inject the storage, so no live DO runtime is
 // needed (the class is also wired as a real DurableObject for when bindings land).
 
-import { SfuError } from "./sfu.js";
-import type { ParticipantSessionUsage } from "./metering.js";
+import { SfuClient, SfuError } from "./sfu.js";
+import type { SessionDescription } from "./sfu.js";
+import { Signaling } from "./signaling.js";
+import type { SignalContext, PublishTrack } from "./signaling.js";
+import type { ParticipantSessionUsage, MeterEmitEnv } from "./metering.js";
 
 /** CF Realtime GCs a track after 30s of inactivity (design §4). Registry reconcile uses this. */
 export const TRACK_GC_MS = 30_000;
@@ -265,16 +268,40 @@ interface DurableObjectStateLike {
 }
 
 /**
- * RoomDO — the Durable Object wrapper. Holds a RoomCore over the DO's own storage. Signaling/auth
- * (P5.2) will add a `fetch`/RPC surface that calls these methods; for now this exposes the typed
- * internal API directly. Registered in wrangler config when bindings land (additive, not in P5.1
- * deploy scope).
+ * Env the RoomDO reads to build its SFU client + metering tap (referenced, never valued here):
+ *   • CF_CALLS_APP_ID / CF_CALLS_APP_SECRET — CF Realtime SFU app creds (sfu.ts). Unset → join fails
+ *     closed 503 REALTIME_NOT_CONFIGURED (preserving the /rtk surface).
+ *   • GATEWAY_BASE_URL / WAVE_SERVICE_TOKEN — metering tap (metering.ts). Both unset → emit is INERT.
+ * __sfuFetch / __meterFetch are TEST-ONLY injectables (no live network in tests); production leaves them
+ * undefined so the real `fetch` is used.
+ */
+export interface RoomDOEnv {
+  CF_CALLS_APP_ID?: string;
+  CF_CALLS_APP_SECRET?: string;
+  GATEWAY_BASE_URL?: string;
+  WAVE_SERVICE_TOKEN?: string;
+  /** test-only: injected SFU HTTP client (defaults to global fetch). The metering tap uses global fetch. */
+  __sfuFetch?: typeof fetch;
+}
+
+/** The realtime intents the worker entry forwards to the DO's fetch() (last path segment). */
+type RoomIntent = "join" | "publish" | "subscribe" | "renegotiate" | "leave";
+
+/**
+ * RoomDO — the Durable Object wrapper. Holds a RoomCore over the DO's own storage and exposes BOTH the
+ * typed internal API (used by tests) AND a fetch() control-plane surface (P5.2): the worker entry routes
+ * each realtime intent to fetch(), which runs the Signaling orchestration (signaling.ts) over THIS room's
+ * RoomCore + an SfuClient built from env, and meters on leave. Running Signaling INSIDE the DO is what
+ * gives per-room serialized state + per-org isolation (the DO id is keyed `${org}:${room}` by the worker).
+ * Registered in wrangler config (ROOM binding + v1 migration).
  */
 export class RoomDO {
   private readonly core: RoomCore;
+  private readonly env: RoomDOEnv;
 
-  constructor(state: DurableObjectStateLike, _env?: unknown) {
+  constructor(state: DurableObjectStateLike, env?: RoomDOEnv) {
     this.core = new RoomCore(state.storage);
+    this.env = env ?? {};
   }
 
   ensureRoom(config: RoomConfig) { return this.core.ensureRoom(config); }
@@ -286,4 +313,72 @@ export class RoomDO {
   reconcileTracks() { return this.core.reconcileTracks(); }
   isExpired() { return this.core.isExpired(); }
   snapshot() { return this.core.snapshot(); }
+
+  /**
+   * Control-plane surface. The worker forwards `POST .../<intent>` here with a JSON body carrying the
+   * already-validated context (org/room/participantId) + the intent payload. Builds the SfuClient lazily
+   * (so an unconfigured app fails closed only when an intent actually needs the SFU), runs Signaling, and
+   * maps SfuError/SignalError to the spoke's normalized {error,message} envelope. Metering fires on leave
+   * (fail-open inside metering.ts). The DO never holds media — only state + orchestration.
+   */
+  async fetch(request: Request): Promise<Response> {
+    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent;
+    let body: Record<string, unknown> = {};
+    try {
+      body = (await request.json()) as Record<string, unknown>;
+    } catch {
+      body = {};
+    }
+    const ctx = body.ctx as SignalContext | undefined;
+
+    try {
+      const signaling = new Signaling(this.core, this.buildSfu(), this.meterEnv());
+      switch (intent) {
+        case "join":
+          return Response.json(
+            await signaling.join(ctx!, { role: body.role as Role | undefined, offer: body.offer as SessionDescription | undefined }),
+            { status: 200 },
+          );
+        case "publish":
+          return Response.json(
+            await signaling.publishTrack(ctx!, { tracks: body.tracks as PublishTrack[], offer: body.offer as SessionDescription }),
+            { status: 200 },
+          );
+        case "subscribe":
+          return Response.json(
+            await signaling.subscribeTrack(ctx!, { trackName: String(body.trackName ?? "") }),
+            { status: 200 },
+          );
+        case "renegotiate":
+          return Response.json(
+            await signaling.renegotiate(ctx!, { answer: body.answer as SessionDescription }),
+            { status: 200 },
+          );
+        case "leave":
+          await signaling.leave(ctx!);
+          return Response.json({ ok: true }, { status: 200 });
+        default:
+          return Response.json({ error: "BAD_REQUEST", message: `unknown realtime intent: ${intent}` }, { status: 400 });
+      }
+    } catch (e) {
+      // SfuError + SignalError both carry {code,status}; anything else → 500.
+      const code = (e as { code?: string })?.code ?? "REALTIME_ERROR";
+      const status = (e as { status?: number })?.status ?? 500;
+      const message = (e as Error)?.message ?? "unexpected error";
+      return Response.json({ error: code, message }, { status });
+    }
+  }
+
+  /** Build the SFU client from env; throws SfuError 503 NOT_CONFIGURED when app creds are unset. */
+  private buildSfu(): SfuClient {
+    return new SfuClient(
+      { appId: this.env.CF_CALLS_APP_ID ?? "", appSecret: this.env.CF_CALLS_APP_SECRET ?? "" },
+      this.env.__sfuFetch ?? fetch,
+    );
+  }
+
+  /** Metering env for the leave-time tap. INERT until GATEWAY_BASE_URL + WAVE_SERVICE_TOKEN are set. */
+  private meterEnv(): MeterEmitEnv {
+    return { GATEWAY_BASE_URL: this.env.GATEWAY_BASE_URL, WAVE_SERVICE_TOKEN: this.env.WAVE_SERVICE_TOKEN };
+  }
 }

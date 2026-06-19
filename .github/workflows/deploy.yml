@@ -1,0 +1,63 @@
+name: deploy
+
+# wave-realtime-edge deploy (#30). workflow_dispatch ONLY — never auto-deploy on push.
+# Merges to main do NOT deploy; Jake names the crossing explicitly (proven-live-or-not-done +
+# every-product-host-on-chassis: rt.wave.online is a paid customer-facing host). Mirrors the
+# established sibling pattern (wave-acuity-edge/.github/workflows/deploy.yml).
+#
+# What this does:
+#   1. npm ci || npm install   (standalone worker — NO @wave-av/* deps, so no GitHub Packages auth)
+#   2. typecheck + test (re-run the gate before a real deploy)
+#   3. wrangler deploy
+#      wrangler reads wrangler.toml: name, main, routes (rt.wave.online custom_domain),
+#      the ROOM Durable Object binding + v1 migration (new_sqlite_classes ["RoomDO"]), vars,
+#      and observability. First deploy bootstraps the RoomDO migration.
+#
+# Secrets required in this repo (set once, NOT here — same org secrets the other spokes use):
+#   CLOUDFLARE_API_TOKEN   — CF API token: Workers Scripts:Edit, Workers KV:Edit, Zone Workers Routes:Edit
+#   CLOUDFLARE_ACCOUNT_ID  — the WAVE CF account id
+#
+# Worker runtime secrets are set separately via `wrangler secret put` (values from Doppler wave/prd):
+#   CF_CALLS_APP_ID, CF_CALLS_APP_SECRET   — CF Realtime SFU app creds (sfu.ts)
+#   WAVE_SERVICE_TOKEN                     — metering-tap bearer to the gateway (room.ts)
+#   WAVE_INTERNAL_SECRET, CF_API_TOKEN, TURN_KEY_ID, TURN_KEY_TOKEN — existing /rtk surface (worker.ts)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-wave-realtime-edge
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: install
+        run: npm ci || npm install
+
+      - name: typecheck (tsc --noEmit)
+        run: npm run typecheck
+
+      - name: test (vitest)
+        run: npm test
+
+      - name: Deploy with Wrangler
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3.15.0
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # wrangler reads wrangler.toml: name=wave-realtime-edge, route rt.wave.online (custom_domain),
+          # ROOM Durable Object binding + v1 migration. First deploy bootstraps the RoomDO migration.
