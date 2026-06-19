@@ -168,3 +168,24 @@ describe("SfuClient.newDataChannel", () => {
 		await expect(new SfuClient(CFG, stub(() => jsonResp({}))).newDataChannel(SESSION, [])).rejects.toMatchObject({ code: "BAD_REQUEST" });
 	});
 });
+
+describe("SfuClient.renegotiate", () => {
+	it("PUTs the sessionDescription to /renegotiate and returns the SFU answer", async () => {
+		const f = stub(() => jsonResp({ sessionDescription: { type: "answer", sdp: "a=ok" } }));
+		const c = new SfuClient(CFG, f as never);
+		const r = await c.renegotiate(SESSION, { type: "answer", sdp: "v=client" });
+		expect(r.sessionDescription).toEqual({ type: "answer", sdp: "a=ok" });
+		expect(f.mock.calls[0][0]).toContain(`/sessions/${SESSION}/renegotiate`);
+		expect((f.mock.calls[0][1] as RequestInit).method).toBe("PUT");
+	});
+
+	it("rejects a missing/invalid sessionDescription → 400", async () => {
+		const c = new SfuClient(CFG, stub(() => jsonResp({})));
+		await expect(c.renegotiate(SESSION, { type: "answer", sdp: "" })).rejects.toMatchObject({ code: "BAD_REQUEST", status: 400 });
+	});
+
+	it("rejects an invalid session id → 400", async () => {
+		const c = new SfuClient(CFG, stub(() => jsonResp({})));
+		await expect(c.renegotiate("bad/id", { type: "answer", sdp: "v=x" })).rejects.toMatchObject({ code: "BAD_REQUEST", status: 400 });
+	});
+});

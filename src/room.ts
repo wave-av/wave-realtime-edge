@@ -13,6 +13,7 @@
 // needed (the class is also wired as a real DurableObject for when bindings land).
 
 import { SfuError } from "./sfu.js";
+import type { ParticipantSessionUsage } from "./metering.js";
 
 /** CF Realtime GCs a track after 30s of inactivity (design §4). Registry reconcile uses this. */
 export const TRACK_GC_MS = 30_000;
@@ -34,6 +35,10 @@ export interface Participant {
   role: Role;
   permissions: Permissions;
   joinedAt: number;
+  /** Sticky: set true the first time the participant publishes an AUDIO track (P5.3 metering tier). */
+  publishedAudio?: boolean;
+  /** Sticky: set true the first time the participant publishes a VIDEO track (P5.3 metering tier). */
+  publishedVideo?: boolean;
 }
 
 export type TrackKind = "audio" | "video";
@@ -146,19 +151,34 @@ export class RoomCore {
     return participant;
   }
 
-  /** Leave a participant: remove them and GC every track owned by their session. */
-  async leaveRoom(org: string, participantId: string): Promise<void> {
+  /**
+   * Leave a participant: remove them and GC every track owned by their session. Returns a
+   * ParticipantSessionUsage snapshot (join→leave window + which kinds they published) for the P5.3
+   * metering tap to emit, or null on an idempotent/no-op leave (already gone, or room not bound). The
+   * caller emits best-effort AFTER the state is committed — a metering failure must never block the leave.
+   */
+  async leaveRoom(org: string, participantId: string): Promise<ParticipantSessionUsage | null> {
     const s = await this.load();
-    if (!s.config) return; // nothing to leave
+    if (!s.config) return null; // nothing to leave
     if (s.config.org !== org) throw new SfuError("ROOM_ORG_MISMATCH", "org mismatch", 403);
     const participant = s.participants[participantId];
-    if (!participant) return; // idempotent leave
+    if (!participant) return null; // idempotent leave
     delete s.participants[participantId];
     for (const [name, t] of Object.entries(s.tracks)) {
       if (t.sessionId === participant.sessionId) delete s.tracks[name];
     }
     if (Object.keys(s.participants).length === 0) s.emptyAt = this.now();
     await this.save(s);
+    return {
+      org: s.config.org,
+      room: s.config.roomId,
+      participantId: participant.participantId,
+      sessionId: participant.sessionId,
+      joinedAt: participant.joinedAt,
+      leftAt: this.now(),
+      publishedAudio: participant.publishedAudio === true,
+      publishedVideo: participant.publishedVideo === true,
+    };
   }
 
   /** Register a published track in the room registry (called after a successful SFU pushTracks). */
@@ -170,6 +190,13 @@ export class RoomCore {
     if (!t.trackName) throw new SfuError("BAD_REQUEST", "trackName is required", 400);
     const track: RoomTrack = { ...t, lastSeenAt: this.now() };
     s.tracks[t.trackName] = track;
+    // Sticky per-tier publish flags for P5.3 metering: once a participant publishes a track of a kind,
+    // they accrue that meter for the session (kept sticky so a momentary unpublish/GC doesn't zero it).
+    const owner = s.participants[t.participantId];
+    if (owner) {
+      if (t.kind === "audio") owner.publishedAudio = true;
+      if (t.kind === "video") owner.publishedVideo = true;
+    }
     await this.save(s);
     return track;
   }
