@@ -123,7 +123,12 @@ export class SfuClient {
 
   /** POST helper → JSON object, or SfuError on any non-2xx / non-JSON / unparseable boundary. */
   private async call<T>(method: "POST" | "PUT", path: string, body: unknown): Promise<T> {
-    const res = await this.fetchImpl(`${this.baseUrl}/apps/${this.appId}${path}`, {
+    // Detach from `this` before invoking: calling `this.fetchImpl(...)` would set the callee's `this` to
+    // this SfuClient instance, and the global `fetch` builtin throws "Illegal invocation" unless called
+    // with its own (global) receiver. A local binding makes `this` undefined (module strict mode), which
+    // both the real fetch and any injected mock accept. Regression: test/sfu.test.ts asserts this.
+    const doFetch = this.fetchImpl;
+    const res = await doFetch(`${this.baseUrl}/apps/${this.appId}${path}`, {
       method,
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.appSecret}` },
       body: JSON.stringify(body ?? {}),

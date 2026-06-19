@@ -50,6 +50,20 @@ describe("SfuClient construction", () => {
 		expect((init.headers as Record<string, string>).Authorization).toBe(`Bearer ${CFG.appSecret}`);
 		expect(f.mock.calls[0][0]).not.toContain(CFG.appSecret);
 	});
+
+	// Regression (live 500 "Illegal invocation"): the client must invoke fetchImpl DETACHED from `this`.
+	// The global `fetch` builtin throws when called with a non-global receiver, so calling it as
+	// `this.fetchImpl(...)` (receiver = the SfuClient instance) breaks at runtime. A this-sensitive stub
+	// reproduces that: a plain function records its own `this`, which MUST be undefined at the call site.
+	it("invokes fetchImpl with `this` === undefined (no Illegal invocation against the real fetch)", async () => {
+		let receiver: unknown = "unset";
+		const thisSensitive = function (this: unknown): Promise<Response> {
+			receiver = this;
+			return Promise.resolve(jsonResp({ sessionId: SESSION }));
+		};
+		await new SfuClient(CFG, thisSensitive as never).newSession();
+		expect(receiver).toBeUndefined();
+	});
 });
 
 describe("SfuClient.newSession", () => {
