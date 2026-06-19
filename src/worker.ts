@@ -167,6 +167,11 @@ export default {
 				payload = {}; // empty/invalid JSON → validated inside the DO/signaling layer
 			}
 			const participantId = typeof payload.participantId === "string" ? payload.participantId : "";
+			// Role is gateway-stamped via x-wave-role (set by the gateway after WRT verification).
+			// Room type comes from x-wave-room-type header or the join body; both are optional.
+			const role = request.headers.get("x-wave-role") ?? undefined;
+			const type = request.headers.get("x-wave-room-type") ??
+				(typeof payload.type === "string" ? payload.type : undefined);
 			// Forward to the room's DO with the already-authenticated context bound in. Per-org isolation is
 			// enforced by the DO id (org:room) AND re-checked inside the Room DO (org-mismatch → 403/409).
 			const id = env.ROOM.idFromName(`${org}:${room}`);
@@ -174,7 +179,7 @@ export default {
 			const intentReq = new Request(`https://room/${intent}`, {
 				method: "POST",
 				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ ...payload, ctx: { org, room, participantId } }),
+				body: JSON.stringify({ ...payload, ctx: { org, room, participantId, role, type } }),
 			});
 			return stub.fetch(intentReq);
 		}
