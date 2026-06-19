@@ -11,7 +11,10 @@
 //   PUT  /apps/{appId}/sessions/{id}/tracks/close        → close tracks
 //   POST /apps/{appId}/sessions/{id}/datachannels/new    → open data channels
 // Auth is the App SECRET as a Bearer token. The App ID + App Secret + base URL come from config/env
-// (DO NOT hardcode; the real CF_REALTIME_APP_ID / CF_REALTIME_APP_SECRET arrive via Doppler later).
+// (DO NOT hardcode). The provisioned CF Realtime app supplies these via env: CF_CALLS_APP_ID and
+// CF_CALLS_APP_SECRET (Doppler wave/prd; app "wispy-feather-fa96" on the WAVE account). Wire the
+// worker as `new SfuClient({ appId: env.CF_CALLS_APP_ID, appSecret: env.CF_CALLS_APP_SECRET })` —
+// the default baseUrl resolves to https://rtc.live.cloudflare.com/v1/apps/{CF_CALLS_APP_ID}.
 //
 // NO room logic lives here (that is the Room DO). NO live network in tests — the HTTP client is
 // injectable (`FetchLike`) so every path is mocked. Fixed host literal (SSRF-safe); ids are
