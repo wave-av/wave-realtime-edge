@@ -12,6 +12,11 @@
 // preserves the gateway-delegated contract + the existing contract tests.
 import { join, turn, RtkError } from "./realtimekit";
 
+// Re-export the Room Durable Object so the wrangler `ROOM` binding + migration (v1, new_sqlite_classes)
+// resolve from this main module. The class itself is defined in room.ts (P5 substrate); it is not yet
+// wired into fetch() — that is the P5.2 signaling follow-up. Exporting it here lets the binding deploy.
+export { RoomDO } from "./room";
+
 interface Env {
 	CF_API_TOKEN?: string; // wrangler SECRET — account API token (Calls/Realtime scope). Never logged/returned.
 	CF_ACCOUNT_ID?: string; // var
