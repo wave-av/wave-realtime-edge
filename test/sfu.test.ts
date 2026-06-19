@@ -75,8 +75,21 @@ describe("SfuClient.newSession", () => {
 	it("forwards an SDP offer when provided", async () => {
 		const f = stub(() => jsonResp({ sessionId: SESSION }));
 		await new SfuClient(CFG, f as never).newSession({ type: "offer", sdp: "v=0..." });
-		const body = JSON.parse((f.mock.calls[0][1] as { body: string }).body);
+		const init = f.mock.calls[0][1] as { body: string; headers: Record<string, string> };
+		const body = JSON.parse(init.body);
 		expect(body.sessionDescription).toEqual({ type: "offer", sdp: "v=0..." });
+		expect(init.headers["Content-Type"]).toBe("application/json");
+	});
+
+	// Regression (live CF 400 "Body JSON validation error: sessionDescription"): a no-offer session must
+	// send NO body (and no JSON Content-Type) — CF rejects an empty `{}` but accepts a bodyless POST.
+	it("sends NO body and NO Content-Type when there is no offer", async () => {
+		const f = stub(() => jsonResp({ sessionId: SESSION }));
+		await new SfuClient(CFG, f as never).newSession();
+		const init = f.mock.calls[0][1] as { body?: unknown; headers: Record<string, string> };
+		expect(init.body).toBeUndefined();
+		expect(init.headers["Content-Type"]).toBeUndefined();
+		expect(init.headers.Authorization).toBe(`Bearer ${CFG.appSecret}`);
 	});
 
 	it("missing session id in response → 502", async () => {
