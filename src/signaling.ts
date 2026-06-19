@@ -16,6 +16,7 @@
 
 import { RoomCore, Role, TrackKind } from "./room.js";
 import { SfuClient, SessionDescription, LocalTrack } from "./sfu.js";
+import { emitParticipantUsage, MeterEmitEnv } from "./metering.js";
 
 /** A validated request context. AUTH is upstream (gateway) — see file header. */
 export interface SignalContext {
@@ -66,6 +67,8 @@ export class Signaling {
   constructor(
     private readonly room: RoomCore,
     private readonly sfu: SfuClient,
+    /** P5.3 metering env (gateway URL + service token). Optional → emit is INERT until provisioned. */
+    private readonly meterEnv: MeterEmitEnv = {},
   ) {}
 
   /**
@@ -154,7 +157,12 @@ export class Signaling {
    */
   async leave(ctx: SignalContext): Promise<void> {
     this.assertCtx(ctx);
-    await this.room.leaveRoom(ctx.org, ctx.participantId);
+    // Commit the leave FIRST (state of record), then meter best-effort. P5.3: the leaveRoom snapshot
+    // carries the join→leave window + which tiers (audio/video) this participant published; the tap
+    // computes participant-minutes + overage-only egress and flushes to the gateway. A metering failure
+    // must NEVER affect the leave (media-safety > metering, design §4) — emitParticipantUsage is fail-open.
+    const usage = await this.room.leaveRoom(ctx.org, ctx.participantId);
+    if (usage) await emitParticipantUsage(this.meterEnv, usage);
   }
 
   private assertCtx(ctx: SignalContext): void {
