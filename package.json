@@ -5,11 +5,13 @@
   "type": "module",
   "scripts": {
     "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260613.1",
+    "typescript": "^5.9.3",
     "vitest": "^4.1.8",
     "wrangler": "^4.100.0"
   }
