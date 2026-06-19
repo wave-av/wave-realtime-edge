@@ -64,6 +64,8 @@ export interface TrackResponse {
 
 export interface NewSessionResult {
   sessionId: string;
+  /** The SFU's SDP answer, present when the session was created from a client offer. */
+  sessionDescription?: SessionDescription;
 }
 
 export interface TracksResult {
@@ -142,10 +144,14 @@ export class SfuClient {
 
   /** Create a new SFU session. Returns the opaque session id used by all subsequent calls. */
   async newSession(offer?: SessionDescription): Promise<NewSessionResult> {
-    const data = await this.call<{ sessionId?: string }>("POST", "/sessions/new", offer ? { sessionDescription: offer } : {});
+    const data = await this.call<{ sessionId?: string; sessionDescription?: SessionDescription }>(
+      "POST",
+      "/sessions/new",
+      offer ? { sessionDescription: offer } : {},
+    );
     const sessionId = String(data.sessionId ?? "");
     if (!SESSIONID.test(sessionId)) throw new SfuError("REALTIME_UPSTREAM", "session id missing/invalid", 502);
-    return { sessionId };
+    return { sessionId, sessionDescription: data.sessionDescription };
   }
 
   /** Push local tracks into a session (publish). `offer` carries the renegotiation SDP when required. */
@@ -194,6 +200,25 @@ export class SfuClient {
       { tracks: mids.map((mid) => ({ mid })), force: false, ...(offer ? { sessionDescription: offer } : {}) },
     );
     return { tracks: Array.isArray(data.tracks) ? data.tracks : [], sessionDescription: data.sessionDescription };
+  }
+
+  /**
+   * Renegotiate a session: forward a client-side SDP (typically the `answer` to the SFU's offer after a
+   * pull required immediate renegotiation, or a fresh client `offer`) so the PeerConnection re-syncs.
+   * CF Realtime contract: `PUT /sessions/{id}/renegotiate` with the sessionDescription. Returns the
+   * SFU's resulting sessionDescription when one is produced.
+   */
+  async renegotiate(sessionId: string, sdp: SessionDescription): Promise<TracksResult> {
+    this.assertSession(sessionId);
+    if (!sdp || (sdp.type !== "offer" && sdp.type !== "answer") || !sdp.sdp) {
+      throw new SfuError("BAD_REQUEST", "a valid sessionDescription is required to renegotiate", 400);
+    }
+    const data = await this.call<{ sessionDescription?: SessionDescription }>(
+      "PUT",
+      `/sessions/${sessionId}/renegotiate`,
+      { sessionDescription: sdp },
+    );
+    return { tracks: [], sessionDescription: data.sessionDescription };
   }
 
   /** Open a data channel (local = create, remote = subscribe to a peer's channel). */
