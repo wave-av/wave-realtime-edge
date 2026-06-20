@@ -193,7 +193,19 @@ export class RealtimeRecorder {
       this.parts.push(uploaded);
       this.nextPartNumber += 1;
     }
-    await this.upload.complete(this.parts);
+    try {
+      await this.upload.complete(this.parts);
+    } catch (err) {
+      // R2 completeMultipartUpload is NOT idempotent server-side: the uploadId is consumed on a successful
+      // complete. A throw is ambiguous — (a) it genuinely failed and the upload is still open (a retried
+      // finalize SHOULD re-complete), or (b) it actually committed but the ACK was lost (a blind retry would
+      // throw "no such upload" forever, orphaning a real recording). Disambiguate by HEAD: object present ⇒
+      // the complete landed, treat as success; absent ⇒ rethrow so the still-open upload can be retried. We
+      // deliberately do NOT null `this.upload` before complete() — that would make a genuine failure
+      // un-retryable.
+      const landed = await this.bucket.head(this.key);
+      if (!landed) throw err;
+    }
     this.upload = null;
     this.finalized = { key: this.key, bytes: this.totalBytes, container: this.container };
     return this.finalized;
@@ -218,7 +230,11 @@ export class RealtimeRecorder {
       uploadId: this.upload.uploadId,
       parts: this.parts,
       nextPartNumber: this.nextPartNumber,
-      totalBytes: this.totalBytes,
+      // Persist FLUSHED bytes only. The un-flushed in-memory tail (`bufLen`) is lost on a mid-session eviction
+      // (it lives only in `this.buf`, never in meta), so counting it here would make a resumed recorder's
+      // final RecordingResult.bytes overcount the actual R2 object. `totalBytes - bufLen` == bytes durably
+      // uploaded as parts.
+      totalBytes: this.totalBytes - this.bufLen,
       container: this.container,
     };
   }

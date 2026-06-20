@@ -18,6 +18,7 @@ class FakeUpload {
   completed: Array<{ partNumber: number; etag: string }> | null = null;
   aborted = false;
   completeCalls = 0;
+  throwOnNextComplete = false;
   constructor(
     public key: string,
     public uploadId: string,
@@ -28,6 +29,10 @@ class FakeUpload {
   }
   async complete(parts: Array<{ partNumber: number; etag: string }>) {
     this.completeCalls += 1;
+    if (this.throwOnNextComplete) {
+      this.throwOnNextComplete = false;
+      throw new Error("network error: ACK lost");
+    }
     this.completed = parts;
     return {} as R2Object;
   }
@@ -43,6 +48,7 @@ class FakeBucket {
   getCalls = 0;
   putCalls = 0;
   deleteCalls = 0;
+  headResult: R2Object | null = null;
   private seq = 0;
   async createMultipartUpload(key: string) {
     const u = new FakeUpload(key, `upload-${++this.seq}`);
@@ -64,6 +70,9 @@ class FakeBucket {
   }
   async delete(_key: string) {
     this.deleteCalls += 1;
+  }
+  async head(_key: string) {
+    return this.headResult;
   }
 }
 const bucket = () => new FakeBucket() as unknown as R2Bucket & FakeBucket;
@@ -204,5 +213,66 @@ describe("RealtimeRecorder — one object per session, tier=SKIP", () => {
     expect(rec.toMeta()).not.toBeNull();
     await rec.finalize();
     expect(rec.toMeta()).toBeNull();
+  });
+});
+
+describe("RealtimeRecorder — finalize() idempotency + toMeta() byte accuracy", () => {
+  it("complete() throws but object landed → finalize succeeds; second finalize returns cached result without re-completing", async () => {
+    const b = bucket();
+    b.headResult = {} as R2Object; // HEAD says object exists (complete landed but ACK lost)
+    const rec = await RealtimeRecorder.begin(b, ORG, "sess-fix1", webm(1024));
+    const up = b.created[0] as unknown as FakeUpload;
+    up.throwOnNextComplete = true;
+
+    // First finalize: complete() throws, HEAD returns truthy → treated as success
+    const result = await rec.finalize();
+    expect(result).not.toBeNull();
+    expect(result!.key).toBe(`${ORG}/realtime-recordings/sess-fix1/recording.webm`);
+    expect(up.completeCalls).toBe(1);
+
+    // Second finalize: returns cached result, does NOT call complete() again
+    const result2 = await rec.finalize();
+    expect(result2).toEqual(result);
+    expect(up.completeCalls).toBe(1); // still 1 — no second complete
+  });
+
+  it("complete() throws and object absent → rethrows; retry succeeds; complete called exactly twice, tail uploaded once", async () => {
+    const b = bucket();
+    b.headResult = null; // HEAD says absent (genuine failure)
+    const rec = await RealtimeRecorder.begin(b, ORG, "sess-fix2", webm(1024));
+    const up = b.created[0] as unknown as FakeUpload;
+    up.throwOnNextComplete = true;
+
+    // First finalize: complete() throws, HEAD returns null → rethrows
+    await expect(rec.finalize()).rejects.toThrow("network error: ACK lost");
+    expect(up.completeCalls).toBe(1);
+    // Tail was uploaded exactly once (during the first finalize attempt)
+    expect(up.parts).toHaveLength(1);
+
+    // Retry: complete() now succeeds (throwOnNextComplete was reset to false)
+    const result = await rec.finalize();
+    expect(result).not.toBeNull();
+    expect(up.completeCalls).toBe(2); // exactly two complete calls total
+    // Still only one part uploaded (tail was NOT re-uploaded on retry)
+    expect(up.parts).toHaveLength(1);
+  });
+
+  it("toMeta().totalBytes excludes the un-flushed tail; resumed recorder's result.bytes is accurate", async () => {
+    const b = bucket();
+    // Append PART_SIZE + 512 KiB: exactly one 5 MiB part flushes, 512 KiB stays in buf
+    const tailSize = 512 * 1024;
+    const rec = await RealtimeRecorder.begin(b, ORG, "sess-fix3", webm(PART_SIZE));
+    await rec.append(new Uint8Array(tailSize));
+
+    const meta = rec.toMeta()!;
+    // toMeta().totalBytes must be flushed bytes only (PART_SIZE), NOT PART_SIZE + tailSize
+    expect(meta.totalBytes).toBe(PART_SIZE);
+
+    // Resume from meta, append more, finalize — result.bytes = flushed-at-eviction + post-resume bytes
+    const postResumeSize = 256 * 1024;
+    const resumed = RealtimeRecorder.resume(b, meta);
+    await resumed.append(new Uint8Array(postResumeSize));
+    const done = await resumed.finalize();
+    expect(done!.bytes).toBe(PART_SIZE + postResumeSize);
   });
 });
