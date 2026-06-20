@@ -41,6 +41,9 @@ interface Env {
 const REALTIME_INTENTS = new Set(["join", "publish", "subscribe", "renegotiate", "leave"]);
 /** POST /v1/realtime/rooms/:room/:intent */
 const REALTIME_ROUTE = /^\/v1\/realtime\/rooms\/([^/]+)\/([^/]+)\/?$/;
+/** Whitelists for the UNTRUSTED gateway-stamped role/type values (reject anything off-list). */
+const ROLES = new Set(["host", "speaker", "viewer"]);
+const ROOM_TYPE_VALUES = new Set(["meeting", "webinar", "event", "breakout"]);
 
 /** Constant-time string compare (length check, then XOR-accumulate — no early return on content). */
 function timingSafeEqual(a: string, b: string): boolean {
@@ -167,11 +170,17 @@ export default {
 				payload = {}; // empty/invalid JSON → validated inside the DO/signaling layer
 			}
 			const participantId = typeof payload.participantId === "string" ? payload.participantId : "";
-			// Role is gateway-stamped via x-wave-role (set by the gateway after WRT verification).
-			// Room type comes from x-wave-room-type header or the join body; both are optional.
-			const role = request.headers.get("x-wave-role") ?? undefined;
-			const type = request.headers.get("x-wave-room-type") ??
+			// Role is gateway-stamped via x-wave-role (set by the gateway after WRT verification) and room
+			// type via x-wave-room-type header or the join body. Both are UNTRUSTED transport values:
+			// whitelist them before forwarding so a junk header can't corrupt permissions/policy.
+			const role = ROLES.has(request.headers.get("x-wave-role") ?? "")
+				? (request.headers.get("x-wave-role") as string)
+				: undefined;
+			const rawType = request.headers.get("x-wave-room-type") ??
 				(typeof payload.type === "string" ? payload.type : undefined);
+			const type = rawType !== undefined && ROOM_TYPE_VALUES.has(rawType) ? rawType : undefined;
+			// Anonymity marker stamped by the gateway from the WRT/auth context. Absent → identified.
+			const anon = (request.headers.get("x-wave-anon") ?? "") !== "";
 			// Forward to the room's DO with the already-authenticated context bound in. Per-org isolation is
 			// enforced by the DO id (org:room) AND re-checked inside the Room DO (org-mismatch → 403/409).
 			const id = env.ROOM.idFromName(`${org}:${room}`);
@@ -179,7 +188,7 @@ export default {
 			const intentReq = new Request(`https://room/${intent}`, {
 				method: "POST",
 				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ ...payload, ctx: { org, room, participantId, role, type } }),
+				body: JSON.stringify({ ...payload, ctx: { org, room, participantId, role, type, anon } }),
 			});
 			return stub.fetch(intentReq);
 		}

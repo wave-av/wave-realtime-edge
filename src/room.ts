@@ -50,6 +50,12 @@ const POLICY_DEFAULTS: Record<RoomType, AdmissionPolicy> = {
   breakout: { mode: "auto",  locked: false, capacity: null,  defaultRole: "viewer",  allowAnonymous: false },
 };
 
+/** The set of known room types — used to validate a `type` before it sets a policy (no empty policies). */
+export const ROOM_TYPES = Object.keys(POLICY_DEFAULTS) as RoomType[];
+export function isRoomType(t: unknown): t is RoomType {
+  return typeof t === "string" && (ROOM_TYPES as string[]).includes(t);
+}
+
 /** A participant waiting for admission (knock rooms). No SFU session is minted yet. */
 export interface WaitingEntry {
   participantId: string;
@@ -116,6 +122,13 @@ export interface RoomState {
   waiting: Record<string, WaitingEntry>;
   /** Permanently banned participant ids. A banned pid is denied immediately on join. */
   banned: string[];
+  /**
+   * Participants a host has admitted from the waiting room but who have not yet been seated (their
+   * retry join is still in flight). An admitted pid bypasses the knock check exactly once — the marker
+   * is consumed when joinRoom seats them. Without this, a knock-mode admissionCheck re-queues the SAME
+   * admitted participant forever (admit → retry → waiting → …).
+   */
+  admitted: string[];
 }
 
 /** Minimal storage surface (subset of DurableObjectStorage) — injectable for tests. */
@@ -132,7 +145,23 @@ const ROLE_DEFAULT_PERMS: Record<Role, Permissions> = {
 };
 
 function emptyState(): RoomState {
-  return { config: null, participants: {}, tracks: {}, emptyAt: Date.now(), policy: null, waiting: {}, banned: [] };
+  return { config: null, participants: {}, tracks: {}, emptyAt: Date.now(), policy: null, waiting: {}, banned: [], admitted: [] };
+}
+
+/**
+ * Normalize a loaded state record so code added after the original schema can rely on the admission
+ * fields being present. Records written before this change lack policy/waiting/banned/admitted; without
+ * this, `s.banned.includes(...)` / `delete s.waiting[...]` / `s.admitted.includes(...)` throw. Mutates
+ * and returns the same object (so the cached instance is normalized too).
+ */
+function normalizeState(s: RoomState): RoomState {
+  if (s.policy === undefined) s.policy = null;
+  if (!s.waiting) s.waiting = {};
+  if (!Array.isArray(s.banned)) s.banned = [];
+  if (!Array.isArray(s.admitted)) s.admitted = [];
+  if (!s.participants) s.participants = {};
+  if (!s.tracks) s.tracks = {};
+  return s;
 }
 
 /**
@@ -150,7 +179,7 @@ export class RoomCore {
 
   private async load(): Promise<RoomState> {
     if (this.state) return this.state;
-    this.state = (await this.storage.get<RoomState>(STATE_KEY)) ?? emptyState();
+    this.state = normalizeState((await this.storage.get<RoomState>(STATE_KEY)) ?? emptyState());
     return this.state;
   }
 
@@ -162,6 +191,11 @@ export class RoomCore {
   /** Bind the room to an org on first use. Idempotent for the SAME (roomId, org); rejects a mismatch.
    *  If `type` is provided and no policy is set yet, applies the corresponding POLICY_DEFAULTS entry. */
   async ensureRoom(config: RoomConfig): Promise<RoomConfig> {
+    // Validate the room type BEFORE it can set a policy: an unknown type would otherwise index
+    // POLICY_DEFAULTS as undefined and produce an empty (truthy) policy missing mode/locked/capacity.
+    if (config.type !== undefined && !isRoomType(config.type)) {
+      throw new SfuError("BAD_ROOM_TYPE", `unknown room type: ${String(config.type)}`, 400);
+    }
     const s = await this.load();
     if (s.config) {
       if (s.config.org !== config.org || s.config.roomId !== config.roomId) {
@@ -224,8 +258,9 @@ export class RoomCore {
       joinedAt: this.now(),
     };
     s.participants[p.participantId] = participant;
-    // If they were in the waiting room (admitted), remove them from there.
+    // Seated now: clear any waiting entry and consume the admitted marker (one-shot bypass).
     delete s.waiting[p.participantId];
+    s.admitted = s.admitted.filter((id) => id !== p.participantId);
     s.emptyAt = null; // occupied
     await this.save(s);
     return participant;
@@ -239,7 +274,7 @@ export class RoomCore {
    */
   async admissionCheck(
     org: string,
-    p: { participantId: string; role?: Role },
+    p: { participantId: string; role?: Role; anon?: boolean },
   ): Promise<WaitingResult | null> {
     const s = await this.load();
     if (!s.config) throw new SfuError("ROOM_NOT_BOUND", "room is not bound to an org", 409);
@@ -249,6 +284,10 @@ export class RoomCore {
     if (s.banned.includes(p.participantId)) {
       throw new SfuError("PARTICIPANT_BANNED", "participant is banned from this room", 403);
     }
+    // Enforce allowAnonymous: an anonymous (no WAVE account) joiner is refused before any seat/queue.
+    if (p.anon === true && s.policy.allowAnonymous === false) {
+      throw new SfuError("ANONYMOUS_FORBIDDEN", "anonymous participants are not allowed in this room", 403);
+    }
     if (s.policy.locked) {
       throw new SfuError("ROOM_LOCKED", "room is locked — no new participants allowed", 423);
     }
@@ -256,9 +295,15 @@ export class RoomCore {
     if (s.policy.capacity !== null && occupancy >= s.policy.capacity) {
       throw new SfuError("ROOM_FULL", "room has reached its participant capacity", 429);
     }
+    const role: Role = p.role ?? s.policy.defaultRole;
     if (s.policy.mode === "knock") {
-      const role: Role = p.role ?? s.policy.defaultRole;
+      // Hosts admit others — they themselves must never wait (a first host would deadlock the room).
+      if (role === "host") return null;
+      // An already-admitted pid passes through exactly once (the marker is consumed when seated by
+      // joinRoom). Without this, admit() → retry join() would re-queue the same participant forever.
+      if (s.admitted.includes(p.participantId)) return null;
       s.waiting[p.participantId] = { participantId: p.participantId, role, requestedAt: this.now() };
+      s.emptyAt = null; // a pending knock keeps the room active (see isExpired)
       await this.save(s);
       return { waiting: true, participantId: p.participantId };
     }
@@ -276,8 +321,11 @@ export class RoomCore {
     const s = await this.load();
     const entry = s.waiting[participantId];
     if (!entry) throw new SfuError("PARTICIPANT_NOT_WAITING", "participant is not in the waiting room", 404);
-    // Remove from waiting — signaling will call joinRoom to actually seat them.
+    // Remove from waiting and mark admitted — signaling will call joinRoom to actually seat them, and
+    // the admitted marker lets their retry join() bypass the knock check (consumed on seat).
     delete s.waiting[participantId];
+    if (!s.admitted.includes(participantId)) s.admitted.push(participantId);
+    s.emptyAt = null; // an admitted-but-not-yet-seated pid keeps the room active (see isExpired)
     await this.save(s);
     return entry;
   }
@@ -287,6 +335,9 @@ export class RoomCore {
     const s = await this.load();
     if (!s.waiting[participantId]) return;
     delete s.waiting[participantId];
+    s.admitted = s.admitted.filter((id) => id !== participantId);
+    // If that was the last reason to keep the room alive, start the TTL clock.
+    if (this.isIdle(s) && s.emptyAt == null) s.emptyAt = this.now();
     await this.save(s);
   }
 
@@ -308,6 +359,11 @@ export class RoomCore {
 
   /** Update the participant capacity limit. null = unlimited. */
   async setCapacity(n: number | null): Promise<void> {
+    // Reject anything but null or a non-negative safe integer: -1 makes every join look full, and
+    // NaN/floats compare inconsistently in the capacity check.
+    if (n !== null && (!Number.isSafeInteger(n) || n < 0)) {
+      throw new SfuError("BAD_CAPACITY", "capacity must be null or a non-negative integer", 400);
+    }
     const s = await this.load();
     if (!s.policy) return;
     s.policy.capacity = n;
@@ -458,8 +514,17 @@ export class RoomCore {
   async isExpired(): Promise<boolean> {
     const s = await this.load();
     if (!s.config || s.emptyAt == null) return false;
-    if (Object.keys(s.participants).length > 0) return false;
+    // A room is only "empty" when it has no seated participants AND no pending knocks/admits — a host
+    // who steps away while people are knocking must not have the room GC'd out from under them.
+    if (!this.isIdle(s)) return false;
     return this.now() >= s.emptyAt + (s.config.ttlMs ?? DEFAULT_ROOM_TTL_MS);
+  }
+
+  /** True when the room has no seated participants AND no pending waiting/admitted queues. */
+  private isIdle(s: RoomState): boolean {
+    return Object.keys(s.participants).length === 0 &&
+      Object.keys(s.waiting).length === 0 &&
+      s.admitted.length === 0;
   }
 
   /** Read-only snapshot for the signaling layer / tests. */

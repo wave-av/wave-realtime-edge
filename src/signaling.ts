@@ -27,6 +27,11 @@ export interface SignalContext {
   role?: Role;
   /** Room type forwarded by the worker; used to set the admission policy on first bind. */
   type?: RoomType;
+  /**
+   * Whether this joiner is anonymous (no authenticated WAVE account). Stamped by the worker from the
+   * gateway's `x-wave-anon` marker. Enforced against policy.allowAnonymous in admissionCheck.
+   */
+  anon?: boolean;
 }
 
 /** A track the client wants to publish: a transceiver mid + a CF Realtime track name + its kind. */
@@ -95,7 +100,7 @@ export class Signaling {
 
     // Admission pre-check: enforces ban/lock/capacity/knock before we spend a SFU session.
     // Returns { waiting: true } for knock rooms, null to proceed for auto/no-policy.
-    const waiting = await this.room.admissionCheck(ctx.org, { participantId: ctx.participantId, role });
+    const waiting = await this.room.admissionCheck(ctx.org, { participantId: ctx.participantId, role, anon: ctx.anon });
     if (waiting) return waiting; // knocking — no SFU session minted
 
     // Auto/no-policy: mint SFU session, then record in room state.
