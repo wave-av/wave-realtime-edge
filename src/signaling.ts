@@ -14,7 +14,7 @@
 //
 // No live network in tests: the SfuClient's HTTP is injectable and RoomCore's storage is injectable.
 
-import { RoomCore, Role, TrackKind } from "./room.js";
+import { RoomCore, Role, RoomType, TrackKind, WaitingResult } from "./room.js";
 import { SfuClient, SessionDescription, LocalTrack } from "./sfu.js";
 import { emitParticipantUsage, MeterEmitEnv } from "./metering.js";
 
@@ -23,6 +23,15 @@ export interface SignalContext {
   org: string;
   room: string;
   participantId: string;
+  /** Role stamped by the gateway (from a WRT or an operator call). Optional — falls back to policy default. */
+  role?: Role;
+  /** Room type forwarded by the worker; used to set the admission policy on first bind. */
+  type?: RoomType;
+  /**
+   * Whether this joiner is anonymous (no authenticated WAVE account). Stamped by the worker from the
+   * gateway's `x-wave-anon` marker. Enforced against policy.allowAnonymous in admissionCheck.
+   */
+  anon?: boolean;
 }
 
 /** A track the client wants to publish: a transceiver mid + a CF Realtime track name + its kind. */
@@ -39,6 +48,9 @@ export interface JoinResult {
   /** The SFU's SDP answer, when the join carried a client offer. */
   sessionDescription?: SessionDescription;
 }
+
+/** Returned by join() when the room is in knock mode and the participant is placed in the waiting room. */
+export type JoinOrWaiting = JoinResult | WaitingResult;
 
 export interface NegotiateResult {
   /** Per-track status echoed by the SFU (empty for renegotiate). */
@@ -72,23 +84,35 @@ export class Signaling {
   ) {}
 
   /**
-   * JOIN: bind the room to the org (idempotent), mint an SFU session (forwarding the client offer if
-   * any), then record the participant in the Room DO with that session id. Order matters — the SFU
-   * session must exist before the participant is recorded against it.
+   * JOIN: bind the room to the org (idempotent), run the admission pre-check, then (if admitted)
+   * mint an SFU session and record the participant in the Room DO.
+   *
+   * When the room is in "knock" mode the participant is placed in the waiting room and a
+   * `{ waiting: true, participantId }` sentinel is returned WITHOUT minting an SFU session —
+   * the host calls admit() and the participant retries.
+   *
+   * Role precedence: ctx.role (gateway-stamped) → opts.role → policy default → "speaker".
    */
-  async join(ctx: SignalContext, opts: { role?: Role; offer?: SessionDescription } = {}): Promise<JoinResult> {
+  async join(ctx: SignalContext, opts: { role?: Role; offer?: SessionDescription } = {}): Promise<JoinOrWaiting> {
     this.assertCtx(ctx);
-    await this.room.ensureRoom({ roomId: ctx.room, org: ctx.org });
+    const role: Role | undefined = ctx.role ?? opts.role;
+    await this.room.ensureRoom({ roomId: ctx.room, org: ctx.org, type: ctx.type });
+
+    // Admission pre-check: enforces ban/lock/capacity/knock before we spend a SFU session.
+    // Returns { waiting: true } for knock rooms, null to proceed for auto/no-policy.
+    const waiting = await this.room.admissionCheck(ctx.org, { participantId: ctx.participantId, role, anon: ctx.anon });
+    if (waiting) return waiting; // knocking — no SFU session minted
+
+    // Auto/no-policy: mint SFU session, then record in room state.
     const session = await this.sfu.newSession(opts.offer);
     const participant = await this.room.joinRoom(ctx.org, {
       participantId: ctx.participantId,
       sessionId: session.sessionId,
-      role: opts.role,
+      role,
     });
     return {
       participantId: participant.participantId,
       sessionId: session.sessionId,
-      // The SFU echoes its SDP answer on the create-session response when a client offer was sent.
       sessionDescription: session.sessionDescription,
     };
   }

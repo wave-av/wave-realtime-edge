@@ -62,8 +62,10 @@ describe("Signaling.join", () => {
 		const { sig, core } = makeSignaling(fn);
 
 		const res = await sig.join(CTX_A);
-		expect(res.sessionId).toBe(SESSION_A);
-		expect(res.participantId).toBe("p_alice");
+		expect("waiting" in res).toBe(false);
+		const joined = res as import("../src/signaling.js").JoinResult;
+		expect(joined.sessionId).toBe(SESSION_A);
+		expect(joined.participantId).toBe("p_alice");
 
 		const snap = await core.snapshot();
 		expect(snap.config?.org).toBe("org_a");
@@ -78,7 +80,9 @@ describe("Signaling.join", () => {
 		]);
 		const { sig } = makeSignaling(fn);
 		const res = await sig.join(CTX_A, { offer: { type: "offer", sdp: "v=0" } });
-		expect(res.sessionDescription).toEqual({ type: "answer", sdp: "a=ans" });
+		expect("waiting" in res).toBe(false);
+		const joined = res as import("../src/signaling.js").JoinResult;
+		expect(joined.sessionDescription).toEqual({ type: "answer", sdp: "a=ans" });
 	});
 
 	it("honors an explicit role (viewer cannot publish later)", async () => {
