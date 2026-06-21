@@ -37,6 +37,21 @@ RTK_APP_ID = "6dee33e5-cd89-41e8-a81c-9a8cd48bb9c3"
 # = https://api.wave.online. (sfu.ts/room.ts are P5 substrate; the metering tap reads this when wired.)
 GATEWAY_BASE_URL = "https://api.wave.online"
 
+# ── RT-P1.5 — pluggable recording encoders (design §6). DEFAULT DISARMED / DORMANT. ──
+# RT_RECORD arms recording at all; absent/"0" → selectEncoder() returns the inert DisarmedEncoder (begin →
+# null), so the whole feature is a no-op (config-no-silent-noop: inert, not silently broken). Arming
+# RT_RECORD=1 in any live env is a ◆ Jake-named crossing (design §8.5(6)).
+RT_RECORD = "0"
+# RT_ENCODER selects the adapter when armed: "managed" (C, the buildable path) | "container" (A) | "wasm"
+# (B). A/B are BLOCKED-ON-RT-P0.1-spike and throw NOT_SPIKED at begin until the §7 WS media-transport spike.
+RT_ENCODER = "managed"
+# RT_RECORDINGS — the SKIP sink R2 bucket. Binding attach is ◆ RT-P2.4 (#34); declared dormant below so the
+# code path is visible but no bucket is attached until Jake names the crossing. Until then, even when armed
+# the adapter fails open (records nothing) because the binding is absent.
+# [[r2_buckets]]
+# binding = "RT_RECORDINGS"
+# bucket_name = "wave-realtime-recordings"   # ◆ create + attach at RT-P2.4 deploy (Jake-named)
+
 # ── CF Realtime SFU app creds (P5 — sfu.ts) — wrangler SECRETS, referenced not valued ──
 # These are NOT set here. Set via `wrangler secret put`, values from Doppler wave/prd:
 #   CF_CALLS_APP_ID      — CF Realtime app id (app "wispy-feather-fa96"). sfu.ts SfuClient appId.

@@ -160,6 +160,24 @@ export class RealtimeRecorder {
     return this.parts.length;
   }
 
+  /**
+   * RT-P1.5 convenience: loop a `ReadableStream<Uint8Array>` into `append`, used by adapter C to stream a
+   * finished WebM file (from CF managed recording) into the one canonical object. ADD-ONLY — this is plain
+   * sugar over `append`; it adds NO hash/claim/index code and does NOT change the SKIP invariant.
+   */
+  async appendFrom(stream: ReadableStream<Uint8Array>): Promise<void> {
+    const reader = stream.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && value.length > 0) await this.append(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
   /** Append one media chunk, flushing whole PART_SIZE parts as they fill. Empty/no-upload chunks are no-ops. */
   async append(payload: Uint8Array): Promise<void> {
     if (!this.upload || payload.length === 0) return;
