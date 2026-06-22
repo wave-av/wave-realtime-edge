@@ -5,6 +5,7 @@
 // RT_ENCODER managed) still 101s the route but the DO feed is a no-op for managed — covered in orchestration.
 import { describe, it, expect, beforeAll } from "vitest";
 import worker from "../src/worker.js";
+import { mintRecorderToken } from "../src/encoders/recorder-auth.js";
 
 const ctx = { waitUntil: () => {} } as unknown as ExecutionContext;
 
@@ -66,6 +67,55 @@ describe("recorder route — gateway-trust chokepoint", () => {
     );
     expect(res.status).toBeLessThan(400); // 101 on Workers; 200 fallback in the Node test env (both = upgraded)
     expect(accepted).toBe(1);
+  });
+});
+
+describe("recorder route — signed capability token (?t=) authenticates the SFU dial-in", () => {
+  it("valid ?t= token + upgrade → accepts auth (server accept, not 401/4xx) — no x-wave-internal needed", async () => {
+    accepted = 0;
+    const t = await mintRecorderToken("s", "org_x", "sess_ABC12345", "mic");
+    const res = await worker.fetch(
+      new Request(`https://rt.wave.online${PATH}?t=${t}`, { method: "GET", headers: { Upgrade: "websocket" } }),
+      env({ WAVE_INTERNAL_SECRET: "s", RT_RECORD: "1" }),
+      ctx,
+    );
+    expect(res.status).toBeLessThan(400);
+    expect(accepted).toBe(1);
+  });
+
+  it("no token + no x-wave-internal → 401", async () => {
+    const res = await worker.fetch(req({ Upgrade: "websocket" }), env({ WAVE_INTERNAL_SECRET: "s", RT_RECORD: "1" }), ctx);
+    expect(res.status).toBe(401);
+  });
+
+  it("valid x-wave-internal (no token) still works → server accept", async () => {
+    accepted = 0;
+    const res = await worker.fetch(
+      req({ Upgrade: "websocket", "x-wave-internal": "s" }),
+      env({ WAVE_INTERNAL_SECRET: "s", RT_RECORD: "1" }),
+      ctx,
+    );
+    expect(res.status).toBeLessThan(400);
+    expect(accepted).toBe(1);
+  });
+
+  it("invalid token + no header → 401", async () => {
+    const res = await worker.fetch(
+      new Request(`https://rt.wave.online${PATH}?t=999999999999.tampered`, { method: "GET", headers: { Upgrade: "websocket" } }),
+      env({ WAVE_INTERNAL_SECRET: "s", RT_RECORD: "1" }),
+      ctx,
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("token minted for a DIFFERENT track → 401 (scoped, no cross-use)", async () => {
+    const t = await mintRecorderToken("s", "org_x", "sess_ABC12345", "speaker"); // PATH track is 'mic'
+    const res = await worker.fetch(
+      new Request(`https://rt.wave.online${PATH}?t=${t}`, { method: "GET", headers: { Upgrade: "websocket" } }),
+      env({ WAVE_INTERNAL_SECRET: "s", RT_RECORD: "1" }),
+      ctx,
+    );
+    expect(res.status).toBe(401);
   });
 });
 
