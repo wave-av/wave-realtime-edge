@@ -69,10 +69,16 @@ export interface ManagedRecordingApi {
  * creds (throws → caller's begin() catches → records nothing, never blocks media).
  */
 export class DefaultManagedRecordingApi implements ManagedRecordingApi {
+  private readonly fetchImpl: typeof fetch;
   constructor(
     private readonly env: EncoderEnv,
-    private readonly fetchImpl: typeof fetch = fetch,
-  ) {}
+    fetchImpl: typeof fetch = fetch,
+  ) {
+    // Bind to globalThis. Native `fetch` throws "Illegal invocation" when called as a method — `this.fetchImpl(...)`
+    // would set this=the api instance instead of the global. Binding makes every call site safe (and is a harmless
+    // no-op for an injected test fake, which ignores `this`). See developers.cloudflare.com/workers/observability/errors.
+    this.fetchImpl = fetchImpl.bind(globalThis);
+  }
 
   private base(): string {
     const acc = this.env.CF_ACCOUNT_ID ?? "";

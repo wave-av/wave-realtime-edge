@@ -102,6 +102,19 @@ describe("DefaultManagedRecordingApi (PULL) — RTK recording REST", () => {
     await expect(api.start("m")).rejects.toThrow(/not configured/);
   });
 
+  it("binds fetch to globalThis (regression: native fetch as a method → 'Illegal invocation' in Workers)", async () => {
+    let calledThis: unknown = "unset";
+    function fake(this: unknown) {
+      calledThis = this;
+      return new Response(JSON.stringify({ success: true, data: { id: REC, download_url: "https://cdn/x.mp4" } }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    const api = new DefaultManagedRecordingApi(env, fake as unknown as typeof fetch);
+    await api.getDownloadUrl(REC);
+    expect(calledThis).not.toBe(api); // never invoked as a method of the api instance (would Illegal-invoke real fetch)
+  });
+
   it("fetchRecording passes redirect:'error' (SSRF: a 30x must not be followed past the host guard)", async () => {
     let seenInit: RequestInit | undefined;
     const impl = (async (_url: string, init?: RequestInit) => {
