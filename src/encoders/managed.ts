@@ -1,125 +1,76 @@
 /// <reference types="@cloudflare/workers-types" />
 /**
- * RT-P1.5 — Adapter C: CF-native managed WebM recording (design §2). The FASTEST path to a real recording
- * on disk: don't encode anything ourselves. Ask CF to record the session to WebM, then stream the finished
- * file into the SKIP-tier `RealtimeRecorder` so it lands as the one canonical org-prefixed object —
- * uniform storage path / lifecycle / SKIP semantics regardless of who encoded it.
+ * RT-P2.5 — Adapter C: CF-native managed recording, PULL mode (design §2, corrected 2026-06-22).
  *
- * Data flow (design §2):
- *   begin(session) → POST CF managed-recording start  (recordingId)        [no local media]
- *   onPublish(...)  → no-op (CF taps the SFU/RTK session directly)
- *   finalize()      → POST stop → poll for the ready WebM URL → fetch(stream) → recorder.appendFrom(stream)
- *                   → recorder.finalize()  // ONE canonical .webm, SKIP, no hash
+ * WHY PULL (not direct): RealtimeKit CANNOT upload a recording into our R2 inline. Its `storage_config`
+ * destination enum is `aws | azure | digitalocean | gcs | sftp` — there is NO `cloudflare`/R2 option, and a
+ * `type:"cloudflare"` is silently dropped (the recording lands in RTK's OWN bucket with RTK key-naming, which
+ * has no per-org path → breaks our org-prefix sweep metering). So the ONLY way recordings reach OUR bucket
+ * under OUR org-rooted key is to PULL them after the fact:
  *
- * SKIP compliance: C never sees frames and never hashes — it streams a finished file into `appendFrom`.
- * Trivially SKIP-clean. This module NEVER imports `@wave-av/content-hash`.
+ *   /rtk/join (stateless)  → api.start(meetingId)            // RTK records to ITS OWN storage; persist meetingId→org
+ *   meeting runs … ends … RTK auto-stops … uploads to RTK storage … fires `recording.statusUpdate` UPLOADED
+ *   webhook (rtk-webhook.ts) → lookup org by meetingId → resolve download_url → fetch → RealtimeRecorder
+ *                            → ONE canonical object at `${org}/realtime-recordings/${meetingId}/recording.mp4`
  *
- * OPEN DEPENDENCY (design §2 caveat / §7 spike): CF managed/track recording is documented as an RTK-meeting
- * feature; the exact endpoint for a raw CF-Calls SFU session must be confirmed in the §7 spike. That
- * dependency does NOT block this code — the REST surface is injectable (`ManagedRecordingApi`) so the
- * adapter is fully unit-testable with a fake, and the real endpoint shape is the ONE thing the spike fills.
+ * The webhook owns the byte-pull because the stateless /rtk/join request returns in milliseconds and has no
+ * way to drive an in-worker finalize across a multi-minute meeting; the signed webhook IS the "recording is
+ * ready" signal (no polling needed — it fires exactly at UPLOADED). This module therefore only needs to
+ * START the recording and expose the REST primitives the webhook pull uses (resolve download_url + fetch).
+ *
+ * SKIP compliance: nothing here hashes or claims; this module NEVER imports `@wave-av/content-hash`. The
+ * webhook pull streams a finished file straight into the SKIP-tier `RealtimeRecorder` (one object, no dedup).
  */
-import { RealtimeRecorder, type RecordingResult } from "../recording-writer.js";
 import type { EncoderEnv, EncoderHandle, RecordingEncoder, RecordingSession } from "./encoder.js";
+import type { RecordingResult } from "../recording-writer.js";
+
+const CF_API_BASE = "https://api.cloudflare.com/client/v4"; // fixed host — no request-derived URLs (SSRF-safe)
+const HEX32 = /^[0-9a-f]{32}$/i;
+const UUIDISH = /^[0-9a-z-]{16,64}$/i;
 
 /**
- * RTK `storage_config` (direct mode): hand CF an R2 destination so it uploads the finished recording STRAIGHT
- * to our bucket at an org-rooted path. `type:"cloudflare"` = R2; `access_key`/`secret` are an R2 S3-API token;
- * `path` is the org-rooted key prefix the daily storage sweep bills by. (RTK recording-guide storage_config.)
+ * Is adapter C (PULL mode) fully configured to arm a recording on the stateless /rtk/join path? Requires:
+ *   • armed (RT_RECORD==="1")
+ *   • RTK REST creds to START a recording (CF_ACCOUNT_ID / RTK_APP_ID / CF_API_TOKEN)
+ *   • the SKIP sink R2 binding (RT_RECORDINGS) — the webhook writes the pulled bytes there
+ *   • the meeting→org KV (RT_MEETING_ORG) — the webhook attributes the recording by meetingId
+ * Any absent → false (the caller logs loudly and records nothing — config-no-silent-noop). Note: unlike the
+ * retired "direct" mode this does NOT need R2 S3 creds (we never hand RTK an R2 destination — RTK uses its own
+ * storage and we pull).
  */
-export interface RtkStorageConfig {
-  type: "cloudflare";
-  bucket: string;
-  path: string; // `${org}/realtime-recordings/${meetingId}/`
-  account_id: string;
-  access_key: string;
-  secret: string;
-}
-
-/**
- * The CF managed-recording REST surface, injected so the adapter is testable without live network. The
- * concrete URLs/auth are filled by the §7 spike; `DefaultManagedRecordingApi` is the live binding.
- */
-export interface ManagedRecordingApi {
-  /**
-   * Ask CF to start recording the meeting `sessionId`; returns the managed recording id. When `storageConfig`
-   * is given (direct mode), CF uploads the finished recording straight to that R2 destination.
-   */
-  start(sessionId: string, storageConfig?: RtkStorageConfig): Promise<{ recordingId: string }>;
-  /** Ask CF to stop recording, poll until ready, and return a fetchable WebM URL (or null if nothing). */
-  stop(recordingId: string): Promise<{ webmUrl: string } | null>;
-  /** Fetch the finished WebM as a byte stream (null body → nothing recorded). */
-  fetchRecording(webmUrl: string): Promise<ReadableStream<Uint8Array> | null>;
-}
-
-/**
- * Build the direct-mode `storage_config` from env + session, or null when direct mode is not fully
- * configured (any of: bucket name, account id, R2 access key/secret, or the session org is missing). Null is
- * the signal to `begin()` that direct recording can't proceed — it loud-nulls rather than silently no-op.
- */
-export function buildStorageConfig(env: EncoderEnv, session: RecordingSession): RtkStorageConfig | null {
-  const bucket = env.RT_RECORDINGS_BUCKET;
-  const account_id = env.CF_ACCOUNT_ID;
-  const access_key = env.RT_R2_ACCESS_KEY_ID;
-  const secret = env.RT_R2_SECRET_ACCESS_KEY;
-  if (!bucket || !account_id || !access_key || !secret || !session.org) return null;
-  return {
-    type: "cloudflare",
-    bucket,
-    path: `${session.org}/realtime-recordings/${session.sessionId}/`,
-    account_id,
-    access_key,
-    secret,
-  };
-}
-
-/**
- * Is adapter C's "direct" mode fully configured (armed + R2 destination creds present)? The stateless
- * /rtk/join path arms recording ONLY when this is true, because direct mode is the only managed mechanism
- * that COMPLETES without an in-worker finalize (RTK uploads to R2 itself; the webhook confirms). Returns
- * false when disarmed or any R2 cred is absent — the caller logs loudly and records nothing.
- */
-export function directRecordingConfigured(env: EncoderEnv): boolean {
+export function pullRecordingConfigured(env: EncoderEnv): boolean {
   return (
     env.RT_RECORD === "1" &&
-    !!env.RT_RECORDINGS_BUCKET &&
     !!env.CF_ACCOUNT_ID &&
-    !!env.RT_R2_ACCESS_KEY_ID &&
-    !!env.RT_R2_SECRET_ACCESS_KEY
+    HEX32.test(env.CF_ACCOUNT_ID) &&
+    !!env.RTK_APP_ID &&
+    !!env.CF_API_TOKEN &&
+    !!env.RT_RECORDINGS &&
+    !!env.RT_MEETING_ORG
   );
 }
 
 /**
- * Live binding for the RealtimeKit (Cloudflare Realtime managed) recording REST API — §7 spike captured
- * (api-contracts-rtk-and-ws-adapter.md, verified against developers.cloudflare.com/realtime/realtimekit/
- * recording-guide). RealtimeKit records the MEETING (not a raw SFU session) → for adapter C, the
- * RecordingSession.sessionId IS the RTK meeting id (the worker maps an /rtk meeting to it).
- *
- *   start  → POST /accounts/{acc}/realtime/kit/{app}/recordings {meeting_id}  → data.id (recordingId)
- *   stop   → PUT  /accounts/{acc}/realtime/kit/{app}/recordings/{id} {action:"stop"}, then poll
- *            GET  /accounts/{acc}/realtime/kit/{app}/recordings/{id} until status UPLOADED → download_url
- *   fetch  → GET the download_url body (composite mp4 / track webm)
- *
- * Fail-CLOSED on unconfigured creds (throws → caller's begin() catches → records nothing, never blocks
- * media). The bounded poll keeps a slow upload from hanging the Worker; when it times out, finalize()
- * yields null and the `recording.statusUpdate` webhook (RT-R-WH) is the completion fallback. The poll
- * delay is injected so tests run with no real timers.
+ * The CF managed-recording REST surface, injected so the adapter is testable without live network.
+ *   start            → POST /accounts/{acc}/realtime/kit/{app}/recordings {meeting_id} → data.id (recordingId)
+ *   getDownloadUrl   → GET  /accounts/{acc}/realtime/kit/{app}/recordings/{id} → data.download_url (when the
+ *                       webhook event omits it; the webhook normally carries downloadUrl directly)
+ *   fetchRecording   → GET the download_url body (composite mp4) as a byte stream
  */
-const CF_API_BASE = "https://api.cloudflare.com/client/v4"; // fixed host — no request-derived URLs (SSRF-safe)
-const HEX32 = /^[0-9a-f]{32}$/i;
-const UUIDISH = /^[0-9a-z-]{16,64}$/i;
-/** Terminal-ok upload states for the stop() poll. */
-const UPLOADED = "UPLOADED";
-const ERRORED = "ERRORED";
+export interface ManagedRecordingApi {
+  start(meetingId: string): Promise<{ recordingId: string }>;
+  getDownloadUrl(recordingId: string): Promise<string | null>;
+  fetchRecording(url: string): Promise<ReadableStream<Uint8Array> | null>;
+}
 
+/**
+ * Live binding for the RealtimeKit (Cloudflare Realtime managed) recording REST API. RealtimeKit records the
+ * MEETING → for adapter C the RecordingSession.sessionId IS the RTK meeting id. Fail-CLOSED on unconfigured
+ * creds (throws → caller's begin() catches → records nothing, never blocks media).
+ */
 export class DefaultManagedRecordingApi implements ManagedRecordingApi {
   constructor(
     private readonly env: EncoderEnv,
-    /** Injected for tests: a no-op delay so the bounded poll spins without real timers. */
-    private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
-    /** Bounded poll: how many GETs before giving up to the webhook (default ~30s at 3s each). */
-    private readonly maxPolls = 10,
-    private readonly pollMs = 3000,
     private readonly fetchImpl: typeof fetch = fetch,
   ) {}
 
@@ -150,13 +101,12 @@ export class DefaultManagedRecordingApi implements ManagedRecordingApi {
     return json.data;
   }
 
-  async start(meetingId: string, storageConfig?: RtkStorageConfig): Promise<{ recordingId: string }> {
-    const body: Record<string, unknown> = { meeting_id: meetingId };
-    if (storageConfig) body.storage_config = storageConfig; // direct mode → RTK uploads straight to our R2
+  /** Start recording the meeting. PULL mode: NO storage_config — RTK records to its own storage; we pull later. */
+  async start(meetingId: string): Promise<{ recordingId: string }> {
     const res = await this.fetchImpl(this.base(), {
       method: "POST",
       headers: this.headers(),
-      body: JSON.stringify(body),
+      body: JSON.stringify({ meeting_id: meetingId }),
     });
     const data = await this.data(res);
     const id = String(data.id ?? "");
@@ -164,47 +114,46 @@ export class DefaultManagedRecordingApi implements ManagedRecordingApi {
     return { recordingId: id };
   }
 
-  async stop(recordingId: string): Promise<{ webmUrl: string } | null> {
+  /**
+   * Resolve a fresh download URL for a finished recording (GET the recording object). Used by the webhook pull
+   * only when the `recording.statusUpdate` event itself omitted the URL. Returns null (not throw) on any
+   * non-success so the pull treats it as "nothing to fetch" — best-effort, never blocks the ack.
+   */
+  async getDownloadUrl(recordingId: string): Promise<string | null> {
     if (!UUIDISH.test(recordingId)) return null;
-    const stopRes = await this.fetchImpl(`${this.base()}/${recordingId}`, {
-      method: "PUT",
-      headers: this.headers(),
-      body: JSON.stringify({ action: "stop" }),
-    });
-    // A stop on an already-stopped/auto-stopped recording is fine — fall through to the status poll.
-    if (!stopRes.ok && stopRes.status !== 409) {
-      // best-effort: don't throw the finalize down; the webhook is the completion fallback.
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${this.base()}/${recordingId}`, { headers: this.headers() });
+    } catch {
       return null;
     }
-    for (let i = 0; i < this.maxPolls; i++) {
-      const res = await this.fetchImpl(`${this.base()}/${recordingId}`, { headers: this.headers() });
-      let data: Record<string, unknown> | null = null;
-      try {
-        data = await this.data(res);
-      } catch {
-        data = null;
-      }
-      const status = String(data?.status ?? "");
-      if (status === UPLOADED) {
-        const url = String(data?.download_url ?? "");
-        return url ? { webmUrl: url } : null;
-      }
-      if (status === ERRORED) return null;
-      await this.sleep(this.pollMs);
+    let data: Record<string, unknown> | null = null;
+    try {
+      data = await this.data(res);
+    } catch {
+      return null;
     }
-    return null; // timed out → webhook (RT-R-WH) completes the registration
+    const url = String(data?.download_url ?? data?.downloadUrl ?? "");
+    return url || null;
   }
 
-  async fetchRecording(webmUrl: string): Promise<ReadableStream<Uint8Array> | null> {
-    const res = await this.fetchImpl(webmUrl);
+  /**
+   * Fetch the finished recording as a byte stream (null body → nothing to write). `redirect:"error"` —
+   * RTK's signed download URLs are terminal, so a 30x is unexpected AND would bypass the caller's
+   * isSafePublicHttpsUrl host guard (a redirect to a private/metadata host = SSRF). Fail closed: a redirect
+   * throws → the webhook catch logs an alarm + enqueues a pending retry, never failing the ack.
+   */
+  async fetchRecording(url: string): Promise<ReadableStream<Uint8Array> | null> {
+    const res = await this.fetchImpl(url, { redirect: "error" });
     if (!res.ok || !res.body) return null;
     return res.body;
   }
 }
 
 /**
- * ManagedEncoder (adapter C). Constructed armed (RT_RECORD==="1") by the factory; `begin` starts the CF
- * managed recording and returns a handle whose `finalize` streams the finished WebM into the SKIP sink.
+ * ManagedEncoder (adapter C, PULL mode). The factory constructs it armed (RT_RECORD==="1"). `begin` starts the
+ * RTK recording (RTK → its own storage) and returns a correlation-only handle — there is NOTHING to finalize
+ * in-worker on this stateless path; the `recording.statusUpdate` webhook pulls the finished file into our R2.
  */
 export class ManagedEncoder implements RecordingEncoder {
   readonly kind = "managed" as const;
@@ -218,124 +167,43 @@ export class ManagedEncoder implements RecordingEncoder {
   }
 
   async begin(session: RecordingSession): Promise<EncoderHandle | null> {
-    if (this.env.RT_RECORD !== "1") return null; // disarmed → caller no-ops (defense in depth; factory also gates)
-
-    // DIRECT mode (the shipped managed path): RTK uploads straight to our R2 at an org-rooted path. Preferred —
-    // the bytes never transit this worker, so a multi-GB meeting recording can't hit a worker CPU/time limit,
-    // and there is no in-worker finalize to drive (RTK auto-stops; the recording.statusUpdate webhook confirms).
-    const storage = buildStorageConfig(this.env, session);
-    if (storage) {
-      let started: { recordingId: string };
-      try {
-        started = await this.api.start(session.sessionId, storage);
-      } catch {
-        return null; // best-effort — a start failure must never throw the session down
-      }
-      return new DirectManagedHandle(started.recordingId, session, storage.path);
-    }
-
-    // FETCH+STREAM mode (for a STATEFUL caller that holds the session lifecycle and WILL call finalize — e.g. a
-    // DO-driven meeting): the worker fetches the finished recording and streams it into the SKIP sink itself.
-    // Requires the RT_RECORDINGS R2 binding. The stateless /rtk/join path does NOT reach here (it gates on
-    // directRecordingConfigured()); a caller here without direct creds has opted into driving finalize.
-    const bucket = this.env.RT_RECORDINGS;
-    if (!bucket) return null; // armed but neither direct creds nor a sink binding → fail-open, record nothing
+    if (this.env.RT_RECORD !== "1") return null; // disarmed (defense in depth; the factory also gates)
     let started: { recordingId: string };
     try {
       started = await this.api.start(session.sessionId);
     } catch {
-      return null;
+      return null; // best-effort — a start failure must never throw the session down
     }
-    return new ManagedHandle(this.api, bucket, session, started.recordingId);
+    return new PullManagedHandle(started.recordingId, session);
   }
 }
 
 /**
- * Direct-mode handle: RTK uploads the recording to our R2 itself, so there is nothing for the worker to flush
- * or finalize — the bytes land out-of-band and the `recording.statusUpdate` webhook (RT-R-WH) is the
- * completion signal. `recordingId`/`keyPrefix` are exposed for logging + the webhook/index correlation. C
- * never taps frames, so `onPublish` is intentionally absent.
+ * PULL-mode handle: RTK records to its own storage and the worker pulls the finished file in the webhook, so
+ * there is nothing for this stateless handle to flush or finalize. It carries the correlation (recordingId +
+ * org-rooted keyPrefix) for the arm-time log line + webhook/index correlation. C never taps frames, so
+ * `onPublish` is intentionally absent.
  */
-export class DirectManagedHandle implements EncoderHandle {
+export class PullManagedHandle implements EncoderHandle {
+  /** Org-rooted R2 key prefix the webhook will write the pulled recording under. */
+  readonly keyPrefix: string;
   constructor(
     readonly recordingId: string,
     readonly session: RecordingSession,
-    /** Org-rooted R2 key prefix RTK writes the recording under (`${org}/realtime-recordings/${meetingId}/`). */
-    readonly keyPrefix: string,
-  ) {}
+  ) {
+    this.keyPrefix = `${session.org}/realtime-recordings/${session.sessionId}/`;
+  }
 
-  /** Nothing to finalize in-worker — RTK owns the upload. The webhook is the authoritative completion. */
+  /** Nothing to finalize in-worker — the webhook pull owns the byte transfer + the one canonical object. */
   async finalize(): Promise<RecordingResult | null> {
     return null;
   }
 
-  /** No-op: a started RTK recording auto-stops on CF's side; we never stop a live meeting from here. */
+  /** No-op: a started RTK recording auto-stops when the meeting ends; we never stop a live meeting from here. */
   async abort(): Promise<void> {}
 
-  /** No hibernation state — RTK owns the upload, not this worker. */
+  /** No hibernation state — the pull is webhook-driven, not held in this worker. */
   toMeta(): unknown | null {
     return null;
-  }
-}
-
-/** One session's managed-recording handle. C never taps frames, so onPublish is intentionally absent. */
-class ManagedHandle implements EncoderHandle {
-  private recorder: RealtimeRecorder | null = null;
-  private finalized: RecordingResult | null = null;
-  private done = false;
-
-  constructor(
-    private readonly api: ManagedRecordingApi,
-    private readonly bucket: R2Bucket,
-    private readonly session: RecordingSession,
-    private readonly recordingId: string,
-  ) {}
-
-  async finalize(): Promise<RecordingResult | null> {
-    if (this.done) return this.finalized; // idempotent
-    this.done = true;
-    let ready: { webmUrl: string } | null = null;
-    try {
-      ready = await this.api.stop(this.recordingId);
-    } catch {
-      return null; // best-effort
-    }
-    if (!ready) return null;
-    const stream = await this.api.fetchRecording(ready.webmUrl);
-    if (!stream) return null;
-
-    // Stream the finished WebM into the SKIP sink. `begin` needs the first bytes to sniff the container, so
-    // tee a small head: read one chunk, seed the recorder, then drain the rest. tier=SKIP throughout.
-    const reader = stream.getReader();
-    try {
-      const first = await reader.read();
-      if (first.done || !first.value || first.value.length === 0) {
-        return null; // nothing recorded → never a 0-byte object
-      }
-      this.recorder = await RealtimeRecorder.begin(
-        this.bucket,
-        this.session.org,
-        this.session.sessionId,
-        first.value,
-      );
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value && value.length > 0) await this.recorder.append(value);
-      }
-    } finally {
-      reader.releaseLock();
-    }
-    this.finalized = await this.recorder.finalize();
-    return this.finalized;
-  }
-
-  async abort(): Promise<void> {
-    this.done = true;
-    await this.recorder?.safeAbort().catch(() => {});
-  }
-
-  toMeta(): unknown | null {
-    return this.recorder?.toMeta() ?? null;
   }
 }
