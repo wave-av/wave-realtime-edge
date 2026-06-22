@@ -115,16 +115,19 @@ describe("DefaultManagedRecordingApi (PULL) — RTK recording REST", () => {
     expect(calledThis).not.toBe(api); // never invoked as a method of the api instance (would Illegal-invoke real fetch)
   });
 
-  it("fetchRecording passes redirect:'error' (SSRF: a 30x must not be followed past the host guard)", async () => {
+  it("fetchRecording uses redirect:'manual' (Workers rejects 'error') and fails closed on a 3xx", async () => {
     let seenInit: RequestInit | undefined;
-    const impl = (async (_url: string, init?: RequestInit) => {
+    const ok = (async (_url: string, init?: RequestInit) => {
       seenInit = init;
       return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
     }) as unknown as typeof fetch;
-    const api = new DefaultManagedRecordingApi(env, impl);
-    const body = await api.fetchRecording("https://cdn.example.com/r.mp4");
-    expect(body).not.toBeNull();
-    expect(seenInit?.redirect).toBe("error");
+    const api = new DefaultManagedRecordingApi(env, ok);
+    expect(await api.fetchRecording("https://cdn.example.com/r.mp4")).not.toBeNull();
+    expect(seenInit?.redirect).toBe("manual"); // NOT "error" — Workers only supports follow|manual
+
+    // A redirect (3xx) is returned by redirect:"manual" and must fail closed (never followed to the target).
+    const redir = (async () => new Response(null, { status: 302, headers: { location: "https://169.254.169.254/" } })) as unknown as typeof fetch;
+    expect(await new DefaultManagedRecordingApi(env, redir).fetchRecording("https://cdn.example.com/r.mp4")).toBeNull();
   });
 });
 

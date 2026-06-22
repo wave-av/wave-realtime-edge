@@ -144,14 +144,16 @@ export class DefaultManagedRecordingApi implements ManagedRecordingApi {
   }
 
   /**
-   * Fetch the finished recording as a byte stream (null body → nothing to write). `redirect:"error"` —
-   * RTK's signed download URLs are terminal, so a 30x is unexpected AND would bypass the caller's
-   * isSafePublicHttpsUrl host guard (a redirect to a private/metadata host = SSRF). Fail closed: a redirect
-   * throws → the webhook catch logs an alarm + enqueues a pending retry, never failing the ack.
+   * Fetch the finished recording as a byte stream (null body → nothing to write). `redirect:"manual"` —
+   * Workers does NOT support `redirect:"error"`; "manual" returns the 3xx WITHOUT following it, so an
+   * unexpected redirect (RTK's signed download URLs are terminal) is caught by the `!res.ok` check below and
+   * fails closed — we never follow a 30x to an unverified (potentially private/metadata) host past the
+   * caller's isSafePublicHttpsUrl guard. A 3xx / opaqueredirect ⇒ !res.ok ⇒ null ⇒ the webhook enqueues a
+   * pending retry.
    */
   async fetchRecording(url: string): Promise<ReadableStream<Uint8Array> | null> {
-    const res = await this.fetchImpl(url, { redirect: "error" });
-    if (!res.ok || !res.body) return null;
+    const res = await this.fetchImpl(url, { redirect: "manual" });
+    if (!res.ok || !res.body) return null; // 3xx (redirect) is not ok → fail-closed; only 2xx is followed
     return res.body;
   }
 }
