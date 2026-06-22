@@ -28,6 +28,14 @@ import {
 // wired into fetch() — that is the P5.2 signaling follow-up. Exporting it here lets the binding deploy.
 export { RoomDO } from "./room";
 
+// RT-R10 (#72) — the PORTABLE raw-SFU encode container Durable Object class (Path A). Mirrors bridge-edge's
+// MoqContainer verbatim: a Container-DO the Worker reaches via getContainer(env.RECORDER, id).fetch('/encode')
+// to transcode JPEG→VP8 / PCM→Opus (the Workers isolate can't host libvpx/libopus). INERT: the matching
+// `[[containers]] RECORDER` block in wrangler.toml stays COMMENTED (Path A attach is a Jake-named ◆), so this
+// export resolves the class without provisioning a live container or a `new_sqlite_classes` migration. It is
+// exported here (the main module) so that, when the ◆ uncomments the binding, the class is already in scope.
+export { RecorderContainer } from "./encoders/recorder-container";
+
 /** Minimal Durable Object namespace shape (avoids a hard dependency on cloudflare:workers types). */
 interface RoomNamespace {
 	idFromName(name: string): unknown;
@@ -45,6 +53,12 @@ interface Env extends EncoderEnv {
 	ROOM?: RoomNamespace; // Durable Object binding (wrangler ROOM → RoomDO). Per-room state + signaling.
 	// GATEWAY_BASE_URL / WAVE_SERVICE_TOKEN are read INSIDE the RoomDO (see RoomDOEnv in room.ts) — the worker
 	// forwards the env to the DO via the binding, so it does not need to name them here.
+	// ── RT-R10 (#72) portable recorder — ALL inert by default (RECORDER_TARGET 'none', RECORDER_SINK 'r2') ──
+	RECORDER_TARGET?: "cf" | "selfhost" | "none"; // where video encodes; default 'none' (drop video; prod untouched)
+	RECORDER?: DurableObjectNamespace; // Path A container binding — COMMENTED in wrangler.toml until the ◆ attach → absent
+	RECORDER_SELFHOST_URL?: string; // Path B — base URL of the self-hosted rt-encoder service (e.g. https://studio:8080)
+	RECORDER_SINK?: "r2" | "localfs" | "fanout"; // where the recording lands; default 'r2' (today's cloud behavior)
+	RECORDER_LOCAL_DIR?: string; // on-prem local recording dir (self-host); used by localfs/fanout sinks
 }
 
 // Module-scoped so CF's webhook public key (fetched from the well-known doc) is cached for the isolate's

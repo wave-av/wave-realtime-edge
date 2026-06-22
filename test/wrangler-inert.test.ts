@@ -31,7 +31,23 @@ describe("wrangler.toml stays INERT for raw-SFU recording", () => {
     expect(m![1]).toBe("managed");
   });
 
-  it("there is NO [[containers]] block (the container attach is a deferred ◆)", () => {
+  it("there is NO LIVE [[containers]] block (the container attach is a deferred ◆ — block stays commented)", () => {
+    // A live block starts the line with `[[containers]]`. A commented one starts with `#` — must NOT match.
     expect(/^\s*\[\[\s*containers\s*\]\]/m.test(toml)).toBe(false);
+  });
+
+  it("the RT-R10 RecorderContainer [[containers]] block IS present but COMMENTED (inert, ready for the ◆)", () => {
+    // The portable recorder's container block must exist (so the ◆ is a one-line uncomment) yet stay commented.
+    expect(/#\s*\[\[\s*containers\s*\]\]/m.test(toml), "commented [[containers]] block must be present").toBe(true);
+    expect(/#\s*class_name\s*=\s*"RecorderContainer"/m.test(toml), "RecorderContainer class must be named").toBe(true);
+    expect(/#\s*name\s*=\s*"RECORDER"/m.test(toml), "commented RECORDER DO binding must be present").toBe(true);
+    // And NO live RECORDER DO binding (only the commented one) — a live one would attach an unbuilt container.
+    expect(/^\s*name\s*=\s*"RECORDER"/m.test(toml), "RECORDER binding must NOT be live").toBe(false);
+  });
+
+  it("RECORDER_TARGET / RECORDER_SINK are NOT live-set in wrangler.toml (defaults 'none'/'r2' apply)", () => {
+    // The seam defaults inert (none/r2) in code; wrangler.toml must not flip them to a live runtime/sink.
+    expect(/^\s*RECORDER_TARGET\s*=/m.test(toml), "RECORDER_TARGET must not be live-set (default 'none')").toBe(false);
+    expect(/^\s*RECORDER_SINK\s*=/m.test(toml), "RECORDER_SINK must not be live-set (default 'r2')").toBe(false);
   });
 });

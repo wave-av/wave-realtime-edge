@@ -96,6 +96,28 @@ class_name = "RoomDO"
 tag = "v1"
 new_sqlite_classes = ["RoomDO"]
 
+# ── RT-R10 (#72) — PORTABLE raw-SFU encode container (Path A). COMMENTED = INERT. ──
+# The rt-encoder image (containers/rt-encoder/) transcodes JPEG→VP8 / PCM→Opus for the raw-SFU recorder — work
+# the Workers isolate can't host (no libvpx/libopus). The class RecorderContainer is exported from src/worker.ts
+# (mirrors bridge-edge's MoqContainer). This block stays COMMENTED until a Jake-named ◆ attach (epic ◆ A):
+# CF Containers must be provisioned on the deploying account (d674452f has them — wave-bridge-edge-moqcontainer
+# runs live) AND the image built/pushed (DOCKER_HOST=ssh://studio docker build containers/rt-encoder). A LIVE
+# [[containers]] block here pointing at an unbuilt image would BREAK deploy — hence commented (mirrors
+# bridge-edge's commented srt/ndi blocks). When the ◆ is taken, uncomment the three blocks below AND set
+# RECORDER_TARGET="cf"; src/encoders/recorder-target.ts fail-opens to NoneTarget while RECORDER is absent.
+# [[containers]]
+# class_name = "RecorderContainer"
+# image = "./containers/rt-encoder/Dockerfile"
+# max_instances = 3
+#
+# [[durable_objects.bindings]]
+# name = "RECORDER"
+# class_name = "RecorderContainer"
+#
+# [[migrations]]
+# tag = "v2"
+# new_sqlite_classes = ["RecorderContainer"]
+
 [[unsafe.bindings]]
 type = "plain_text"
 name = "FOUNDATION_VERSION"
