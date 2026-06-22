@@ -11,6 +11,10 @@
 // call that lacks the matching `x-wave-internal` header gets 401. Unset (local/test) → no enforcement, which
 // preserves the gateway-delegated contract + the existing contract tests.
 import { join, turn, RtkError } from "./realtimekit";
+import type { EncoderEnv } from "./encoders/encoder";
+import { selectEncoder } from "./encoders/factory";
+import { directRecordingConfigured } from "./encoders/managed";
+import { handleRecordingWebhook, liveWebhookDeps } from "./rtk-webhook";
 
 // Re-export the Room Durable Object so the wrangler `ROOM` binding + migration (v1, new_sqlite_classes)
 // resolve from this main module. The class itself is defined in room.ts (P5 substrate); it is not yet
@@ -23,19 +27,22 @@ interface RoomNamespace {
 	get(id: unknown): { fetch(request: Request): Promise<Response> };
 }
 
-interface Env {
-	CF_API_TOKEN?: string; // wrangler SECRET — account API token (Calls/Realtime scope). Never logged/returned.
-	CF_ACCOUNT_ID?: string; // var
-	RTK_APP_ID?: string; // var — the RealtimeKit app id
+// Env extends EncoderEnv so the recording adapter's config (CF_ACCOUNT_ID/CF_API_TOKEN/RTK_APP_ID +
+// RT_RECORD/RT_ENCODER/RT_RECORDINGS + the direct-mode RT_RECORDINGS_BUCKET/RT_R2_* creds) flows straight
+// from the worker env into selectEncoder()/directRecordingConfigured() with no re-mapping.
+interface Env extends EncoderEnv {
 	WAVE_INTERNAL_SECRET?: string; // wrangler SECRET — when set, ONLY the gateway (x-wave-internal) may /rtk/* AND /v1/realtime/*
 	TURN_KEY_ID?: string; // wrangler SECRET — the CF TURN key uid (32-hex). Out of the public repo; persists across deploys.
 	TURN_KEY_TOKEN?: string; // wrangler SECRET — the TURN key's api token. Never logged/returned; only ephemeral ICE creds are.
 	// ── P5 CF-Calls SFU control plane ──
 	ROOM?: RoomNamespace; // Durable Object binding (wrangler ROOM → RoomDO). Per-room state + signaling.
-	// CF_CALLS_APP_ID / CF_CALLS_APP_SECRET / GATEWAY_BASE_URL / WAVE_SERVICE_TOKEN are read INSIDE the
-	// RoomDO (see RoomDOEnv in room.ts) — the worker forwards the env to the DO via the binding, so it does
-	// not need to name them here.
+	// GATEWAY_BASE_URL / WAVE_SERVICE_TOKEN are read INSIDE the RoomDO (see RoomDOEnv in room.ts) — the worker
+	// forwards the env to the DO via the binding, so it does not need to name them here.
 }
+
+// Module-scoped so CF's webhook public key (fetched from the well-known doc) is cached for the isolate's
+// lifetime instead of re-fetched per webhook. Verification deps are injectable in unit tests via the handler.
+const recordingWebhookDeps = liveWebhookDeps();
 
 /** CF-Calls SFU realtime intents the worker forwards to the Room DO (last path segment). */
 const REALTIME_INTENTS = new Set(["join", "publish", "subscribe", "renegotiate", "leave"]);
@@ -72,7 +79,7 @@ function gatewayGate(request: Request, secret: string | undefined): Response | n
 }
 
 export default {
-	async fetch(request: Request, env: Env = {} as Env, _ctx?: ExecutionContext): Promise<Response> {
+	async fetch(request: Request, env: Env = {} as Env, ctx?: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 
 		if (url.pathname === "/health") {
@@ -83,6 +90,13 @@ export default {
 				protocol: "webrtc-sfu",
 				version: "dev",
 			});
+		}
+
+		// RealtimeKit recording.statusUpdate webhook (RT-R-WH). PUBLIC by design — RTK calls it directly, so it
+		// is intentionally NOT behind gatewayGate; it authenticates itself via the `rtk-signature` header
+		// (RSA-SHA256 over the raw body, verified against CF's published key) before acting on anything.
+		if (request.method === "POST" && url.pathname === "/rtk/recording-webhook") {
+			return handleRecordingWebhook(request, recordingWebhookDeps);
 		}
 
 		if (request.method === "POST" && url.pathname === "/rtk/join") {
@@ -106,6 +120,28 @@ export default {
 							typeof body.custom_participant_id === "string" ? body.custom_participant_id : undefined,
 					},
 				);
+				// Best-effort: arm managed recording for this meeting. DIRECT mode only (RTK uploads straight to
+				// our R2 at an org-rooted path; the recording.statusUpdate webhook confirms) — no in-worker
+				// finalize to drive on this stateless path. Never on the response critical path (waitUntil), never
+				// throws the join. Opt out per call with {"record": false}.
+				if (ctx && body.record !== false && directRecordingConfigured(env)) {
+					const org = request.headers.get("x-wave-org") ?? "";
+					if (org) {
+						const session = { org, room: "", sessionId: result.meetingId };
+						ctx.waitUntil(
+							selectEncoder(env)
+								.begin(session)
+								.then((h) => {
+									if (h) console.log(JSON.stringify({ msg: "rt-recording-armed", meetingId: result.meetingId, org }));
+								})
+								.catch(() => {}),
+						);
+					} else {
+						// Armed but the gateway didn't stamp org on this path — cannot attribute the recording. Loud,
+						// not a silent skip (config-no-silent-noop): the recording is dropped on purpose.
+						console.warn(JSON.stringify({ msg: "rt-recording-skipped-no-org", meetingId: result.meetingId }));
+					}
+				}
 				return Response.json(result, { status: 200 });
 			} catch (e) {
 				const err = e instanceof RtkError ? e : new RtkError("REALTIME_ERROR", "unexpected error", 500);

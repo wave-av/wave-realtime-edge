@@ -3,8 +3,16 @@
 // in-memory R2 multipart bucket (the same shape proven in recording-writer.test.ts) is the SKIP sink. The
 // bucket spies on get/put/delete so we re-assert the SKIP invariant: C never touches a dedup path.
 import { describe, it, expect } from "vitest";
-import { ManagedEncoder, type ManagedRecordingApi } from "../../src/encoders/managed.js";
+import {
+  ManagedEncoder,
+  DefaultManagedRecordingApi,
+  DirectManagedHandle,
+  buildStorageConfig,
+  directRecordingConfigured,
+  type ManagedRecordingApi,
+} from "../../src/encoders/managed.js";
 import type { EncoderEnv } from "../../src/encoders/encoder.js";
+import { sniffWebm, extFor } from "../../src/recording-writer.js";
 
 // ── In-memory R2 multipart fakes (dedup-path spies). ────────────────────────────────────────────────────
 class FakeUpload {
@@ -178,5 +186,170 @@ describe("ManagedEncoder (C) — streams a finished WebM into the SKIP sink", ()
     const handle = await enc.begin(SESSION);
     expect(await handle!.finalize()).toBeNull();
     expect(b.created).toHaveLength(0);
+  });
+});
+
+// ── RT-R1: the REAL RealtimeKit recording REST binding (fake fetch — no live network). ───────────────────
+const ACC = "0123456789abcdef0123456789abcdef"; // HEX32
+const APP = "6dee33e5-cd89-41e8-a81c-9a8cd48bb9c3"; // uuidish
+const REC = "97cb480d-5840-4528-ace3-919b5e386c68"; // uuidish recording id
+const rtkEnv: EncoderEnv = { CF_ACCOUNT_ID: ACC, RTK_APP_ID: APP, CF_API_TOKEN: "tok", RT_RECORD: "1" };
+const RECORDINGS_URL = `https://api.cloudflare.com/client/v4/accounts/${ACC}/realtime/kit/${APP}/recordings`;
+
+/** A fake fetch that scripts the recording lifecycle; records each call for assertion. */
+function rtkFetch(script: { statusSequence?: string[]; startOk?: boolean; downloadUrl?: string }) {
+  const calls: Array<{ method: string; url: string; body?: unknown }> = [];
+  let statusIdx = 0;
+  const seq = script.statusSequence ?? ["UPLOADING", "UPLOADED"];
+  const impl = (async (input: string, init?: RequestInit) => {
+    const method = init?.method ?? "GET";
+    const body = init?.body ? JSON.parse(init.body as string) : undefined;
+    calls.push({ method, url: input, body });
+    const json = (o: unknown, ok = true, status = 200) =>
+      new Response(JSON.stringify(o), { status, headers: { "Content-Type": "application/json" } });
+    if (method === "POST" && input === RECORDINGS_URL) {
+      return script.startOk === false ? json({ success: false }, false, 400) : json({ success: true, data: { id: REC, status: "INVOKED" } });
+    }
+    if (method === "PUT" && input === `${RECORDINGS_URL}/${REC}`) {
+      return json({ success: true, data: { id: REC, status: "RECORDING" } });
+    }
+    if (method === "GET" && input === `${RECORDINGS_URL}/${REC}`) {
+      const status = seq[Math.min(statusIdx++, seq.length - 1)];
+      return json({ success: true, data: { id: REC, status, download_url: script.downloadUrl ?? "https://cf/r.mp4" } });
+    }
+    return json({ success: false }, false, 404);
+  }) as unknown as typeof fetch;
+  return { impl, calls };
+}
+
+describe("DefaultManagedRecordingApi (RT-R1) — real RTK recording REST", () => {
+  it("start POSTs meeting_id to the recordings endpoint and returns data.id", async () => {
+    const { impl, calls } = rtkFetch({});
+    const api = new DefaultManagedRecordingApi(rtkEnv, async () => {}, 5, 0, impl);
+    const r = await api.start("meeting-xyz");
+    expect(r.recordingId).toBe(REC);
+    expect(calls[0]).toMatchObject({ method: "POST", url: RECORDINGS_URL, body: { meeting_id: "meeting-xyz" } });
+  });
+
+  it("stop PUTs action:stop, polls GET until UPLOADED, returns the download_url", async () => {
+    const { impl, calls } = rtkFetch({ statusSequence: ["UPLOADING", "UPLOADING", "UPLOADED"], downloadUrl: "https://cf/final.mp4" });
+    const api = new DefaultManagedRecordingApi(rtkEnv, async () => {}, 10, 0, impl);
+    const r = await api.stop(REC);
+    expect(r).toEqual({ webmUrl: "https://cf/final.mp4" });
+    expect(calls[0]).toMatchObject({ method: "PUT", body: { action: "stop" } });
+    expect(calls.filter((c) => c.method === "GET").length).toBe(3); // polled until UPLOADED
+  });
+
+  it("stop → null when the recording ERRORED", async () => {
+    const { impl } = rtkFetch({ statusSequence: ["UPLOADING", "ERRORED"] });
+    const api = new DefaultManagedRecordingApi(rtkEnv, async () => {}, 10, 0, impl);
+    expect(await api.stop(REC)).toBeNull();
+  });
+
+  it("stop → null on poll timeout (webhook is the fallback)", async () => {
+    const { impl, calls } = rtkFetch({ statusSequence: ["UPLOADING"] }); // never reaches UPLOADED
+    const api = new DefaultManagedRecordingApi(rtkEnv, async () => {}, 3, 0, impl);
+    expect(await api.stop(REC)).toBeNull();
+    expect(calls.filter((c) => c.method === "GET").length).toBe(3); // bounded to maxPolls
+  });
+
+  it("start fails CLOSED (throws) when creds are unconfigured — caller's begin() catches → records nothing", async () => {
+    const api = new DefaultManagedRecordingApi({ RT_RECORD: "1" }); // no acc/app/token
+    await expect(api.start("m")).rejects.toThrow(/not configured/);
+  });
+});
+
+describe("sniffWebm (RT-R1) — mp4 (RTK composite) detection", () => {
+  it("detects an ISO-BMFF/MP4 ftyp box → container mp4 → .mp4 extension", () => {
+    const mp4 = new Uint8Array([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d]);
+    expect(sniffWebm(mp4)).toBe("mp4");
+    expect(extFor("mp4")).toBe("mp4");
+  });
+  it("still detects webm EBML magic, and falls back to raw/.bin otherwise", () => {
+    expect(sniffWebm(new Uint8Array([0x1a, 0x45, 0xdf, 0xa3]))).toBe("webm");
+    expect(sniffWebm(new Uint8Array([0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]))).toBe("raw");
+    expect(extFor("raw")).toBe("bin");
+  });
+});
+
+// ── RT-R-WH: direct mode (storage_config) — RTK uploads STRAIGHT to our R2; no in-worker stream/finalize. ──
+describe("direct mode (storage_config) — RTK writes to our R2 at an org-rooted path", () => {
+  const directEnv = (over: Partial<EncoderEnv> = {}): EncoderEnv => ({
+    RT_RECORD: "1",
+    RT_ENCODER: "managed",
+    CF_ACCOUNT_ID: ACC,
+    RTK_APP_ID: APP,
+    CF_API_TOKEN: "tok",
+    RT_RECORDINGS_BUCKET: "wave-realtime-recordings",
+    RT_R2_ACCESS_KEY_ID: "ak",
+    RT_R2_SECRET_ACCESS_KEY: "sk",
+    ...over,
+  });
+
+  it("buildStorageConfig → org-rooted path when fully configured; null when any cred or org is missing", () => {
+    expect(buildStorageConfig(directEnv(), SESSION)).toEqual({
+      type: "cloudflare",
+      bucket: "wave-realtime-recordings",
+      path: `${ORG}/realtime-recordings/sess-1/`,
+      account_id: ACC,
+      access_key: "ak",
+      secret: "sk",
+    });
+    expect(buildStorageConfig(directEnv({ RT_R2_SECRET_ACCESS_KEY: undefined }), SESSION)).toBeNull();
+    expect(buildStorageConfig(directEnv({ RT_RECORDINGS_BUCKET: undefined }), SESSION)).toBeNull();
+    expect(buildStorageConfig(directEnv(), { ...SESSION, org: "" })).toBeNull();
+  });
+
+  it("directRecordingConfigured → true only when armed AND all R2 creds present", () => {
+    expect(directRecordingConfigured(directEnv())).toBe(true);
+    expect(directRecordingConfigured(directEnv({ RT_RECORD: "0" }))).toBe(false);
+    expect(directRecordingConfigured(directEnv({ RT_RECORDINGS_BUCKET: undefined }))).toBe(false);
+    expect(directRecordingConfigured(directEnv({ RT_R2_ACCESS_KEY_ID: undefined }))).toBe(false);
+    expect(directRecordingConfigured(directEnv({ CF_ACCOUNT_ID: undefined }))).toBe(false);
+  });
+
+  it("start sends storage_config in the POST body when given", async () => {
+    const { impl, calls } = rtkFetch({});
+    const api = new DefaultManagedRecordingApi(rtkEnv, async () => {}, 5, 0, impl);
+    const cfg = buildStorageConfig(directEnv(), SESSION)!;
+    await api.start("meeting-xyz", cfg);
+    expect(calls[0]).toMatchObject({
+      method: "POST",
+      url: RECORDINGS_URL,
+      body: { meeting_id: "meeting-xyz", storage_config: { type: "cloudflare", path: `${ORG}/realtime-recordings/sess-1/` } },
+    });
+  });
+
+  it("begin (direct) → DirectManagedHandle, starts RTK with storage_config, never opens a worker upload", async () => {
+    const b = new FakeBucket();
+    const { impl, calls } = rtkFetch({});
+    const api = new DefaultManagedRecordingApi(rtkEnv, async () => {}, 5, 0, impl);
+    const enc = new ManagedEncoder(directEnv({ RT_RECORDINGS: b as unknown as R2Bucket }), api);
+    const handle = await enc.begin(SESSION);
+    expect(handle).toBeInstanceOf(DirectManagedHandle);
+    const direct = handle as DirectManagedHandle;
+    expect(direct.recordingId).toBe(REC);
+    expect(direct.keyPrefix).toBe(`${ORG}/realtime-recordings/sess-1/`);
+    expect(calls[0].body).toMatchObject({ storage_config: { bucket: "wave-realtime-recordings" } });
+    // RTK owns the upload → nothing in-worker to finalize, and the SKIP sink is never touched.
+    expect(await direct.finalize()).toBeNull();
+    expect(direct.toMeta()).toBeNull();
+    expect(b.created).toHaveLength(0);
+    expect(b.getCalls + b.putCalls + b.deleteCalls).toBe(0);
+  });
+
+  it("begin → null (loud) when armed but direct creds absent and NO sink binding either", async () => {
+    const { api } = fakeApi();
+    const enc = new ManagedEncoder({ RT_RECORD: "1", RT_ENCODER: "managed" }, api);
+    expect(await enc.begin(SESSION)).toBeNull();
+  });
+
+  it("begin falls back to fetch+stream (NOT DirectManagedHandle) when only the bucket binding is present", async () => {
+    const b = new FakeBucket();
+    const { api } = fakeApi({ bytes: 1024 });
+    const enc = new ManagedEncoder({ RT_RECORD: "1", RT_ENCODER: "managed", RT_RECORDINGS: b as unknown as R2Bucket }, api);
+    const handle = await enc.begin(SESSION);
+    expect(handle).not.toBeNull();
+    expect(handle).not.toBeInstanceOf(DirectManagedHandle);
   });
 });
