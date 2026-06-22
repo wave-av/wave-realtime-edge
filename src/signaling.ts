@@ -75,12 +75,24 @@ export class SignalError extends Error {
  * Signaling — constructed per request with a RoomCore (this room's DO state) + an SfuClient (SFU media
  * client built from env). Stateless beyond those two collaborators.
  */
+/**
+ * RT-R9 — the recording orchestration hook the signaling layer drives. publishTrack → onPublish (best-effort,
+ * NEVER blocks publish); leave/endRoom → finalize AFTER the leave is committed. DORMANT when the encoder is
+ * disarmed/managed. Injected by the RoomDO; absent in pure-signaling tests → recording is a no-op.
+ */
+export interface RecordingHook {
+  onPublish(org: string, sessionId: string, room: string, trackName: string, kind: TrackKind): Promise<void>;
+  finalize(sessionId: string): Promise<void>;
+}
+
 export class Signaling {
   constructor(
     private readonly room: RoomCore,
     private readonly sfu: SfuClient,
     /** P5.3 metering env (gateway URL + service token). Optional → emit is INERT until provisioned. */
     private readonly meterEnv: MeterEmitEnv = {},
+    /** RT-R9 recording hook. Optional → recording is a no-op (pure-signaling tests, or no recorder bound). */
+    private readonly recording?: RecordingHook,
   ) {}
 
   /**
@@ -140,6 +152,16 @@ export class Signaling {
         participantId: ctx.participantId,
         kind: t.kind,
       });
+      // RT-R9: arm/forward to the raw-SFU recorder (best-effort). A recording error must NEVER block the
+      // publish (media-safety > recording, design §4) — the hook is internally fail-open, and this is wrapped
+      // again defensively so even a thrown hook can't fail the registered publish.
+      if (this.recording) {
+        try {
+          await this.recording.onPublish(ctx.org, participant.sessionId, ctx.room, t.trackName, t.kind);
+        } catch {
+          /* fail-open — recording never blocks publish */
+        }
+      }
     }
     return result;
   }
@@ -187,6 +209,15 @@ export class Signaling {
     // must NEVER affect the leave (media-safety > metering, design §4) — emitParticipantUsage is fail-open.
     const usage = await this.room.leaveRoom(ctx.org, ctx.participantId);
     if (usage) await emitParticipantUsage(this.meterEnv, usage);
+    // RT-R9: finalize the raw-SFU recording AFTER the leave is committed (state of record first). Best-effort:
+    // a finalize-throw is swallowed so the leave still succeeds (media-safety > recording, design §4).
+    if (usage && this.recording) {
+      try {
+        await this.recording.finalize(usage.sessionId);
+      } catch {
+        /* fail-open — a recorder finalize error never fails the leave */
+      }
+    }
   }
 
   private assertCtx(ctx: SignalContext): void {

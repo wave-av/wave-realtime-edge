@@ -55,6 +55,10 @@ const recordingWebhookDeps = liveWebhookDeps();
 const REALTIME_INTENTS = new Set(["join", "publish", "subscribe", "renegotiate", "leave"]);
 /** POST /v1/realtime/rooms/:room/:intent */
 const REALTIME_ROUTE = /^\/v1\/realtime\/rooms\/([^/]+)\/([^/]+)\/?$/;
+/** RT-R9 hibernatable WS recorder route the SFU dials OUT to: /v1/realtime/recorder/:org/:sessionId/:trackName */
+const RECORDER_ROUTE = /^\/v1\/realtime\/recorder\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
+/** Segment guards for the recorder route (SSRF-safe DO-key + frame-forward params). */
+const SAFE_SEGMENT = /^[A-Za-z0-9_:.-]{1,128}$/;
 /** Whitelists for the UNTRUSTED gateway-stamped role/type values (reject anything off-list). */
 const ROLES = new Set(["host", "speaker", "viewer"]);
 const ROOM_TYPE_VALUES = new Set(["meeting", "webinar", "event", "breakout"]);
@@ -220,6 +224,65 @@ export default {
 			} catch (e) {
 				const err = e instanceof RtkError ? e : new RtkError("REALTIME_ERROR", "unexpected error", 500);
 				return Response.json({ error: err.code, message: err.message }, { status: err.status });
+			}
+		}
+
+		// ── RT-R9 raw-SFU recorder WS route — /v1/realtime/recorder/:org/:sessionId/:trackName ──
+		// The CF Realtime SFU dials OUT to this hibernatable WS endpoint (per the container-encoder adapter) and
+		// pushes ONE track's media as binary frames; each frame is forwarded to the room's DO tap. INERT: gated
+		// behind the SAME internal-secret chokepoint AND RT_RECORD==="1" — unarmed (live default) it 404s, so
+		// nothing can dial it. A non-Upgrade request → 426. The DO feed is fail-open (ctx.waitUntil), never blocks.
+		const recMatch = url.pathname.match(RECORDER_ROUTE);
+		if (recMatch) {
+			const deniedRec = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
+			if (deniedRec) return deniedRec;
+			// Disarmed (RT_RECORD!=="1", the live default) → the route does not exist (config-no-silent-noop:
+			// nothing dials it, so a 404 is the honest "no recorder here", not a silent accept).
+			if (env.RT_RECORD !== "1") {
+				return Response.json({ error: "REALTIME_NOT_IMPLEMENTED", path: url.pathname }, { status: 501 });
+			}
+			if ((request.headers.get("Upgrade") ?? "").toLowerCase() !== "websocket") {
+				return Response.json(
+					{ error: "UPGRADE_REQUIRED", message: "recorder route requires a WebSocket upgrade" },
+					{ status: 426 },
+				);
+			}
+			const [, rorg, rsession, rtrack] = recMatch;
+			if (![rorg, rsession, rtrack].every((s) => SAFE_SEGMENT.test(s)) || !env.ROOM) {
+				return Response.json({ error: "BAD_REQUEST", message: "invalid recorder path or no ROOM binding" }, { status: 400 });
+			}
+			// Open a server WebSocket and forward every BINARY frame to the room's DO tap (per-org keyed). The DO
+			// feed is fully fail-open — a recording error never affects the live media the SFU is also pushing.
+			// WebSocketPair is a Workers-runtime global; referenced off globalThis so unit tests can stub it.
+			const WSP = (globalThis as unknown as { WebSocketPair?: new () => Record<string, WebSocket> }).WebSocketPair;
+			if (!WSP) {
+				return Response.json({ error: "REALTIME_NOT_CONFIGURED", message: "WebSocketPair unavailable" }, { status: 503 });
+			}
+			const pair = new WSP();
+			const client = (pair as unknown as Record<string, WebSocket>)[0];
+			const server = (pair as unknown as Record<string, WebSocket>)[1];
+			server.accept();
+			const id = env.ROOM.idFromName(`${rorg}:${rsession}`);
+			const stub = env.ROOM.get(id);
+			server.addEventListener("message", (ev: MessageEvent) => {
+				const data = ev.data;
+				if (!(data instanceof ArrayBuffer)) return; // ignore text/keepalive — only binary media frames
+				const fwd = stub
+					.fetch(
+						new Request(`https://room/recorder-frame?sessionId=${encodeURIComponent(rsession)}&trackName=${encodeURIComponent(rtrack)}`, {
+							method: "POST",
+							body: data,
+						}),
+					)
+					.catch(() => {});
+				if (ctx) ctx.waitUntil(fwd);
+			});
+			// Workers accepts a 101 + webSocket ResponseInit (the WS-upgrade idiom). Some non-Workers runtimes
+			// (e.g. the Node test env) reject status 101 in the Response ctor — guard so the handler never throws.
+			try {
+				return new Response(null, { status: 101, webSocket: client } as ResponseInit & { webSocket: WebSocket });
+			} catch {
+				return new Response(null, { status: 200, webSocket: client } as ResponseInit & { webSocket: WebSocket });
 			}
 		}
 
