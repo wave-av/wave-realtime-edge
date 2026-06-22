@@ -568,9 +568,6 @@ export interface RoomDOEnv {
   RT_RECORDINGS?: R2Bucket; // SKIP sink the container tap writes the one canonical object into
   RT_ENCODER?: EncoderKind; // selector; default "managed" (live). "container" = raw-SFU (◆).
   RT_RECORD?: string; // "1" to arm recording at all (default OFF — fully inert)
-  // Carried through so the cast at selectEncoder(this.env as unknown as EncoderEnv) gives the container
-  // encoder the secret it signs the recorder-route capability token with (wrangler SECRET, bound to the DO).
-  WAVE_INTERNAL_SECRET?: string;
   CF_API_TOKEN?: string; // managed (C) RTK REST bearer (carried through for selectEncoder)
   RTK_APP_ID?: string; // managed (C) RTK app id
   CF_ACCOUNT_ID?: string; // managed (C) account id
