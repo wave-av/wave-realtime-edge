@@ -53,7 +53,9 @@ GATEWAY_BASE_URL = "https://api.wave.online"
 # silently dropped → recording lands in RTK's OWN bucket, breaking our org-prefix sweep). So RTK records to
 # its own storage and the recording.statusUpdate UPLOADED webhook PULLS the finished file into RT_RECORDINGS
 # at an org-rooted key (the daily storage sweep bills by org-prefix). CF_API_TOKEN/CF_ACCOUNT_ID are wrangler
-# SECRETS; the old RT_R2_ACCESS_KEY_ID/SECRET S3 creds (retired direct mode) are now UNUSED — deletable.
+# SECRETS. The retired direct-mode S3 creds (RT_R2_ACCESS_KEY_ID/SECRET) have been DELETED from the worker
+# + Doppler and their bucket-scoped R2 token (wave-realtime-recordings-rtk-rw) REVOKED (#70) — pull mode
+# writes via the RT_RECORDINGS R2 binding, never S3 creds, so nothing references them.
 RT_RECORD = "1"
 # RT_ENCODER selects the adapter when armed: "managed" (C, the buildable path) | "container" (A) | "wasm"
 # (B). A/B are BLOCKED-ON-RT-P0.1-spike and throw NOT_SPIKED at begin until the §7 WS media-transport spike.
