@@ -18,6 +18,7 @@ import type { SessionDescription } from "./sfu.js";
 import { Signaling } from "./signaling.js";
 import type { SignalContext, PublishTrack } from "./signaling.js";
 import type { ParticipantSessionUsage, MeterEmitEnv } from "./metering.js";
+import type { EventEmitEnv } from "./event-emitter.js";
 import { selectEncoder } from "./encoders/factory.js";
 import type { EncoderEnv, EncoderHandle, EncoderKind, RecordingEncoder } from "./encoders/encoder.js";
 
@@ -561,6 +562,12 @@ export interface RoomDOEnv {
   CF_CALLS_APP_SECRET?: string;
   GATEWAY_BASE_URL?: string;
   WAVE_SERVICE_TOKEN?: string;
+  // ── LK-rip #46 SFU event emitter (DORMANT until the Jake-named cutover). The DO forwards these to the
+  // Signaling layer, which emits room/session lifecycle events to the WSC Argus ingest ONLY when
+  // WAVE_REALTIME_EVENTS_EMIT="1" AND the shared HMAC secret is set (else fully inert — no network). ──
+  WAVE_REALTIME_EVENTS_EMIT?: string; // "1" arms; absent/anything-else → inert
+  WAVE_REALTIME_WEBHOOK_SECRET?: string; // shared HMAC secret (Doppler, both sides); absent → inert
+  WSC_EVENTS_URL?: string; // ingest URL override (var); default = prod contract URL
   // ── RT-R9 raw-SFU recording (DORMANT until ◆-armed). The DO builds the recording encoder lazily via
   // selectEncoder(env) on the FIRST publish. RT_ENCODER stays "managed" in live wrangler.toml → the
   // recordingHandle is a no-op (managed C has no onPublish/finalize state held here); only an ◆-armed
@@ -748,7 +755,7 @@ export class RoomDO {
     const ctx = body.ctx as SignalContext | undefined;
 
     try {
-      const signaling = new Signaling(this.core, this.buildSfu(), this.meterEnv(), this.recording);
+      const signaling = new Signaling(this.core, this.buildSfu(), this.meterEnv(), this.recording, this.eventEnv());
       switch (intent) {
         case "join":
           return Response.json(
@@ -796,5 +803,14 @@ export class RoomDO {
   /** Metering env for the leave-time tap. INERT until GATEWAY_BASE_URL + WAVE_SERVICE_TOKEN are set. */
   private meterEnv(): MeterEmitEnv {
     return { GATEWAY_BASE_URL: this.env.GATEWAY_BASE_URL, WAVE_SERVICE_TOKEN: this.env.WAVE_SERVICE_TOKEN };
+  }
+
+  /** LK-rip #46 event-emitter env. DORMANT until WAVE_REALTIME_EVENTS_EMIT="1" + the shared secret are set. */
+  private eventEnv(): EventEmitEnv {
+    return {
+      WAVE_REALTIME_EVENTS_EMIT: this.env.WAVE_REALTIME_EVENTS_EMIT,
+      WAVE_REALTIME_WEBHOOK_SECRET: this.env.WAVE_REALTIME_WEBHOOK_SECRET,
+      WSC_EVENTS_URL: this.env.WSC_EVENTS_URL,
+    };
   }
 }
