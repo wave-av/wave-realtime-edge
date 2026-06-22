@@ -1,6 +1,8 @@
-// RT-R9 INERT-LEAK guard (epic §Risks). The live wrangler.toml MUST keep RT_ENCODER="managed" so the raw-SFU
-// container path is NEVER selected in prod by this PR — and there must be NO [[containers]] block (that attach
-// is a Jake-named ◆). A future edit that flips the live selector or attaches a container fails HERE before prod.
+// RT-R9 INERT-LEAK guard (epic §Risks). After Step A (#67b ◆ A), the RecorderContainer INFRA is ARMED — the
+// [[containers]] block is LIVE so the container DO deploys — but the ENCODER stays dormant: the live wrangler.toml
+// MUST keep RT_ENCODER="managed" (the PULL-mode path) and MUST NOT live-set RECORDER_TARGET to 'cf'/'selfhost'
+// (defaults 'none' → NoneTarget). The invariant is now: container infra armed, encoder still inert. A future edit
+// that flips the live selector OR sets RECORDER_TARGET to a live runtime fails HERE before prod (that's Step D).
 // Loads wrangler.toml as a raw string via Vite's import.meta.glob (no node:fs — tsconfig has only workers-types).
 import { describe, it, expect } from "vitest";
 
@@ -31,18 +33,17 @@ describe("wrangler.toml stays INERT for raw-SFU recording", () => {
     expect(m![1]).toBe("managed");
   });
 
-  it("there is NO LIVE [[containers]] block (the container attach is a deferred ◆ — block stays commented)", () => {
-    // A live block starts the line with `[[containers]]`. A commented one starts with `#` — must NOT match.
-    expect(/^\s*\[\[\s*containers\s*\]\]/m.test(toml)).toBe(false);
+  it("the [[containers]] block IS LIVE (Step A armed the container infra — DO deploys)", () => {
+    // A live block starts the line with `[[containers]]` (no leading `#`). Step A uncommented it.
+    expect(/^\s*\[\[\s*containers\s*\]\]/m.test(toml), "live [[containers]] block must be present").toBe(true);
   });
 
-  it("the RT-R10 RecorderContainer [[containers]] block IS present but COMMENTED (inert, ready for the ◆)", () => {
-    // The portable recorder's container block must exist (so the ◆ is a one-line uncomment) yet stay commented.
-    expect(/#\s*\[\[\s*containers\s*\]\]/m.test(toml), "commented [[containers]] block must be present").toBe(true);
-    expect(/#\s*class_name\s*=\s*"RecorderContainer"/m.test(toml), "RecorderContainer class must be named").toBe(true);
-    expect(/#\s*name\s*=\s*"RECORDER"/m.test(toml), "commented RECORDER DO binding must be present").toBe(true);
-    // And NO live RECORDER DO binding (only the commented one) — a live one would attach an unbuilt container.
-    expect(/^\s*name\s*=\s*"RECORDER"/m.test(toml), "RECORDER binding must NOT be live").toBe(false);
+  it("the RT-R10 RecorderContainer [[containers]] block IS present and LIVE (infra armed, encoder still dormant)", () => {
+    // Step A (#67b ◆ A): the portable recorder's container block is now uncommented so the container DO deploys.
+    expect(/^\s*\[\[\s*containers\s*\]\]/m.test(toml), "live [[containers]] block must be present").toBe(true);
+    expect(/^\s*class_name\s*=\s*"RecorderContainer"/m.test(toml), "RecorderContainer class must be named live").toBe(true);
+    // The RECORDER DO binding is now LIVE (the container DO must bind for the deploy to provision it).
+    expect(/^\s*name\s*=\s*"RECORDER"/m.test(toml), "live RECORDER DO binding must be present").toBe(true);
   });
 
   it("RECORDER_TARGET / RECORDER_SINK are NOT live-set in wrangler.toml (defaults 'none'/'r2' apply)", () => {
