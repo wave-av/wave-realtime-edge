@@ -21,6 +21,7 @@
 import type { EncoderEnv, EncoderHandle, RecordingEncoder, RecordingSession } from "./encoder.js";
 import type { RecordingResult } from "../recording-writer.js";
 import { createWebsocketAdapter, RawSfuTap, type WsAdapterTrack } from "./container-adapter.js";
+import { mintRecorderToken } from "./recorder-auth.js";
 
 const HEX32 = /^[0-9a-f]{32}$/i;
 
@@ -135,11 +136,24 @@ export class ContainerHandle implements EncoderHandle {
     // Ask the SFU to dial OUT to our recorder route for this track. Fail-open: a create-adapter failure leaves
     // the tap in place (it simply receives no frames) and NEVER throws the publish down.
     try {
+      // The SFU is a third party — it cannot send our `x-wave-internal` header. So when the internal secret
+      // is bound, append a signed, per-(org,session,track), expiring capability token the recorder route
+      // validates as an alternative auth. Unset (local/test) → bare endpoint (route enforces nothing either).
+      let endpoint = `${this.recorderBase}/${this.session.org}/${this.session.sessionId}/${trackName}`;
+      if (this.env.WAVE_INTERNAL_SECRET) {
+        const t = await mintRecorderToken(
+          this.env.WAVE_INTERNAL_SECRET,
+          this.session.org,
+          this.session.sessionId,
+          trackName,
+        );
+        endpoint = `${endpoint}?t=${t}`;
+      }
       const track: WsAdapterTrack = {
         location: "remote",
         sessionId: this.session.sessionId,
         trackName,
-        endpoint: `${this.recorderBase}/${this.session.org}/${this.session.sessionId}/${trackName}`,
+        endpoint,
         outputCodec: "pcm",
       };
       await createWebsocketAdapter(

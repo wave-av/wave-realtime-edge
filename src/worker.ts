@@ -13,6 +13,7 @@
 import { join, turn, RtkError } from "./realtimekit";
 import type { EncoderEnv } from "./encoders/encoder";
 import { selectEncoder } from "./encoders/factory";
+import { verifyRecorderToken } from "./encoders/recorder-auth";
 import { pullRecordingConfigured, DefaultManagedRecordingApi } from "./encoders/managed";
 import {
 	handleRecordingWebhook,
@@ -248,10 +249,23 @@ export default {
 		// nothing can dial it. A non-Upgrade request → 426. The DO feed is fail-open (ctx.waitUntil), never blocks.
 		const recMatch = url.pathname.match(RECORDER_ROUTE);
 		if (recMatch) {
-			const deniedRec = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
-			if (deniedRec) return deniedRec;
+			const [, rorg, rsession, rtrack] = recMatch;
+			if (![rorg, rsession, rtrack].every((s) => SAFE_SEGMENT.test(s)) || !env.ROOM) {
+				return Response.json({ error: "BAD_REQUEST", message: "invalid recorder path or no ROOM binding" }, { status: 400 });
+			}
+			// AUTH — accept EITHER a valid scoped capability token (?t=, how the third-party SFU dials in; it
+			// cannot send our internal header) OR the `x-wave-internal` header (the path for internal callers).
+			// When WAVE_INTERNAL_SECRET is unset (local/test) the token check is false AND gatewayGate enforces
+			// nothing → no enforcement, mirroring every other gated route.
+			const tok = url.searchParams.get("t");
+			const tokenOk =
+				!!tok && !!env.WAVE_INTERNAL_SECRET && (await verifyRecorderToken(env.WAVE_INTERNAL_SECRET, rorg, rsession, rtrack, tok));
+			if (!tokenOk) {
+				const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
+				if (denied) return denied;
+			}
 			// Disarmed (RT_RECORD!=="1", the live default) → the route does not exist (config-no-silent-noop:
-			// nothing dials it, so a 404 is the honest "no recorder here", not a silent accept).
+			// nothing dials it, so a 501 is the honest "no recorder here", not a silent accept).
 			if (env.RT_RECORD !== "1") {
 				return Response.json({ error: "REALTIME_NOT_IMPLEMENTED", path: url.pathname }, { status: 501 });
 			}
@@ -260,10 +274,6 @@ export default {
 					{ error: "UPGRADE_REQUIRED", message: "recorder route requires a WebSocket upgrade" },
 					{ status: 426 },
 				);
-			}
-			const [, rorg, rsession, rtrack] = recMatch;
-			if (![rorg, rsession, rtrack].every((s) => SAFE_SEGMENT.test(s)) || !env.ROOM) {
-				return Response.json({ error: "BAD_REQUEST", message: "invalid recorder path or no ROOM binding" }, { status: 400 });
 			}
 			// Open a server WebSocket and forward every BINARY frame to the room's DO tap (per-org keyed). The DO
 			// feed is fully fail-open — a recording error never affects the live media the SFU is also pushing.

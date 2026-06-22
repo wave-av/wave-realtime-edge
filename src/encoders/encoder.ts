@@ -36,6 +36,9 @@ export interface EncoderEnv {
   RT_RECORDINGS?: R2Bucket; // the SKIP sink bucket — the webhook pull writes the finished recording here (RT-P2.4 ◆)
   RT_ENCODER?: EncoderKind; // selector; default "managed" (C)
   RT_RECORD?: string; // "1" to arm recording at all (default OFF — fully inert)
+  // adapter A: signs the per-(org,session,track) capability token the SFU appends to the recorder route URL
+  // (?t=...) so it can authenticate the dial-in WITHOUT the internal header. Unset → no token (local/test).
+  WAVE_INTERNAL_SECRET?: string;
   // ── adapter C PULL mode (design §2, corrected): RTK records to ITS OWN storage (its `storage_config` enum
   // has no R2 option), fires the `recording.statusUpdate` UPLOADED webhook, and the worker PULLS the finished
   // file into RT_RECORDINGS at an org-rooted key. RT_MEETING_ORG carries meetingId→org from the stateless
