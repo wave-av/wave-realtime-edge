@@ -46,6 +46,7 @@ const ID = {
   Audio: [0xe1],
   SamplingFrequency: [0xb5],
   Channels: [0x9f],
+  BitDepth: [0x62, 0x64],
   Cluster: [0x1f, 0x43, 0xb6, 0x75],
   Timestamp: [0xe7],
   SimpleBlock: [0xa3],
@@ -68,9 +69,19 @@ export interface MuxerOptions {
   /** Video pixel dimensions for the Tracks header. Defaults are placeholders until real frame geometry. */
   width?: number;
   height?: number;
-  /** Opus sampling frequency / channel count. */
+  /** Audio sampling frequency / channel count. */
   sampleRate?: number;
   channels?: number;
+  /**
+   * Audio codec for the audio TrackEntry. "opus" (default) declares A_OPUS in a `webm` DocType — the real
+   * product path, fed by an Opus encoder (WASM). "pcm" declares A_PCM/INT/LIT in a `matroska` DocType — the
+   * no-encoder walking-skeleton path: the SFU's raw 16-bit-LE PCM is muxed verbatim (NO WASM Opus encode),
+   * so the whole raw-SFU pipe (RT-R8) is buildable+provable now. A future Opus WASM encoder swaps the encode
+   * seam (RawSfuTap.AudioEncoder) and flips this back to "opus" with no muxer change.
+   */
+  audioCodec?: "opus" | "pcm";
+  /** PCM bit depth for the A_PCM BitDepth element (only emitted when audioCodec==="pcm"). Default 16. */
+  bitDepth?: number;
   /** Writing-app string (defaults to "wave-realtime-edge"). */
   writingApp?: string;
 }
@@ -172,6 +183,8 @@ export class WebmMuxer {
       height: options.height ?? 720,
       sampleRate: options.sampleRate ?? 48000,
       channels: options.channels ?? 2,
+      audioCodec: options.audioCodec ?? "opus",
+      bitDepth: options.bitDepth ?? 16,
       writingApp: options.writingApp ?? "wave-realtime-edge",
     };
   }
@@ -181,13 +194,16 @@ export class WebmMuxer {
     if (this.headerWritten) return;
     this.headerWritten = true;
 
+    // A_PCM is not a WebM codec — when muxing raw PCM, the DocType is the broader `matroska` (a .webm-named
+    // object whose bytes are valid Matroska; the recorder sniffs only the shared EBML magic for the extension).
+    const pcm = this.opts.audioCodec === "pcm";
     const ebml = master(ID.EBML, [
       uintElem(ID.EBMLVersion, 1),
       uintElem(ID.EBMLReadVersion, 1),
       uintElem(ID.EBMLMaxIDLength, 4),
       uintElem(ID.EBMLMaxSizeLength, 8),
-      strElem(ID.DocType, "webm"),
-      uintElem(ID.DocTypeVersion, 2),
+      strElem(ID.DocType, pcm ? "matroska" : "webm"),
+      uintElem(ID.DocTypeVersion, pcm ? 4 : 2),
       uintElem(ID.DocTypeReadVersion, 2),
     ]);
 
@@ -208,15 +224,17 @@ export class WebmMuxer {
         uintElem(ID.PixelHeight, this.opts.height),
       ]),
     ]);
+    const audioChildren = [
+      floatElem(ID.SamplingFrequency, this.opts.sampleRate),
+      uintElem(ID.Channels, this.opts.channels),
+    ];
+    if (pcm) audioChildren.push(uintElem(ID.BitDepth, this.opts.bitDepth));
     const audioTrack = master(ID.TrackEntry, [
       uintElem(ID.TrackNumber, TRACK_AUDIO),
       uintElem(ID.TrackUID, TRACK_AUDIO),
       uintElem(ID.TrackType, TYPE_AUDIO),
-      strElem(ID.CodecID, "A_OPUS"),
-      master(ID.Audio, [
-        floatElem(ID.SamplingFrequency, this.opts.sampleRate),
-        uintElem(ID.Channels, this.opts.channels),
-      ]),
+      strElem(ID.CodecID, pcm ? "A_PCM/INT/LIT" : "A_OPUS"),
+      master(ID.Audio, audioChildren),
     ]);
     const tracks = master(ID.Tracks, [videoTrack, audioTrack]);
 
