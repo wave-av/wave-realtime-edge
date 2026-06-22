@@ -187,6 +187,20 @@ export interface AudioEncoder {
   encode(payload: Uint8Array): Uint8Array;
 }
 
+/**
+ * RT-R8 video seam (P3 SCAFFOLD) — the JPEG→VP8 encode seam, parallel to AudioEncoder. The SFU pushes video as
+ * `outputCodec:"jpeg"` frames; an injected VideoEncoder turns each decoded JPEG into a VP8 keyframe the muxer
+ * writes as a video SimpleBlock. This is the ◆ infra slice: a real VP8 encoder needs libvpx (the rt-encoder
+ * container — see containers/rt-encoder/). DEFAULT: no video encoder injected → video frames are DROPPED
+ * (audio-only path is unchanged), so the container stays OPTIONAL. NEVER imports `@wave-av/content-hash`.
+ */
+export interface VideoEncoder {
+  /** The muxer video codec these bytes are valid for (the muxer's video TrackEntry declares V_VP8). */
+  readonly codec: "vp8";
+  /** Encode one decoded JPEG frame → a VP8 keyframe. (Real impl: libvpx in the rt-encoder container — ◆.) */
+  encode(jpeg: Uint8Array): Uint8Array;
+}
+
 /** Default no-WASM encoder: the SFU's raw 16-bit-LE PCM is already mux-ready as A_PCM/INT/LIT. */
 export class PassthroughPcmEncoder implements AudioEncoder {
   readonly codec = "pcm" as const;
@@ -206,6 +220,16 @@ export interface RawSfuTapOptions {
   target: RawSfuTapTarget;
   /** Encode seam; default PassthroughPcmEncoder (no WASM). */
   encoder?: AudioEncoder;
+  /**
+   * Which media this track delivers (matches the WS adapter's `outputCodec`). "pcm" (default) → audio frames;
+   * "jpeg" → video frames routed through `videoEncoder`. Without a videoEncoder, "jpeg" frames are dropped.
+   */
+  outputCodec?: "pcm" | "jpeg";
+  /**
+   * Video encode seam (P3 ◆). When set AND outputCodec==="jpeg", each decoded JPEG payload → VP8 → a video
+   * SimpleBlock (keyframe). Absent → video frames are DROPPED (audio-only path unchanged, container OPTIONAL).
+   */
+  videoEncoder?: VideoEncoder;
   /** Muxer geometry/rate overrides (audioCodec is forced to the encoder's codec). */
   muxerOptions?: Omit<MuxerOptions, "audioCodec">;
   /** Packet timestamp → ms. Default identity (assumes ms); set to t=>t/48 if the SFU emits 48kHz samples. */
@@ -224,6 +248,8 @@ export interface RawSfuTapOptions {
 export class RawSfuTap {
   private readonly target: RawSfuTapTarget;
   private readonly encoder: AudioEncoder;
+  private readonly outputCodec: "pcm" | "jpeg";
+  private readonly videoEncoder: VideoEncoder | null;
   private readonly muxer: WebmMuxer;
   private readonly tsToMs: (ts: number) => number;
   private readonly flushBytes: number;
@@ -234,6 +260,8 @@ export class RawSfuTap {
   constructor(opts: RawSfuTapOptions) {
     this.target = opts.target;
     this.encoder = opts.encoder ?? new PassthroughPcmEncoder();
+    this.outputCodec = opts.outputCodec ?? "pcm";
+    this.videoEncoder = opts.videoEncoder ?? null;
     this.muxer = new WebmMuxer({ ...opts.muxerOptions, audioCodec: this.encoder.codec });
     this.tsToMs = opts.tsToMs ?? ((t) => t);
     this.flushBytes = opts.flushBytes ?? 1024 * 1024;
@@ -244,14 +272,26 @@ export class RawSfuTap {
     return this.recorder?.key ?? null;
   }
 
-  /** Feed ONE raw WS binary frame (one Packet): decode → encode → mux audio frame → flush when full. */
+  /**
+   * Feed ONE raw WS binary frame (one Packet): decode → encode → mux frame → flush when full. Audio
+   * (outputCodec "pcm") muxes a video-less audio SimpleBlock. Video (outputCodec "jpeg") routes the decoded
+   * JPEG through the injected `videoEncoder` (P3 ◆) → a VP8 keyframe video SimpleBlock; with NO videoEncoder
+   * the video frame is DROPPED (audio-only path unchanged, container OPTIONAL).
+   */
   async onFrame(frame: Uint8Array): Promise<void> {
     if (this.finalized) return;
     const pkt = decodePacket(frame);
     if (pkt.payload.length === 0) return; // keep-alive / empty frame
     if (this.firstTs === null) this.firstTs = pkt.timestamp;
     const tsMs = Math.max(0, Math.floor(this.tsToMs(pkt.timestamp - this.firstTs)));
-    this.muxer.addFrame({ kind: "audio", data: this.encoder.encode(pkt.payload), timestampMs: tsMs });
+    if (this.outputCodec === "jpeg") {
+      if (!this.videoEncoder) return; // no VP8 encoder injected → drop video (audio-only path unchanged)
+      const vp8 = this.videoEncoder.encode(pkt.payload);
+      if (vp8.length === 0) return;
+      this.muxer.addFrame({ kind: "video", data: vp8, timestampMs: tsMs, keyframe: true });
+    } else {
+      this.muxer.addFrame({ kind: "audio", data: this.encoder.encode(pkt.payload), timestampMs: tsMs });
+    }
     if (this.muxer.pending >= this.flushBytes) await this.flush();
   }
 

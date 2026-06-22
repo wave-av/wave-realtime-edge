@@ -18,6 +18,8 @@ import type { SessionDescription } from "./sfu.js";
 import { Signaling } from "./signaling.js";
 import type { SignalContext, PublishTrack } from "./signaling.js";
 import type { ParticipantSessionUsage, MeterEmitEnv } from "./metering.js";
+import { selectEncoder } from "./encoders/factory.js";
+import type { EncoderEnv, EncoderHandle, EncoderKind, RecordingEncoder } from "./encoders/encoder.js";
 
 /** CF Realtime GCs a track after 30s of inactivity (design §4). Registry reconcile uses this. */
 export const TRACK_GC_MS = 30_000;
@@ -559,8 +561,20 @@ export interface RoomDOEnv {
   CF_CALLS_APP_SECRET?: string;
   GATEWAY_BASE_URL?: string;
   WAVE_SERVICE_TOKEN?: string;
+  // ── RT-R9 raw-SFU recording (DORMANT until ◆-armed). The DO builds the recording encoder lazily via
+  // selectEncoder(env) on the FIRST publish. RT_ENCODER stays "managed" in live wrangler.toml → the
+  // recordingHandle is a no-op (managed C has no onPublish/finalize state held here); only an ◆-armed
+  // RT_ENCODER="container" + RT_RECORD="1" + creds opens a real raw-SFU tap. ──
+  RT_RECORDINGS?: R2Bucket; // SKIP sink the container tap writes the one canonical object into
+  RT_ENCODER?: EncoderKind; // selector; default "managed" (live). "container" = raw-SFU (◆).
+  RT_RECORD?: string; // "1" to arm recording at all (default OFF — fully inert)
+  CF_API_TOKEN?: string; // managed (C) RTK REST bearer (carried through for selectEncoder)
+  RTK_APP_ID?: string; // managed (C) RTK app id
+  CF_ACCOUNT_ID?: string; // managed (C) account id
   /** test-only: injected SFU HTTP client (defaults to global fetch). The metering tap uses global fetch. */
   __sfuFetch?: typeof fetch;
+  /** test-only: injected recording encoder (defaults to selectEncoder(env)). Lets orchestration tests drive a fake. */
+  __recordingEncoder?: RecordingEncoder;
 }
 
 /** The realtime intents the worker entry forwards to the DO's fetch() (last path segment). */
@@ -574,13 +588,108 @@ type RoomIntent = "join" | "publish" | "subscribe" | "renegotiate" | "leave";
  * gives per-room serialized state + per-org isolation (the DO id is keyed `${org}:${room}` by the worker).
  * Registered in wrangler config (ROOM binding + v1 migration).
  */
+/**
+ * RT-R9 — per-DO raw-SFU recording orchestrator. Holds the lazily-built recording encoder + one EncoderHandle
+ * per SFU sessionId, and persists each handle's hibernation meta (handle.toMeta()) so a DO eviction mid-session
+ * can resume. DORMANT for the live "managed" path (its handle has no onPublish + a null toMeta — nothing held);
+ * only an ◆-armed RT_ENCODER="container" opens real taps. Every method is fail-open: a recording error NEVER
+ * propagates up the publish/leave path (media-safety > recording, design §4).
+ */
+export class RoomRecording {
+  private encoder: RecordingEncoder | null = null;
+  /** sessionId → live EncoderHandle (one raw-SFU recording per participant SFU session). */
+  private readonly handles = new Map<string, EncoderHandle>();
+
+  constructor(
+    private readonly env: RoomDOEnv,
+    private readonly storage: RoomStorage,
+  ) {}
+
+  private static metaKey(sessionId: string): string {
+    return `rt:recorder:${sessionId}`;
+  }
+
+  /** Lazily construct the encoder (selectEncoder) — DisarmedEncoder unless RT_RECORD="1". Injectable for tests. */
+  private getEncoder(): RecordingEncoder {
+    if (!this.encoder) {
+      this.encoder = this.env.__recordingEncoder ?? selectEncoder(this.env as unknown as EncoderEnv);
+    }
+    return this.encoder;
+  }
+
+  /**
+   * A track published in `org`'s room for participant SFU `sessionId`. Begins the recording handle for that
+   * session on first publish, then forwards onPublish(trackName,kind). Persists the handle's hibernation meta.
+   * Fail-open: any error is swallowed (recording is best-effort, never blocks the publish).
+   */
+  async onPublish(org: string, sessionId: string, room: string, trackName: string, kind: TrackKind): Promise<void> {
+    try {
+      let handle = this.handles.get(sessionId);
+      if (!handle) {
+        const begun = await this.getEncoder().begin({ org, room, sessionId });
+        if (!begun) return; // disarmed / unconfigured → records nothing (loud-warned inside the encoder)
+        handle = begun;
+        this.handles.set(sessionId, handle);
+      }
+      if (handle.onPublish) await handle.onPublish(trackName, kind);
+      await this.persist(sessionId, handle);
+    } catch {
+      /* fail-open — recording never blocks publish */
+    }
+  }
+
+  /** Feed ONE decoded WS media frame to the tap for (sessionId, trackName) — used by the Worker recorder route. */
+  async feedFrame(sessionId: string, trackName: string, frame: Uint8Array): Promise<void> {
+    try {
+      const handle = this.handles.get(sessionId);
+      // ContainerHandle exposes its taps; other handles (managed) hold no taps → frame is a no-op.
+      const taps = (handle as { tapsByTrack?: ReadonlyMap<string, { onFrame(f: Uint8Array): Promise<void> }> })
+        ?.tapsByTrack;
+      const tap = taps?.get(trackName);
+      if (tap) await tap.onFrame(frame);
+    } catch {
+      /* fail-open */
+    }
+  }
+
+  /** Session end (leave/endRoom): finalize the handle for `sessionId`, clear its persisted meta. Fail-open. */
+  async finalize(sessionId: string): Promise<void> {
+    try {
+      const handle = this.handles.get(sessionId);
+      if (!handle) return;
+      await handle.finalize();
+    } catch {
+      /* fail-open — a finalize error never throws the leave down */
+    } finally {
+      this.handles.delete(sessionId);
+      try {
+        await this.storage.put(RoomRecording.metaKey(sessionId), null);
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
+
+  /** Persist a handle's hibernation snapshot so a DO wake can resume (null meta → nothing to hold). */
+  private async persist(sessionId: string, handle: EncoderHandle): Promise<void> {
+    try {
+      const meta = handle.toMeta();
+      if (meta != null) await this.storage.put(RoomRecording.metaKey(sessionId), meta);
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
 export class RoomDO {
   private readonly core: RoomCore;
   private readonly env: RoomDOEnv;
+  private readonly recording: RoomRecording;
 
   constructor(state: DurableObjectStateLike, env?: RoomDOEnv) {
     this.core = new RoomCore(state.storage);
     this.env = env ?? {};
+    this.recording = new RoomRecording(this.env, state.storage);
   }
 
   ensureRoom(config: RoomConfig) { return this.core.ensureRoom(config); }
@@ -602,6 +711,10 @@ export class RoomDO {
   ban(participantId: string) { return this.core.ban(participantId); }
   endRoom() { return this.core.endRoom(); }
   listWaiting() { return this.core.listWaiting(); }
+  /** RT-R9: feed ONE decoded WS media frame to the tap for (sessionId, trackName). DORMANT for managed. */
+  feedRecorderFrame(sessionId: string, trackName: string, frame: Uint8Array) {
+    return this.recording.feedFrame(sessionId, trackName, frame);
+  }
 
   /**
    * Control-plane surface. The worker forwards `POST .../<intent>` here with a JSON body carrying the
@@ -611,7 +724,21 @@ export class RoomDO {
    * (fail-open inside metering.ts). The DO never holds media — only state + orchestration.
    */
   async fetch(request: Request): Promise<Response> {
-    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent;
+    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent | "recorder-frame";
+    // RT-R9: the Worker recorder route forwards one decoded WS media frame as a raw binary POST. DORMANT for
+    // managed (feedFrame is a no-op when no container tap is held). Fail-open: always 200/204, never throws.
+    if (intent === "recorder-frame") {
+      try {
+        const u = new URL(request.url);
+        const sessionId = u.searchParams.get("sessionId") ?? "";
+        const trackName = u.searchParams.get("trackName") ?? "";
+        const buf = new Uint8Array(await request.arrayBuffer());
+        if (sessionId && trackName && buf.length > 0) await this.recording.feedFrame(sessionId, trackName, buf);
+      } catch {
+        /* fail-open */
+      }
+      return new Response(null, { status: 204 });
+    }
     let body: Record<string, unknown> = {};
     try {
       body = (await request.json()) as Record<string, unknown>;
@@ -621,7 +748,7 @@ export class RoomDO {
     const ctx = body.ctx as SignalContext | undefined;
 
     try {
-      const signaling = new Signaling(this.core, this.buildSfu(), this.meterEnv());
+      const signaling = new Signaling(this.core, this.buildSfu(), this.meterEnv(), this.recording);
       switch (intent) {
         case "join":
           return Response.json(

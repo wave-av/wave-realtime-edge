@@ -37,11 +37,26 @@ describe("selectEncoder — armed adapter selection (RT_RECORD='1')", () => {
   });
 });
 
-describe("A/B adapters are BLOCKED-ON-RT-P0.1-spike (fail loud, never silent no-op)", () => {
-  it("ContainerEncoder.begin throws NOT_SPIKED", async () => {
+describe("ContainerEncoder (A) is now a real audio-first impl — begin NEVER throws (fail-open, inert)", () => {
+  it("armed but UNCONFIGURED (no bucket/app) → null, never throws (loud-warn)", async () => {
     const enc = selectEncoder({ RT_RECORD: "1", RT_ENCODER: "container" });
-    await expect(enc.begin(SESSION)).rejects.toThrow(/BLOCKED-ON-RT-P0.1-spike/);
+    await expect(enc.begin(SESSION)).resolves.toBeNull();
   });
+  it("armed + fully configured → a non-null ContainerHandle (no throw)", async () => {
+    const bucket = {} as unknown as R2Bucket;
+    const enc = selectEncoder({
+      RT_RECORD: "1",
+      RT_ENCODER: "container",
+      RT_RECORDINGS: bucket,
+      CF_CALLS_APP_ID: "a".repeat(32),
+      CF_CALLS_APP_SECRET: "sfu-secret",
+    });
+    const handle = await enc.begin(SESSION);
+    expect(handle).not.toBeNull();
+  });
+});
+
+describe("WasmEncoder (B) is STILL a BLOCKED-ON-RT-P0.1-spike scaffold (fail loud)", () => {
   it("WasmEncoder.begin throws NOT_SPIKED", async () => {
     const enc = selectEncoder({ RT_RECORD: "1", RT_ENCODER: "wasm" });
     await expect(enc.begin(SESSION)).rejects.toThrow(/BLOCKED-ON-RT-P0.1-spike/);
