@@ -36,6 +36,13 @@ export interface EncoderEnv {
   RT_RECORDINGS?: R2Bucket; // the SKIP sink bucket (RT-P2.4 ◆ binding; absent until armed+attached)
   RT_ENCODER?: EncoderKind; // selector; default "managed" (C)
   RT_RECORD?: string; // "1" to arm recording at all (default OFF — fully inert)
+  // ── adapter C "direct" mode (storage_config): RTK uploads the finished recording STRAIGHT to our R2 at an
+  // org-rooted path, so the bytes never transit this worker (no double-egress, no worker time/CPU limit on a
+  // GB-sized meeting). The daily storage sweep bills it by org-prefix. These three configure that path; when
+  // any is absent, direct mode is OFF (begin() loud-nulls — config-no-silent-noop). ──
+  RT_RECORDINGS_BUCKET?: string; // R2 bucket NAME RTK writes to (storage_config.bucket), e.g. "wave-realtime-recordings"
+  RT_R2_ACCESS_KEY_ID?: string; // R2 S3 access-key id handed to RTK (storage_config.access_key) — wrangler SECRET
+  RT_R2_SECRET_ACCESS_KEY?: string; // R2 S3 secret handed to RTK (storage_config.secret) — wrangler SECRET
 }
 
 export type EncoderKind = "managed" | "container" | "wasm";
