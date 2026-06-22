@@ -41,10 +41,17 @@ GATEWAY_BASE_URL = "https://api.wave.online"
 # RT_RECORD arms recording at all; absent/"0" → selectEncoder() returns the inert DisarmedEncoder (begin →
 # null), so the whole feature is a no-op (config-no-silent-noop: inert, not silently broken). Arming
 # RT_RECORD=1 in any live env is a ◆ Jake-named crossing (design §8.5(6)).
-RT_RECORD = "0"
+# ◆ ARMED at RT-P2.4 (#34, Jake-named): managed (C) direct-storage_config recording is live. The R2 dest
+# creds (RT_R2_ACCESS_KEY_ID/SECRET) + CF_ACCOUNT_ID are wrangler SECRETS (set from Doppler wave/prd); the
+# token is a bucket-scoped R2 key (read+write wave-realtime-recordings ONLY). Direct mode needs NO R2
+# binding on this worker — RTK uploads straight to the bucket; the daily storage sweep bills by org-prefix.
+RT_RECORD = "1"
 # RT_ENCODER selects the adapter when armed: "managed" (C, the buildable path) | "container" (A) | "wasm"
 # (B). A/B are BLOCKED-ON-RT-P0.1-spike and throw NOT_SPIKED at begin until the §7 WS media-transport spike.
 RT_ENCODER = "managed"
+# RT_RECORDINGS_BUCKET — the R2 bucket NAME handed to RTK in storage_config (managed-direct mode). Bucket
+# name only (committable; the account id is the CF_ACCOUNT_ID SECRET, kept out of this public repo).
+RT_RECORDINGS_BUCKET = "wave-realtime-recordings"
 # RT_RECORDINGS — the SKIP sink R2 bucket. Binding attach is ◆ RT-P2.4 (#34); declared dormant below so the
 # code path is visible but no bucket is attached until Jake names the crossing. Until then, even when armed
 # the adapter fails open (records nothing) because the binding is absent.
