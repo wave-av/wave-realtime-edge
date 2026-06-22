@@ -18,6 +18,13 @@ routes = [{ pattern = "rt.wave.online", custom_domain = true }]
 [observability]
 enabled = true
 
+# RT-P2.5 — cron that runs scheduled() → reconcilePending: re-pulls any PULL-mode recording whose UPLOADED
+# webhook pull failed POST-ack (RTK won't re-deliver after our 200), so a transient blip can't silently lose a
+# customer recording. Idempotent (deterministic R2 key); clears the pending KV record on success. Cheap (KV
+# list of a normally-empty set). No-op when RT_RECORDINGS/RT_MEETING_ORG are unbound.
+[triggers]
+crons = ["*/15 * * * *"]
+
 [vars]
 # CF-3.1.2 — RealtimeKit (CF Realtime) config. RTK_APP_ID is a non-secret app identifier.
 RTK_APP_ID = "6dee33e5-cd89-41e8-a81c-9a8cd48bb9c3"
@@ -41,23 +48,30 @@ GATEWAY_BASE_URL = "https://api.wave.online"
 # RT_RECORD arms recording at all; absent/"0" → selectEncoder() returns the inert DisarmedEncoder (begin →
 # null), so the whole feature is a no-op (config-no-silent-noop: inert, not silently broken). Arming
 # RT_RECORD=1 in any live env is a ◆ Jake-named crossing (design §8.5(6)).
-# ◆ ARMED at RT-P2.4 (#34, Jake-named): managed (C) direct-storage_config recording is live. The R2 dest
-# creds (RT_R2_ACCESS_KEY_ID/SECRET) + CF_ACCOUNT_ID are wrangler SECRETS (set from Doppler wave/prd); the
-# token is a bucket-scoped R2 key (read+write wave-realtime-recordings ONLY). Direct mode needs NO R2
-# binding on this worker — RTK uploads straight to the bucket; the daily storage sweep bills by org-prefix.
+# ◆ ARMED at RT-P2.4 (#34, Jake-named): managed (C) recording is live in PULL mode. RealtimeKit CANNOT upload
+# into R2 (its storage_config enum is aws|azure|digitalocean|gcs|sftp — no R2 option; type:"cloudflare" is
+# silently dropped → recording lands in RTK's OWN bucket, breaking our org-prefix sweep). So RTK records to
+# its own storage and the recording.statusUpdate UPLOADED webhook PULLS the finished file into RT_RECORDINGS
+# at an org-rooted key (the daily storage sweep bills by org-prefix). CF_API_TOKEN/CF_ACCOUNT_ID are wrangler
+# SECRETS; the old RT_R2_ACCESS_KEY_ID/SECRET S3 creds (retired direct mode) are now UNUSED — deletable.
 RT_RECORD = "1"
 # RT_ENCODER selects the adapter when armed: "managed" (C, the buildable path) | "container" (A) | "wasm"
 # (B). A/B are BLOCKED-ON-RT-P0.1-spike and throw NOT_SPIKED at begin until the §7 WS media-transport spike.
 RT_ENCODER = "managed"
-# RT_RECORDINGS_BUCKET — the R2 bucket NAME handed to RTK in storage_config (managed-direct mode). Bucket
-# name only (committable; the account id is the CF_ACCOUNT_ID SECRET, kept out of this public repo).
-RT_RECORDINGS_BUCKET = "wave-realtime-recordings"
-# RT_RECORDINGS — the SKIP sink R2 bucket. Binding attach is ◆ RT-P2.4 (#34); declared dormant below so the
-# code path is visible but no bucket is attached until Jake names the crossing. Until then, even when armed
-# the adapter fails open (records nothing) because the binding is absent.
-# [[r2_buckets]]
-# binding = "RT_RECORDINGS"
-# bucket_name = "wave-realtime-recordings"   # ◆ create + attach at RT-P2.4 deploy (Jake-named)
+# (PULL mode hands RTK NO storage_config, so there is no RT_RECORDINGS_BUCKET var — the bucket is bound
+# directly below as the R2 binding the webhook pull writes into.)
+
+# ── RT-P2.5 — the SKIP sink R2 bucket (RT_RECORDINGS) + the meetingId→org map (RT_MEETING_ORG). ──
+# The recording webhook fetches the finished RTK recording and streams it into RT_RECORDINGS at
+# `${org}/realtime-recordings/${meetingId}/recording.<ext>`; RT_MEETING_ORG carries org from the stateless
+# /rtk/join to that later webhook so the pull can attribute it. tier=SKIP (no dedup index is ever touched).
+[[r2_buckets]]
+binding = "RT_RECORDINGS"
+bucket_name = "wave-realtime-recordings"
+
+[[kv_namespaces]]
+binding = "RT_MEETING_ORG"
+id = "4acd6ec7b04546ba8767f2353d5394e8"   # `wrangler kv namespace create RT_MEETING_ORG` (d674452f acct)
 
 # ── CF Realtime SFU app creds (P5 — sfu.ts) — wrangler SECRETS, referenced not valued ──
 # These are NOT set here. Set via `wrangler secret put`, values from Doppler wave/prd:

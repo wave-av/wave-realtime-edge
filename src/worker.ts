@@ -13,8 +13,15 @@
 import { join, turn, RtkError } from "./realtimekit";
 import type { EncoderEnv } from "./encoders/encoder";
 import { selectEncoder } from "./encoders/factory";
-import { directRecordingConfigured } from "./encoders/managed";
-import { handleRecordingWebhook, liveWebhookDeps } from "./rtk-webhook";
+import { pullRecordingConfigured, DefaultManagedRecordingApi } from "./encoders/managed";
+import {
+	handleRecordingWebhook,
+	liveWebhookDeps,
+	reconcilePending,
+	PENDING_PREFIX,
+	PENDING_TTL_SECONDS,
+	type RecordingPullSink,
+} from "./rtk-webhook";
 
 // Re-export the Room Durable Object so the wrangler `ROOM` binding + migration (v1, new_sqlite_classes)
 // resolve from this main module. The class itself is defined in room.ts (P5 substrate); it is not yet
@@ -28,8 +35,8 @@ interface RoomNamespace {
 }
 
 // Env extends EncoderEnv so the recording adapter's config (CF_ACCOUNT_ID/CF_API_TOKEN/RTK_APP_ID +
-// RT_RECORD/RT_ENCODER/RT_RECORDINGS + the direct-mode RT_RECORDINGS_BUCKET/RT_R2_* creds) flows straight
-// from the worker env into selectEncoder()/directRecordingConfigured() with no re-mapping.
+// RT_RECORD/RT_ENCODER/RT_RECORDINGS + the pull-mode RT_MEETING_ORG meetingId→org KV) flows straight from the
+// worker env into selectEncoder()/pullRecordingConfigured()/the webhook pull sink with no re-mapping.
 interface Env extends EncoderEnv {
 	WAVE_INTERNAL_SECRET?: string; // wrangler SECRET — when set, ONLY the gateway (x-wave-internal) may /rtk/* AND /v1/realtime/*
 	TURN_KEY_ID?: string; // wrangler SECRET — the CF TURN key uid (32-hex). Out of the public repo; persists across deploys.
@@ -78,6 +85,37 @@ function gatewayGate(request: Request, secret: string | undefined): Response | n
 	return null;
 }
 
+/**
+ * Build the PULL-mode sink the recording webhook uses to fetch a finished recording into our R2. Null when the
+ * SKIP sink bucket (RT_RECORDINGS) or the meetingId→org map (RT_MEETING_ORG) is absent → the webhook degrades
+ * to observe-only (still acks the signed event), never a silent broken write. The RTK REST primitives
+ * (download-url resolve + fetch) come from the same DefaultManagedRecordingApi the join path starts with.
+ */
+function buildPullSink(env: Env): RecordingPullSink | null {
+	if (!env.RT_RECORDINGS || !env.RT_MEETING_ORG) return null;
+	const api = new DefaultManagedRecordingApi(env);
+	const kv = env.RT_MEETING_ORG;
+	const bucket = env.RT_RECORDINGS;
+	return {
+		lookupOrg: (meetingId) => kv.get(meetingId),
+		resolveDownloadUrl: (recordingId) => api.getDownloadUrl(recordingId),
+		fetchRecording: (url) => api.fetchRecording(url),
+		bucket,
+		markPending: async (recordingId, meetingId) => {
+			// Durable retry seed: store only the stable ids (the event's download_url is perishable; the cron
+			// re-resolves it). The scheduled() reconcile re-pulls + clears this. TTL bounds the recovery window.
+			await kv.put(`${PENDING_PREFIX}${recordingId}`, JSON.stringify({ meetingId, attempts: 0 }), {
+				expirationTtl: PENDING_TTL_SECONDS,
+			});
+		},
+	};
+}
+
+/** A WAVE org id is the FIRST path segment of every recording R2 key (the daily sweep bills by it), so it must
+ * be a safe single path segment. The gateway stamps x-wave-org, but we still validate before minting a key/
+ * billing prefix: alphanumerics + `_ : -` only (uuid-ish / pool-ish), no `/`, dot, or whitespace, ≤128 chars. */
+const SAFE_ORG = /^[A-Za-z0-9_:-]{1,128}$/;
+
 export default {
 	async fetch(request: Request, env: Env = {} as Env, ctx?: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
@@ -96,7 +134,17 @@ export default {
 		// is intentionally NOT behind gatewayGate; it authenticates itself via the `rtk-signature` header
 		// (RSA-SHA256 over the raw body, verified against CF's published key) before acting on anything.
 		if (request.method === "POST" && url.pathname === "/rtk/recording-webhook") {
-			return handleRecordingWebhook(request, recordingWebhookDeps);
+			// PULL mode: when the SKIP sink + meetingId→org map are bound, an UPLOADED event pulls the finished
+			// recording into our R2 (backgrounded via ctx.waitUntil so a large transfer can't hold the request past
+			// RTK's webhook timeout). Absent bindings → observe-only deps (the event is still acked).
+			const sink = buildPullSink(env);
+			const webhookDeps =
+				sink && ctx
+					? { ...recordingWebhookDeps, sink, waitUntil: (p: Promise<unknown>) => ctx.waitUntil(p) }
+					: sink
+						? { ...recordingWebhookDeps, sink }
+						: recordingWebhookDeps;
+			return handleRecordingWebhook(request, webhookDeps);
 		}
 
 		if (request.method === "POST" && url.pathname === "/rtk/join") {
@@ -120,26 +168,30 @@ export default {
 							typeof body.custom_participant_id === "string" ? body.custom_participant_id : undefined,
 					},
 				);
-				// Best-effort: arm managed recording for this meeting. DIRECT mode only (RTK uploads straight to
-				// our R2 at an org-rooted path; the recording.statusUpdate webhook confirms) — no in-worker
-				// finalize to drive on this stateless path. Never on the response critical path (waitUntil), never
+				// Best-effort: arm managed recording for this meeting. PULL mode (RTK records to its own storage;
+				// the recording.statusUpdate UPLOADED webhook pulls the finished file into our R2 at an org-rooted
+				// path). On this stateless path we (1) persist meetingId→org so the later webhook can attribute the
+				// pull, then (2) start the RTK recording. Never on the response critical path (waitUntil), never
 				// throws the join. Opt out per call with {"record": false}.
-				if (ctx && body.record !== false && directRecordingConfigured(env)) {
+				if (ctx && body.record !== false && pullRecordingConfigured(env)) {
 					const org = request.headers.get("x-wave-org") ?? "";
-					if (org) {
+					if (SAFE_ORG.test(org)) {
 						const session = { org, room: "", sessionId: result.meetingId };
 						ctx.waitUntil(
-							selectEncoder(env)
-								.begin(session)
-								.then((h) => {
-									if (h) console.log(JSON.stringify({ msg: "rt-recording-armed", meetingId: result.meetingId, org }));
-								})
-								.catch(() => {}),
+							(async () => {
+								// Persist meetingId→org FIRST so the recording webhook can attribute the pull to this org. A
+								// 14-day TTL comfortably outlives any meeting + RTK's upload/webhook latency.
+								await env.RT_MEETING_ORG?.put(result.meetingId, org, { expirationTtl: 60 * 60 * 24 * 14 });
+								const h = await selectEncoder(env).begin(session);
+								if (h) console.log(JSON.stringify({ msg: "rt-recording-armed", meetingId: result.meetingId, org }));
+							})().catch(() => {}),
 						);
 					} else {
-						// Armed but the gateway didn't stamp org on this path — cannot attribute the recording. Loud,
-						// not a silent skip (config-no-silent-noop): the recording is dropped on purpose.
-						console.warn(JSON.stringify({ msg: "rt-recording-skipped-no-org", meetingId: result.meetingId }));
+						// No (or malformed) gateway-stamped org → we do NOT start or attribute a recording on this path
+						// (no KV put, no begin()). Loud, not silent (config-no-silent-noop). We are not "dropping" a
+						// recording: nothing was started here. (A malformed org would otherwise mint a bad billing prefix.)
+						const reason = org ? "rt-recording-skipped-bad-org" : "rt-recording-skipped-no-org";
+						console.warn(JSON.stringify({ msg: reason, meetingId: result.meetingId }));
 					}
 				}
 				return Response.json(result, { status: 200 });
@@ -230,5 +282,18 @@ export default {
 		}
 
 		return Response.json({ error: "REALTIME_NOT_IMPLEMENTED", path: url.pathname }, { status: 501 });
+	},
+
+	// Cron (wrangler.toml [triggers]) — durable recovery for PULL-mode recordings. RTK fires the UPLOADED
+	// webhook once and never re-delivers after our 200, so a POST-ack pull failure would silently lose the
+	// recording. handleRecordingWebhook enqueues a pending-pull record on failure; this reconcile re-pulls each
+	// with a freshly resolved download URL (idempotent key) and clears it on success. Best-effort; never throws.
+	async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+		const sink = buildPullSink(env);
+		if (sink && env.RT_MEETING_ORG) {
+			ctx.waitUntil(
+				reconcilePending(env.RT_MEETING_ORG, sink, (msg, fields) => console.log(JSON.stringify({ msg, ...fields }))),
+			);
+		}
 	},
 };
