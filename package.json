@@ -10,6 +10,9 @@
     "test": "vitest run",
     "test:watch": "vitest"
   },
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.7"
+  },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260613.1",
     "typescript": "^5.9.3",
