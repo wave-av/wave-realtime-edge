@@ -32,6 +32,7 @@ const ROOTS = [
   "src/encoders/factory.ts",
   "src/encoders/managed.ts",
   "src/encoders/container.ts",
+  "src/encoders/container-adapter.ts",
   "src/encoders/wasm.ts",
   "src/muxer/webm.ts",
   "src/rtk-webhook.ts", // RT-P2.5: the webhook now PULLS recordings into the SKIP sink — guard it too
