@@ -31,7 +31,8 @@ export interface EncoderEnv {
   CF_CALLS_APP_ID?: string;
   CF_CALLS_APP_SECRET?: string;
   CF_ACCOUNT_ID?: string;
-  CF_API_TOKEN?: string; // adapter C: managed-recording REST
+  CF_API_TOKEN?: string; // adapter C: RealtimeKit managed-recording REST (account API token, Bearer)
+  RTK_APP_ID?: string; // adapter C: the RealtimeKit app id whose meeting is recorded (recordings are per-meeting)
   RT_RECORDINGS?: R2Bucket; // the SKIP sink bucket (RT-P2.4 ◆ binding; absent until armed+attached)
   RT_ENCODER?: EncoderKind; // selector; default "managed" (C)
   RT_RECORD?: string; // "1" to arm recording at all (default OFF — fully inert)

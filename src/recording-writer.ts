@@ -38,7 +38,7 @@
 /** R2 multipart minimum part size. All parts but the last MUST equal this. */
 export const PART_SIZE = 5 * 1024 * 1024;
 
-export type Container = "webm" | "raw";
+export type Container = "webm" | "mp4" | "raw";
 
 /** Persisted multipart state — JSON-serializable, stored in DO storage for hibernation resume. */
 export interface RecorderMeta {
@@ -63,8 +63,10 @@ export interface RecordingResult {
 }
 
 /**
- * Detect WebM/Matroska from the first object's leading bytes. A WebM/Matroska file begins with the EBML
- * header magic `1A 45 DF A3`. Everything else is treated as opaque raw bytes (bytes preserved regardless).
+ * Detect the container from the first object's leading bytes, to pick the file extension (bytes are always
+ * preserved verbatim regardless). WebM/Matroska begins with the EBML magic `1A 45 DF A3`. ISO-BMFF/MP4
+ * (RealtimeKit composite recordings) has an `ftyp` box: 4-byte size, then ASCII `ftyp` at offset 4. Anything
+ * else is opaque raw `.bin` (robust to whatever a tap emits — a future codec never loses bytes).
  */
 export function sniffWebm(first: Uint8Array): Container {
   if (
@@ -76,12 +78,23 @@ export function sniffWebm(first: Uint8Array): Container {
   ) {
     return "webm";
   }
+  if (
+    first.length >= 8 &&
+    first[4] === 0x66 && // 'f'
+    first[5] === 0x74 && // 't'
+    first[6] === 0x79 && // 'y'
+    first[7] === 0x70 // 'p'
+  ) {
+    return "mp4";
+  }
   return "raw";
 }
 
 /** File extension for a detected container. */
 export function extFor(c: Container): string {
-  return c === "webm" ? "webm" : "bin";
+  if (c === "webm") return "webm";
+  if (c === "mp4") return "mp4";
+  return "bin";
 }
 
 /**

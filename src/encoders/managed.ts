@@ -36,23 +36,111 @@ export interface ManagedRecordingApi {
 }
 
 /**
- * Live binding for the CF managed-recording REST API. The concrete request shapes (paths/verbs/auth) are
- * confirmed in the §7 spike (◆ when run against the live CF-Calls app); until then this throws a clear
- * NOT_SPIKED so a premature live arm fails loud, never silently no-ops (config-no-silent-noop).
+ * Live binding for the RealtimeKit (Cloudflare Realtime managed) recording REST API — §7 spike captured
+ * (api-contracts-rtk-and-ws-adapter.md, verified against developers.cloudflare.com/realtime/realtimekit/
+ * recording-guide). RealtimeKit records the MEETING (not a raw SFU session) → for adapter C, the
+ * RecordingSession.sessionId IS the RTK meeting id (the worker maps an /rtk meeting to it).
+ *
+ *   start  → POST /accounts/{acc}/realtime/kit/{app}/recordings {meeting_id}  → data.id (recordingId)
+ *   stop   → PUT  /accounts/{acc}/realtime/kit/{app}/recordings/{id} {action:"stop"}, then poll
+ *            GET  /accounts/{acc}/realtime/kit/{app}/recordings/{id} until status UPLOADED → download_url
+ *   fetch  → GET the download_url body (composite mp4 / track webm)
+ *
+ * Fail-CLOSED on unconfigured creds (throws → caller's begin() catches → records nothing, never blocks
+ * media). The bounded poll keeps a slow upload from hanging the Worker; when it times out, finalize()
+ * yields null and the `recording.statusUpdate` webhook (RT-R-WH) is the completion fallback. The poll
+ * delay is injected so tests run with no real timers.
  */
+const CF_API_BASE = "https://api.cloudflare.com/client/v4"; // fixed host — no request-derived URLs (SSRF-safe)
+const HEX32 = /^[0-9a-f]{32}$/i;
+const UUIDISH = /^[0-9a-z-]{16,64}$/i;
+/** Terminal-ok upload states for the stop() poll. */
+const UPLOADED = "UPLOADED";
+const ERRORED = "ERRORED";
+
 export class DefaultManagedRecordingApi implements ManagedRecordingApi {
-  constructor(private readonly env: EncoderEnv) {}
-  async start(_sessionId: string): Promise<{ recordingId: string }> {
-    throw new Error(
-      "RT-P1.5 managed-recording start endpoint is BLOCKED-ON-RT-P0.1-spike (§7): the CF managed-recording " +
-        "request shape for a raw CF-Calls SFU session is not yet captured. Inject a ManagedRecordingApi to test.",
-    );
+  constructor(
+    private readonly env: EncoderEnv,
+    /** Injected for tests: a no-op delay so the bounded poll spins without real timers. */
+    private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+    /** Bounded poll: how many GETs before giving up to the webhook (default ~30s at 3s each). */
+    private readonly maxPolls = 10,
+    private readonly pollMs = 3000,
+    private readonly fetchImpl: typeof fetch = fetch,
+  ) {}
+
+  private base(): string {
+    const acc = this.env.CF_ACCOUNT_ID ?? "";
+    const app = this.env.RTK_APP_ID ?? "";
+    if (!HEX32.test(acc) || !UUIDISH.test(app) || !this.env.CF_API_TOKEN) {
+      throw new Error("RT managed-recording is not configured (CF_ACCOUNT_ID/RTK_APP_ID/CF_API_TOKEN)");
+    }
+    return `${CF_API_BASE}/accounts/${acc}/realtime/kit/${app}/recordings`;
   }
-  async stop(_recordingId: string): Promise<{ webmUrl: string } | null> {
-    throw new Error("RT-P1.5 managed-recording stop endpoint is BLOCKED-ON-RT-P0.1-spike (§7).");
+
+  private headers(): Record<string, string> {
+    return { "Content-Type": "application/json", Authorization: `Bearer ${this.env.CF_API_TOKEN}` };
   }
+
+  /** Parse the RealtimeKit `{success, data}` envelope; throws on a non-success/non-2xx response. */
+  private async data(res: Response): Promise<Record<string, unknown>> {
+    let json: { success?: boolean; data?: Record<string, unknown> } | null = null;
+    try {
+      json = (await res.json()) as { success?: boolean; data?: Record<string, unknown> };
+    } catch {
+      json = null;
+    }
+    if (!res.ok || !json?.success || !json.data) {
+      throw new Error(`RTK recording API ${res.status} (success=${json?.success})`);
+    }
+    return json.data;
+  }
+
+  async start(meetingId: string): Promise<{ recordingId: string }> {
+    const res = await this.fetchImpl(this.base(), {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify({ meeting_id: meetingId }),
+    });
+    const data = await this.data(res);
+    const id = String(data.id ?? "");
+    if (!id) throw new Error("RTK recording start: missing data.id");
+    return { recordingId: id };
+  }
+
+  async stop(recordingId: string): Promise<{ webmUrl: string } | null> {
+    if (!UUIDISH.test(recordingId)) return null;
+    const stopRes = await this.fetchImpl(`${this.base()}/${recordingId}`, {
+      method: "PUT",
+      headers: this.headers(),
+      body: JSON.stringify({ action: "stop" }),
+    });
+    // A stop on an already-stopped/auto-stopped recording is fine — fall through to the status poll.
+    if (!stopRes.ok && stopRes.status !== 409) {
+      // best-effort: don't throw the finalize down; the webhook is the completion fallback.
+      return null;
+    }
+    for (let i = 0; i < this.maxPolls; i++) {
+      const res = await this.fetchImpl(`${this.base()}/${recordingId}`, { headers: this.headers() });
+      let data: Record<string, unknown> | null = null;
+      try {
+        data = await this.data(res);
+      } catch {
+        data = null;
+      }
+      const status = String(data?.status ?? "");
+      if (status === UPLOADED) {
+        const url = String(data?.download_url ?? "");
+        return url ? { webmUrl: url } : null;
+      }
+      if (status === ERRORED) return null;
+      await this.sleep(this.pollMs);
+    }
+    return null; // timed out → webhook (RT-R-WH) completes the registration
+  }
+
   async fetchRecording(webmUrl: string): Promise<ReadableStream<Uint8Array> | null> {
-    const res = await fetch(webmUrl);
+    const res = await this.fetchImpl(webmUrl);
     if (!res.ok || !res.body) return null;
     return res.body;
   }
