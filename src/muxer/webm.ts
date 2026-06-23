@@ -189,6 +189,20 @@ export class WebmMuxer {
     };
   }
 
+  /**
+   * RT-R10 (#78) — set the REAL video pixel dimensions before the Tracks header is written. The muxer is
+   * constructed eagerly (before any frame), but the true geometry only arrives with the first VP8 keyframe
+   * (VP8 self-describes — see `vp8KeyframeDimensions`). The video glue reads the first keyframe's dims and
+   * calls this so the Tracks `PixelWidth`/`PixelHeight` carry the real values instead of the 1280×720
+   * placeholder. No-op once the header is written (the Tracks element is already serialized — can't backfill)
+   * or for a non-positive dimension (keep the existing value). Idempotent + safe to call on every frame.
+   */
+  setVideoDimensions(width: number, height: number): void {
+    if (this.headerWritten) return; // Tracks already serialized — cannot retroactively change the declared dims
+    if (width > 0) this.opts.width = width;
+    if (height > 0) this.opts.height = height;
+  }
+
   /** Emit the EBML head + Segment open + Info + Tracks. Must be called once before any frame. */
   header(): void {
     if (this.headerWritten) return;

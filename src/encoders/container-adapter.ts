@@ -23,6 +23,7 @@
  * decoder already handles any field order + unknown fields). All are config/inputs, defaulted sensibly here.
  */
 import { WebmMuxer, type MuxerOptions } from "../muxer/webm.js";
+import { vp8KeyframeDimensions } from "./ivf.js";
 import { RealtimeRecorder, type RecordingResult } from "../recording-writer.js";
 
 // CF app ids are long hex; SFU session ids are opaque url-safe tokens. Guard before interpolating (SSRF-safe).
@@ -374,6 +375,7 @@ export class RawSfuTap {
       if (!this.videoEncoder) return; // no VP8 encoder injected → drop video (audio-only path unchanged)
       const vp8 = this.videoEncoder.encode(pkt.payload);
       if (vp8.length === 0) return;
+      this.applyKeyframeDimensions(vp8, true); // thread REAL geometry into the Tracks header (#78)
       this.muxer.addFrame({ kind: "video", data: vp8, timestampMs: tsMs, keyframe: true });
     } else {
       this.muxer.addFrame({ kind: "audio", data: this.encoder.encode(pkt.payload), timestampMs: tsMs });
@@ -393,12 +395,26 @@ export class RawSfuTap {
       if (this.finalized) return; // a step that settles after finalize must not mutate the finished muxer
       for (const f of frames) {
         if (f.data.length === 0) continue;
+        this.applyKeyframeDimensions(f.data, f.keyframe); // thread REAL geometry into the Tracks header (#78)
         this.muxer.addFrame({ kind: "video", data: f.data, timestampMs: tsMs, keyframe: f.keyframe });
       }
       if (this.muxer.pending >= this.flushBytes) await this.flush();
     } catch {
       /* fail-open — drop this one video frame, keep the queue + media path alive */
     }
+  }
+
+  /**
+   * RT-R10 (#78) — thread the REAL frame geometry from the FIRST VP8 keyframe into the muxer's Tracks header.
+   * VP8 self-describes its dimensions (the muxer's 1280×720 default was a placeholder), so we read them off the
+   * keyframe and set them BEFORE any frame is muxed (the muxer writes its header lazily on the first addFrame).
+   * `setVideoDimensions` is a no-op once the header is written and `vp8KeyframeDimensions` returns null on bad
+   * bytes, so this is fully fail-soft + idempotent: only the first valid keyframe's dims ever take effect.
+   */
+  private applyKeyframeDimensions(vp8: Uint8Array, keyframe: boolean): void {
+    if (!keyframe) return;
+    const dims = vp8KeyframeDimensions(vp8);
+    if (dims) this.muxer.setVideoDimensions(dims.width, dims.height);
   }
 
   /** Flush + finalize the one canonical recording. Idempotent; returns null when nothing was recorded. */

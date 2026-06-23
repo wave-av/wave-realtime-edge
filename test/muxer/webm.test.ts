@@ -58,6 +58,28 @@ describe("WebmMuxer — valid EBML/WebM header", () => {
     expect(indexOfSeq(out, [0x41, 0x5f, 0x4f, 0x50, 0x55, 0x53])).toBeGreaterThan(0); // "A_OPUS"
   });
 
+  it("setVideoDimensions threads REAL geometry into the Tracks PixelWidth/PixelHeight before header (#78)", () => {
+    const m = new WebmMuxer(); // defaults 1280×720
+    m.setVideoDimensions(320, 240); // real dims from the first VP8 keyframe
+    m.header();
+    const out = m.drain();
+    // PixelWidth (0xb0) size 0x82 → u16 0x0140 (320); PixelHeight (0xba) size 0x81 → 0xf0 (240).
+    expect(indexOfSeq(out, [0xb0, 0x82, 0x01, 0x40])).toBeGreaterThan(0);
+    expect(indexOfSeq(out, [0xba, 0x81, 0xf0])).toBeGreaterThan(0);
+    // The placeholder dims must NOT appear: 1280=0x0500, 720=0x02d0.
+    expect(indexOfSeq(out, [0xb0, 0x82, 0x05, 0x00])).toBe(-1);
+    expect(indexOfSeq(out, [0xba, 0x82, 0x02, 0xd0])).toBe(-1);
+  });
+
+  it("setVideoDimensions is a no-op once the header is written (Tracks already serialized)", () => {
+    const m = new WebmMuxer();
+    m.header();
+    m.setVideoDimensions(320, 240); // too late — header already carries the 1280×720 default
+    const out = m.drain();
+    expect(indexOfSeq(out, [0xb0, 0x82, 0x05, 0x00])).toBeGreaterThan(0); // still 1280
+    expect(indexOfSeq(out, [0xb0, 0x82, 0x01, 0x40])).toBe(-1); // never 320
+  });
+
   it("header() is idempotent (a second call writes nothing more)", () => {
     const m = new WebmMuxer();
     m.header();
