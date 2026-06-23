@@ -27,10 +27,10 @@ describe("wrangler.toml stays INERT for raw-SFU recording", () => {
     expect(toml.length).toBeGreaterThan(0);
   });
 
-  it('RT_ENCODER is "managed" (the live, non-container path) — prod untouched', () => {
+  it('◆ STEP D ARM: RT_ENCODER is "container" (Path A encoder) — arm/rt-video-path-a only, NOT main', () => {
     const m = toml.match(/^\s*RT_ENCODER\s*=\s*"([^"]+)"/m);
     expect(m, "RT_ENCODER var must be present in wrangler.toml").not.toBeNull();
-    expect(m![1]).toBe("managed");
+    expect(m![1]).toBe("container");
   });
 
   it("the [[containers]] block IS LIVE (Step A armed the container infra — DO deploys)", () => {
@@ -46,9 +46,11 @@ describe("wrangler.toml stays INERT for raw-SFU recording", () => {
     expect(/^\s*name\s*=\s*"RECORDER"/m.test(toml), "live RECORDER DO binding must be present").toBe(true);
   });
 
-  it("RECORDER_TARGET / RECORDER_SINK are NOT live-set in wrangler.toml (defaults 'none'/'r2' apply)", () => {
-    // The seam defaults inert (none/r2) in code; wrangler.toml must not flip them to a live runtime/sink.
-    expect(/^\s*RECORDER_TARGET\s*=/m.test(toml), "RECORDER_TARGET must not be live-set (default 'none')").toBe(false);
-    expect(/^\s*RECORDER_SINK\s*=/m.test(toml), "RECORDER_SINK must not be live-set (default 'r2')").toBe(false);
+  it("◆ STEP D ARM: RECORDER_TARGET is live-set to 'cf' (Path A) — arm branch only; RECORDER_SINK stays default 'r2'", () => {
+    // arm/rt-video-path-a: the video path is live via the CF container target. Rollback = redeploy main (unset → 'none').
+    const m = toml.match(/^\s*RECORDER_TARGET\s*=\s*"([^"]+)"/m);
+    expect(m, "RECORDER_TARGET must be live-set on the arm branch").not.toBeNull();
+    expect(m![1]).toBe("cf");
+    expect(/^\s*RECORDER_SINK\s*=/m.test(toml), "RECORDER_SINK stays default 'r2' (not live-set)").toBe(false);
   });
 });

@@ -59,7 +59,11 @@ GATEWAY_BASE_URL = "https://api.wave.online"
 RT_RECORD = "1"
 # RT_ENCODER selects the adapter when armed: "managed" (C, the buildable path) | "container" (A) | "wasm"
 # (B). A/B are BLOCKED-ON-RT-P0.1-spike and throw NOT_SPIKED at begin until the §7 WS media-transport spike.
-RT_ENCODER = "managed"
+# ◆ STEP D ARM (Jake-named, branch arm/rt-video-path-a — NOT merged to main): flip to the container encoder +
+# Path A CF-Container target so onPublish('video') taps JPEG→VP8 (RecorderContainer /encode) → IVF→raw-VP8 →
+# WebM SimpleBlock. Rollback = redeploy main (RT_ENCODER="managed", RECORDER_TARGET unset → NoneTarget, dormant).
+RT_ENCODER = "container"
+RECORDER_TARGET = "cf"
 # (PULL mode hands RTK NO storage_config, so there is no RT_RECORDINGS_BUCKET var — the bucket is bound
 # directly below as the R2 binding the webhook pull writes into.)
 
