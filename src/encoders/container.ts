@@ -154,11 +154,13 @@ export class ContainerHandle implements EncoderHandle {
       target: { bucket, org: this.session.org, sessionId: this.session.sessionId },
     });
     this.taps.set(trackName, tap);
-    // Build the recorder endpoint (+ optional signed capability token). The SFU is a third party — it cannot
-    // send our `x-wave-internal` header — so when the internal secret is bound, append a signed, expiring,
-    // per-(org,session,track) token the recorder route accepts as alternative auth. Minting is local HMAC
-    // (fast); a mint failure falls back to the bare endpoint (the route still enforces x-wave-internal).
-    let endpoint = `${this.recorderBase}/${this.session.org}/${this.session.sessionId}/${trackName}`;
+    // Build the recorder endpoint (+ optional signed capability token). The path carries :room so the SFU's frames
+    // reach the SAME RoomDO (keyed `${org}:${room}`) that holds THIS tap — without it they land on a tap-less DO
+    // (keyed by sessionId) and are dropped. The SFU is a third party — it cannot send our `x-wave-internal` header
+    // — so when the internal secret is bound, append a signed, expiring, per-(org,session,track) token the recorder
+    // route accepts as alternative auth (the token does NOT cover room — room is a routing key, not signed identity).
+    // Minting is local HMAC (fast); a mint failure falls back to the bare endpoint (the route still enforces x-wave-internal).
+    let endpoint = `${this.recorderBase}/${this.session.org}/${this.session.room}/${this.session.sessionId}/${trackName}`;
     try {
       if (this.env.WAVE_INTERNAL_SECRET) {
         const t = await mintRecorderToken(
