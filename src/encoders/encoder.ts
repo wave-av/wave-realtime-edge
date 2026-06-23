@@ -45,6 +45,12 @@ export interface EncoderEnv {
   // /rtk/join (where org is known) to the later webhook (which only knows the meetingId), so the pull can
   // attribute the recording to the right org-prefix the daily storage sweep bills by. ──
   RT_MEETING_ORG?: KVNamespace; // meetingId → org map, written at join, read at the recording webhook
+  // ── RT-R10 (#72) VIDEO encode dispatch (adapter A glue). Where the JPEG→VP8 encode runs for raw-SFU video.
+  // ALL default-inert: RECORDER_TARGET defaults 'none' (drop video; prod untouched). 'cf' needs the RECORDER
+  // [[containers]] binding; 'selfhost' needs RECORDER_SELFHOST_URL. See src/encoders/recorder-target.ts. ──
+  RECORDER_TARGET?: "cf" | "selfhost" | "none"; // selector; default 'none' → video dropped (inert)
+  RECORDER?: unknown; // Path A CF Container binding (typed as DurableObjectNamespace<Container> at the seam)
+  RECORDER_SELFHOST_URL?: string; // Path B self-hosted rt-encoder base URL (e.g. https://studio:8080)
 }
 
 export type EncoderKind = "managed" | "container" | "wasm";
