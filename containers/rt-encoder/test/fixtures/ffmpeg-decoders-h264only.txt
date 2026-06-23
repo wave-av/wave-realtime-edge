@@ -1,0 +1,8 @@
+Decoders:
+ V..... = Video
+ A..... = Audio
+ ------
+ V....D h264                 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (codec h264)
+ A....D aac                  AAC (Advanced Audio Coding)
+ A....D opus                 Opus (codec opus)
+ A....D pcm_s16le            PCM signed 16-bit little-endian
