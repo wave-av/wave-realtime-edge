@@ -322,16 +322,25 @@ export default {
 			const client = (pair as unknown as Record<string, WebSocket>)[0];
 			const server = (pair as unknown as Record<string, WebSocket>)[1];
 			server.accept();
+			// CF Workers' default WebSocket binaryType is "blob", so the SFU's binary Packet frames arrive as Blob,
+			// NOT ArrayBuffer (proven live: 1221 frames over a 30s session were silently dropped). Ask for ArrayBuffer
+			// delivery AND accept Blob too — either is a valid Request body the DO normalizes via request.arrayBuffer().
+			try {
+				(server as unknown as { binaryType?: string }).binaryType = "arraybuffer";
+			} catch {
+				/* binaryType not settable on some runtimes — the Blob branch below still catches it */
+			}
 			const id = env.ROOM.idFromName(`${rorg}:${rroom}`); // SAME DO as publish (org:room) → the tap lives here
 			const stub = env.ROOM.get(id);
 			server.addEventListener("message", (ev: MessageEvent) => {
 				const data = ev.data;
-				if (!(data instanceof ArrayBuffer)) return; // ignore text/keepalive — only binary media frames
+				// Only binary media frames (ArrayBuffer or Blob); ignore text/keepalive (string).
+				if (!(data instanceof ArrayBuffer) && !(typeof Blob !== "undefined" && data instanceof Blob)) return;
 				const fwd = stub
 					.fetch(
 						new Request(`https://room/recorder-frame?sessionId=${encodeURIComponent(rsession)}&trackName=${encodeURIComponent(rtrack)}`, {
 							method: "POST",
-							body: data,
+							body: data as BodyInit,
 						}),
 					)
 					.catch(() => {});

@@ -16,22 +16,27 @@ const ctx = { waitUntil: () => {} } as unknown as ExecutionContext;
 // real Workers runtime produces. The worker swallows the Node Response(101) RangeError fail-open (still a 5xx),
 // so we additionally confirm it never 4xx'd and the accept fired.
 let accepted = 0;
+let lastServer: FakeWS | null = null;
 class FakeWS {
+  binaryType = "blob"; // CF Workers default — the worker should flip this to "arraybuffer"
+  onMessage: ((ev: { data: unknown }) => void) | null = null;
   accept() {
     accepted += 1;
   }
-  addEventListener() {}
+  addEventListener(type: string, fn: (ev: { data: unknown }) => void) {
+    if (type === "message") this.onMessage = fn;
+  }
 }
 beforeAll(() => {
   const Pair = class {
     0 = new FakeWS();
-    1 = new FakeWS();
+    1 = (lastServer = new FakeWS());
   };
   (globalThis as unknown as { WebSocketPair: unknown }).WebSocketPair = Pair as unknown;
 });
 
 function stubRoomNamespace() {
-  const seen: { name?: string } = {};
+  const seen: { name?: string; forwards: Request[] } = { forwards: [] };
   return {
     seen,
     idFromName(name: string) {
@@ -39,7 +44,12 @@ function stubRoomNamespace() {
       return { __name: name };
     },
     get(_id: unknown) {
-      return { fetch: async () => new Response(null, { status: 204 }) };
+      return {
+        fetch: async (r: Request) => {
+          seen.forwards.push(r);
+          return new Response(null, { status: 204 });
+        },
+      };
     },
   };
 }
@@ -157,5 +167,41 @@ describe("recorder route — upgrade + routing", () => {
   it("armed + upgrade but no ROOM binding → 400 (loud, not silent)", async () => {
     const res = await worker.fetch(req({ Upgrade: "websocket" }), { RT_RECORD: "1" } as never, ctx);
     expect(res.status).toBe(400);
+  });
+});
+
+describe("recorder route — binary frame forwarding (REGRESSION: CF delivers binary as Blob, not ArrayBuffer)", () => {
+  async function upgrade(ns: ReturnType<typeof stubRoomNamespace>) {
+    const waits: Promise<unknown>[] = [];
+    const wctx = { waitUntil: (p: Promise<unknown>) => waits.push(p) } as unknown as ExecutionContext;
+    await worker.fetch(req({ Upgrade: "websocket", "x-wave-internal": "s" }), env({ WAVE_INTERNAL_SECRET: "s", RT_RECORD: "1", ROOM: ns }), wctx);
+    return waits;
+  }
+
+  it("requests arraybuffer delivery AND forwards a Blob media frame to the room DO (the live bug: 1221 frames dropped)", async () => {
+    const ns = stubRoomNamespace();
+    const waits = await upgrade(ns);
+    expect(lastServer).not.toBeNull();
+    expect(lastServer!.binaryType).toBe("arraybuffer"); // worker asked the runtime for ArrayBuffer delivery
+    lastServer!.onMessage!({ data: new Blob([new Uint8Array([1, 2, 3, 4])]) }); // ...but a Blob still forwards
+    await Promise.all(waits);
+    expect(ns.seen.forwards).toHaveLength(1);
+    expect(ns.seen.forwards[0].url).toContain("/recorder-frame?sessionId=sess_ABC12345&trackName=mic");
+  });
+
+  it("an ArrayBuffer media frame also forwards", async () => {
+    const ns = stubRoomNamespace();
+    const waits = await upgrade(ns);
+    lastServer!.onMessage!({ data: new Uint8Array([5, 6, 7]).buffer });
+    await Promise.all(waits);
+    expect(ns.seen.forwards).toHaveLength(1);
+  });
+
+  it("a text/keepalive (string) message is NOT forwarded", async () => {
+    const ns = stubRoomNamespace();
+    const waits = await upgrade(ns);
+    lastServer!.onMessage!({ data: "keepalive" });
+    await Promise.all(waits);
+    expect(ns.seen.forwards).toHaveLength(0);
   });
 });
