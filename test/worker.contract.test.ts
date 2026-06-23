@@ -95,6 +95,27 @@ describe("POST /whip/{streamKey} (scaffold — 501)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// B3 (#98) — /v1/whip/publish is INERT (501) when WHIP_INGEST_ENABLED is off
+// ---------------------------------------------------------------------------
+describe("POST /v1/whip/publish (B3 — INERT 501 when flag off)", () => {
+	it("flag absent → 501 REALTIME_NOT_IMPLEMENTED (catch-all unchanged)", async () => {
+		const res = await worker.fetch(req("POST", "/v1/whip/publish"), env, ctx);
+		expect(res.status).toBe(501);
+		expect(((await res.json()) as Record<string, unknown>).error).toBe("REALTIME_NOT_IMPLEMENTED");
+	});
+
+	it('flag "0" → 501 (explicit off is still inert)', async () => {
+		const res = await worker.fetch(req("POST", "/v1/whip/publish"), { WHIP_INGEST_ENABLED: "0" } as never, ctx);
+		expect(res.status).toBe(501);
+	});
+
+	it("DELETE /v1/whip/resource/x is also inert 501 when flag off", async () => {
+		const res = await worker.fetch(req("DELETE", "/v1/whip/resource/abc12345"), env, ctx);
+		expect(res.status).toBe(501);
+	});
+});
+
+// ---------------------------------------------------------------------------
 // /whep/{slug} — planned; returns 501 at scaffold stage
 // ---------------------------------------------------------------------------
 describe("POST /whep/{slug} (scaffold — 501)", () => {
