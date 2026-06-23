@@ -44,6 +44,14 @@ RTK_APP_ID = "6dee33e5-cd89-41e8-a81c-9a8cd48bb9c3"
 # = https://api.wave.online. (sfu.ts/room.ts are P5 substrate; the metering tap reads this when wired.)
 GATEWAY_BASE_URL = "https://api.wave.online"
 
+# ── B3 (#98) — IETF WHIP v1 ingest surface (/v1/whip/*). DEFAULT OFF / INERT. ──
+# WHIP_INGEST_ENABLED gates the whole /v1/whip/{publish,resource/{id}} listener (src/whip.ts). Absent/"0" →
+# the surface is inert: a /v1/whip/* request falls through to the honest 501 catch-all (worker.ts), exactly
+# as before this builder. Flipping it to "1" is a ◆ Jake-named crossing (whip-v1-frozen-contract.md §8): it
+# activates the NEW LIVE INGEST path and REQUIRES the gateway WHIP_EDGE origin + the shared x-wave-internal
+# gateway-trust secret on both + the STRIPE_PRICE_WHIP_INGEST_MIN binding. Left OFF here so the deploy is inert.
+WHIP_INGEST_ENABLED = "0"
+
 # ── RT-P1.5 — pluggable recording encoders (design §6). DEFAULT DISARMED / DORMANT. ──
 # RT_RECORD arms recording at all; absent/"0" → selectEncoder() returns the inert DisarmedEncoder (begin →
 # null), so the whole feature is a no-op (config-no-silent-noop: inert, not silently broken). Arming

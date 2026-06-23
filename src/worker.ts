@@ -24,6 +24,9 @@ import {
 	PENDING_TTL_SECONDS,
 	type RecordingPullSink,
 } from "./rtk-webhook";
+// B3 (#98) — IETF WHIP v1 ingest surface (/v1/whip/*). INERT behind WHIP_INGEST_ENABLED ([vars], default off
+// → the 501 catch-all is unchanged). See src/whip.ts + whip-v1-frozen-contract.md §3/§4/§6-B3.
+import { handleWhip, whipIngestEnabled, type WhipEnv } from "./whip";
 
 // Re-export the Room Durable Object so the wrangler `ROOM` binding + migration (v1, new_sqlite_classes)
 // resolve from this main module. The class itself is defined in room.ts (P5 substrate); it is not yet
@@ -49,6 +52,9 @@ interface RoomNamespace {
 // worker env into selectEncoder()/pullRecordingConfigured()/the webhook pull sink with no re-mapping.
 interface Env extends EncoderEnv {
 	WAVE_INTERNAL_SECRET?: string; // wrangler SECRET — when set, ONLY the gateway (x-wave-internal) may /rtk/* AND /v1/realtime/*
+	// B3 (#98) WHIP v1 ingest flag ([vars], default off). Falsy/absent → the /v1/whip/* surface is inert and
+	// the 501 catch-all is unchanged. Truthy ("1"/"true") → the WHIP listener (src/whip.ts) handles /v1/whip/*.
+	WHIP_INGEST_ENABLED?: string | boolean;
 	TURN_KEY_ID?: string; // wrangler SECRET — the CF TURN key uid (32-hex). Out of the public repo; persists across deploys.
 	TURN_KEY_TOKEN?: string; // wrangler SECRET — the TURN key's api token. Never logged/returned; only ephemeral ICE creds are.
 	// ── P5 CF-Calls SFU control plane ──
@@ -592,6 +598,26 @@ export default {
 				body: JSON.stringify({ ...payload, ctx: { org, room, participantId, role, type, anon } }),
 			});
 			return stub.fetch(intentReq);
+		}
+
+		// ── B3 (#98) IETF WHIP v1 ingest — /v1/whip/publish + /v1/whip/resource/{id} ──
+		// INERT behind WHIP_INGEST_ENABLED ([vars], default off): when the flag is falsy/absent, this block is
+		// skipped entirely and a /v1/whip/* request falls through to the 501 catch-all below — UNCHANGED. When
+		// ON, the SAME gateway-trust chokepoint as every other paid route gates it (WAVE_INTERNAL_SECRET /
+		// x-wave-internal); org is the gateway-stamped x-wave-org. The handler (src/whip.ts) talks to the CF
+		// Realtime SFU directly (signaling-only glue; media terminates at the SFU, never on this Worker).
+		if (url.pathname.startsWith("/v1/whip/") && whipIngestEnabled(env as WhipEnv)) {
+			const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
+			if (denied) return denied;
+			const org = request.headers.get("x-wave-org") ?? "";
+			if (!SAFE_ORG.test(org)) {
+				return Response.json(
+					{ error: "BAD_REQUEST", message: "missing or malformed org context (x-wave-org) — stamped by the gateway" },
+					{ status: 400 },
+				);
+			}
+			const whipRes = await handleWhip(request, env as WhipEnv, org);
+			if (whipRes) return whipRes; // null → unrecognized /v1/whip/* sub-path → 501 fall-through below
 		}
 
 		return Response.json({ error: "REALTIME_NOT_IMPLEMENTED", path: url.pathname }, { status: 501 });
