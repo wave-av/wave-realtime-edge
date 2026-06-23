@@ -20,8 +20,16 @@
  */
 import type { EncoderEnv, EncoderHandle, RecordingEncoder, RecordingSession } from "./encoder.js";
 import type { RecordingResult } from "../recording-writer.js";
-import { createWebsocketAdapter, RawSfuTap, type AdapterRetry, type WsAdapterTrack } from "./container-adapter.js";
+import {
+  createWebsocketAdapter,
+  RawSfuTap,
+  type AdapterRetry,
+  type AsyncVideoEncoder,
+  type WsAdapterTrack,
+} from "./container-adapter.js";
 import { mintRecorderToken } from "./recorder-auth.js";
+import { selectRecorderTarget, type RecorderTarget, type RecorderTargetEnv } from "./recorder-target.js";
+import { parseIvf } from "./ivf.js";
 
 const HEX32 = /^[0-9a-f]{32}$/i;
 
@@ -142,17 +150,48 @@ export class ContainerHandle implements EncoderHandle {
   }
 
   /**
-   * A track went live. AUDIO → open a tap + ask the SFU to push that track to our recorder route. VIDEO →
-   * no-op (audio-first; the JPEG→VP8 video slice is the deferred container ◆). Idempotent per trackName.
+   * Adapt a RecorderTarget (async network /encode → IVF) into the tap's AsyncVideoEncoder seam. One decoded
+   * JPEG → encode → IVF → raw VP8 frames (keyframe flags from the VP8 header; see ivf.ts). Fail-open: a null
+   * encode (NoneTarget / fetch error / non-2xx) or a non-IVF body resolves to [] → the muxer drops that frame.
+   */
+  private static videoEncoderFromTarget(target: RecorderTarget): AsyncVideoEncoder {
+    return {
+      codec: "vp8",
+      async encode(jpeg: Uint8Array) {
+        const ivf = await target.encode(jpeg, { kind: "video", ts: 0, codec: "jpeg" });
+        if (!ivf || ivf.length === 0) return [];
+        return parseIvf(ivf).map((f) => ({ data: f.data, keyframe: f.keyframe }));
+      },
+    };
+  }
+
+  /**
+   * A track went live. AUDIO → open a PCM tap. VIDEO → open a JPEG tap whose async VP8 encode runs on the
+   * selected RecorderTarget (container/self-host); when RECORDER_TARGET is unset/'none' (the live default) the
+   * target is NoneTarget, so NO video tap is opened and frames are dropped — main stays inert. Both kinds ask
+   * the SFU to push that track to our recorder route. Idempotent per trackName.
    */
   async onPublish(trackName: string, kind: "audio" | "video"): Promise<void> {
-    if (kind !== "audio") return; // audio-first; video is the deferred ◆ (no tap, no adapter)
     if (this.taps.has(trackName)) return; // idempotent — one tap per track
     const bucket = this.env.RT_RECORDINGS;
     if (!bucket) return; // defense in depth (containerRecordingConfigured already gated)
-    const tap = new RawSfuTap({
-      target: { bucket, org: this.session.org, sessionId: this.session.sessionId },
-    });
+    const target = { bucket, org: this.session.org, sessionId: this.session.sessionId };
+    let tap: RawSfuTap;
+    let outputCodec: "pcm" | "jpeg";
+    if (kind === "video") {
+      // Pick the encode runtime by env. 'none' (default/dormant) → NoneTarget → DROP video (no tap), main inert.
+      const recorderTarget = selectRecorderTarget(this.env as unknown as RecorderTargetEnv);
+      if (recorderTarget.kind === "none") return; // dormant: no video tap, frames dropped (main stays inert)
+      outputCodec = "jpeg";
+      tap = new RawSfuTap({
+        target,
+        outputCodec,
+        asyncVideoEncoder: ContainerHandle.videoEncoderFromTarget(recorderTarget),
+      });
+    } else {
+      outputCodec = "pcm";
+      tap = new RawSfuTap({ target });
+    }
     this.taps.set(trackName, tap);
     // Build the recorder endpoint (+ optional signed capability token). The path carries :room so the SFU's frames
     // reach the SAME RoomDO (keyed `${org}:${room}`) that holds THIS tap — without it they land on a tap-less DO
@@ -179,7 +218,7 @@ export class ContainerHandle implements EncoderHandle {
       sessionId: this.session.sessionId,
       trackName,
       endpoint,
-      outputCodec: "pcm",
+      outputCodec, // "pcm" for audio, "jpeg" for video — the SFU mirrors that codec to our recorder route
     };
     // Ask the SFU to dial OUT to our recorder route. BACKGROUND it — do NOT await up the publish chain: the
     // create races the publisher's media (the SFU returns not_found_track_error until ICE/DTLS bring the track

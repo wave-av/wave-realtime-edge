@@ -236,12 +236,29 @@ export interface AudioEncoder {
  * writes as a video SimpleBlock. This is the ◆ infra slice: a real VP8 encoder needs libvpx (the rt-encoder
  * container — see containers/rt-encoder/). DEFAULT: no video encoder injected → video frames are DROPPED
  * (audio-only path is unchanged), so the container stays OPTIONAL. NEVER imports `@wave-av/content-hash`.
+ *
+ * SYNC vs ASYNC: this seam is SYNCHRONOUS (one JPEG → one raw VP8 keyframe). The real encode runs in the
+ * rt-encoder container over the network, which is ASYNC and returns IVF (not raw VP8) — that path uses the
+ * `AsyncVideoEncoder` seam below instead. The sync seam stays for local/test transcodes that yield raw VP8.
  */
 export interface VideoEncoder {
   /** The muxer video codec these bytes are valid for (the muxer's video TrackEntry declares V_VP8). */
   readonly codec: "vp8";
   /** Encode one decoded JPEG frame → a VP8 keyframe. (Real impl: libvpx in the rt-encoder container — ◆.) */
   encode(jpeg: Uint8Array): Uint8Array;
+}
+
+/**
+ * RT-R10 (#72) — the ASYNC video encode seam, used when the real encode is a network round-trip to the
+ * rt-encoder container (RecorderTarget). One decoded JPEG payload → zero-or-more RAW VP8 frames (the container
+ * returns IVF; the glue parses it to raw VP8 frames + keyframe flags — see src/encoders/ivf.ts). Returning a
+ * LIST (not one frame) means a multi-frame IVF body, or a dropped/empty body ([]), is handled uniformly.
+ * fail-open: an encode/parse error resolves to [] (the muxer gets nothing → that one video frame is dropped).
+ */
+export interface AsyncVideoEncoder {
+  readonly codec: "vp8";
+  /** Encode one decoded JPEG → raw VP8 frames (each with its keyframe flag). [] = dropped/empty (fail-open). */
+  encode(jpeg: Uint8Array): Promise<Array<{ data: Uint8Array; keyframe: boolean }>>;
 }
 
 /** Default no-WASM encoder: the SFU's raw 16-bit-LE PCM is already mux-ready as A_PCM/INT/LIT. */
@@ -273,6 +290,15 @@ export interface RawSfuTapOptions {
    * SimpleBlock (keyframe). Absent → video frames are DROPPED (audio-only path unchanged, container OPTIONAL).
    */
   videoEncoder?: VideoEncoder;
+  /**
+   * RT-R10 (#72) ASYNC video encode seam (the live container/self-host path). When set AND outputCodec==="jpeg",
+   * each decoded JPEG payload is encoded over the network (RecorderTarget) → IVF → raw VP8 frames, each muxed as
+   * a video SimpleBlock IN ARRIVAL ORDER (an internal serialized queue threads the async encode + drains on
+   * finalize). Takes precedence over the sync `videoEncoder` when both are set. Absent (and no sync encoder) →
+   * video frames are DROPPED (audio-only path unchanged). NEVER blocks media: each onFrame returns immediately
+   * after enqueuing; the queue drains in the background and is awaited by finalize().
+   */
+  asyncVideoEncoder?: AsyncVideoEncoder;
   /** Muxer geometry/rate overrides (audioCodec is forced to the encoder's codec). */
   muxerOptions?: Omit<MuxerOptions, "audioCodec">;
   /** Packet timestamp → ms. Default identity (assumes ms); set to t=>t/48 if the SFU emits 48kHz samples. */
@@ -293,18 +319,27 @@ export class RawSfuTap {
   private readonly encoder: AudioEncoder;
   private readonly outputCodec: "pcm" | "jpeg";
   private readonly videoEncoder: VideoEncoder | null;
+  private readonly asyncVideoEncoder: AsyncVideoEncoder | null;
   private readonly muxer: WebmMuxer;
   private readonly tsToMs: (ts: number) => number;
   private readonly flushBytes: number;
   private recorder: RealtimeRecorder | null = null;
   private firstTs: number | null = null;
   private finalized = false;
+  /**
+   * Order-preserving async video pipeline. Each video onFrame chains its (await encode → mux → maybe flush) step
+   * onto this tail so frames mux in ARRIVAL ORDER even though the encode is a network round-trip that may settle
+   * out of order. onFrame returns immediately after chaining (never blocks media); finalize() awaits the tail.
+   * Each step is fail-open (its own try/catch collapses to void) so one bad frame never breaks the chain.
+   */
+  private videoQueue: Promise<void> = Promise.resolve();
 
   constructor(opts: RawSfuTapOptions) {
     this.target = opts.target;
     this.encoder = opts.encoder ?? new PassthroughPcmEncoder();
     this.outputCodec = opts.outputCodec ?? "pcm";
     this.videoEncoder = opts.videoEncoder ?? null;
+    this.asyncVideoEncoder = opts.asyncVideoEncoder ?? null;
     this.muxer = new WebmMuxer({ ...opts.muxerOptions, audioCodec: this.encoder.codec });
     this.tsToMs = opts.tsToMs ?? ((t) => t);
     this.flushBytes = opts.flushBytes ?? 1024 * 1024;
@@ -328,6 +363,14 @@ export class RawSfuTap {
     if (this.firstTs === null) this.firstTs = pkt.timestamp;
     const tsMs = Math.max(0, Math.floor(this.tsToMs(pkt.timestamp - this.firstTs)));
     if (this.outputCodec === "jpeg") {
+      // ASYNC path (live container/self-host): the encode is a network round-trip returning IVF → many raw VP8
+      // frames. Chain it onto the order-preserving queue so frames mux in ARRIVAL ORDER; return immediately
+      // (never block media). The sync `videoEncoder` path stays for local/test transcodes that yield raw VP8.
+      if (this.asyncVideoEncoder) {
+        const jpeg = pkt.payload; // already copied out by decodePacket → safe to retain across the await
+        this.videoQueue = this.videoQueue.then(() => this.encodeAndMuxVideo(jpeg, tsMs));
+        return;
+      }
       if (!this.videoEncoder) return; // no VP8 encoder injected → drop video (audio-only path unchanged)
       const vp8 = this.videoEncoder.encode(pkt.payload);
       if (vp8.length === 0) return;
@@ -338,9 +381,32 @@ export class RawSfuTap {
     if (this.muxer.pending >= this.flushBytes) await this.flush();
   }
 
+  /**
+   * One async video step (runs serialized on `videoQueue`): await the network encode, mux every returned raw VP8
+   * frame as a video SimpleBlock (keyframe flag from the IVF/VP8 header), flush when the buffer is full. Fully
+   * fail-open: ANY error (encode, parse, mux) is swallowed so a single bad frame never breaks the queue or the
+   * media path. After finalize() set `finalized`, in-flight steps stop muxing (the muxer is already finished).
+   */
+  private async encodeAndMuxVideo(jpeg: Uint8Array, tsMs: number): Promise<void> {
+    try {
+      const frames = await this.asyncVideoEncoder!.encode(jpeg);
+      if (this.finalized) return; // a step that settles after finalize must not mutate the finished muxer
+      for (const f of frames) {
+        if (f.data.length === 0) continue;
+        this.muxer.addFrame({ kind: "video", data: f.data, timestampMs: tsMs, keyframe: f.keyframe });
+      }
+      if (this.muxer.pending >= this.flushBytes) await this.flush();
+    } catch {
+      /* fail-open — drop this one video frame, keep the queue + media path alive */
+    }
+  }
+
   /** Flush + finalize the one canonical recording. Idempotent; returns null when nothing was recorded. */
   async finalize(): Promise<RecordingResult | null> {
     if (this.finalized) return this.recorder ? this.recorder.finalize() : null;
+    // Drain any in-flight async video encodes FIRST (before marking finalized) so every enqueued VP8 frame is
+    // muxed before the muxer is closed. The queue is fail-open, so this never throws.
+    await this.videoQueue;
     this.finalized = true;
     this.muxer.finish();
     await this.flush();
