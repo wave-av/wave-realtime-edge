@@ -32,9 +32,14 @@ const ROOTS = [
   "src/encoders/factory.ts",
   "src/encoders/managed.ts",
   "src/encoders/container.ts",
+  "src/encoders/container-adapter.ts",
   "src/encoders/wasm.ts",
   "src/muxer/webm.ts",
   "src/rtk-webhook.ts", // RT-P2.5: the webhook now PULLS recordings into the SKIP sink — guard it too
+  // RT-R10 (#72) — the portable recorder seams are on the SKIP write-path; guard them too.
+  "src/encoders/recorder-target.ts", // dispatch seam (cf | selfhost | none) — pure transcode, no R2/no hash
+  "src/encoders/recording-sink.ts", // sink seam (r2 | localfs | fanout) — bytes to canonical object, no hash
+  "src/encoders/recorder-container.ts", // Path A Container-DO class — pure transcode sidecar, no R2/no hash
 ];
 
 /** Extract `from "..."` / `import("...")` specifiers from a source file. */

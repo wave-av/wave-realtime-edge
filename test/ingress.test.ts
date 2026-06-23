@@ -1,7 +1,7 @@
 // LK-rip #42 — WAVE-native ingress listeners on the worker entry.
 //
-// POST /v1/realtime/ingress/:protocol/:intent is the server-side counterpart to wave-gateway PR #204
-// (identity-path forward) and wave-surfer-connect PR #4982's WaveIngressProviderService. The protocol +
+// POST /v1/realtime/ingress/:protocol/:intent is the server-side counterpart to wave-gateway PR #204  # guard:allow cross-repo PR reference in a design comment, not a leak
+// (identity-path forward) and wave-surfer-connect PR #4982's WaveIngressProviderService. The protocol +  # guard:allow cross-repo PR reference in a design comment, not a leak
 // intent allowlist MUST line up with #204 for the eventual #74 cutover proof. Feasibility, by design:
 //   • WHIP  → LIVE: WebRTC-over-HTTP, forwarded to the Room DO `join` intent (offer → SFU answer).
 //   • rtmp/srt/url → honest 501 {"error":"ingress_protocol_requires_vm_listener"} (need a VM listener).

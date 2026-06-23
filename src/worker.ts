@@ -11,8 +11,10 @@
 // call that lacks the matching `x-wave-internal` header gets 401. Unset (local/test) → no enforcement, which
 // preserves the gateway-delegated contract + the existing contract tests.
 import { join, turn, RtkError } from "./realtimekit";
+import { DefaultManagedRecordingApi as ManagedApi } from "./encoders/managed";
 import type { EncoderEnv } from "./encoders/encoder";
 import { selectEncoder } from "./encoders/factory";
+import { verifyRecorderToken } from "./encoders/recorder-auth";
 import { pullRecordingConfigured, DefaultManagedRecordingApi } from "./encoders/managed";
 import {
 	handleRecordingWebhook,
@@ -27,6 +29,14 @@ import {
 // resolve from this main module. The class itself is defined in room.ts (P5 substrate); it is not yet
 // wired into fetch() — that is the P5.2 signaling follow-up. Exporting it here lets the binding deploy.
 export { RoomDO } from "./room";
+
+// RT-R10 (#72) — the PORTABLE raw-SFU encode container Durable Object class (Path A). Mirrors bridge-edge's
+// MoqContainer verbatim: a Container-DO the Worker reaches via getContainer(env.RECORDER, id).fetch('/encode')
+// to transcode JPEG→VP8 / PCM→Opus (the Workers isolate can't host libvpx/libopus). INERT: the matching
+// `[[containers]] RECORDER` block in wrangler.toml stays COMMENTED (Path A attach is a Jake-named ◆), so this
+// export resolves the class without provisioning a live container or a `new_sqlite_classes` migration. It is
+// exported here (the main module) so that, when the ◆ uncomments the binding, the class is already in scope.
+export { RecorderContainer } from "./encoders/recorder-container";
 
 /** Minimal Durable Object namespace shape (avoids a hard dependency on cloudflare:workers types). */
 interface RoomNamespace {
@@ -45,6 +55,38 @@ interface Env extends EncoderEnv {
 	ROOM?: RoomNamespace; // Durable Object binding (wrangler ROOM → RoomDO). Per-room state + signaling.
 	// GATEWAY_BASE_URL / WAVE_SERVICE_TOKEN are read INSIDE the RoomDO (see RoomDOEnv in room.ts) — the worker
 	// forwards the env to the DO via the binding, so it does not need to name them here.
+	// ── RT-R10 (#72) portable recorder — ALL inert by default (RECORDER_TARGET 'none', RECORDER_SINK 'r2') ──
+	RECORDER_TARGET?: "cf" | "selfhost" | "none"; // where video encodes; default 'none' (drop video; prod untouched)
+	RECORDER?: DurableObjectNamespace; // Path A container binding — COMMENTED in wrangler.toml until the ◆ attach → absent
+	RECORDER_SELFHOST_URL?: string; // Path B — base URL of the self-hosted rt-encoder service (e.g. https://studio:8080)
+	RECORDER_SINK?: "r2" | "localfs" | "fanout"; // where the recording lands; default 'r2' (today's cloud behavior)
+	RECORDER_LOCAL_DIR?: string; // on-prem local recording dir (self-host); used by localfs/fanout sinks
+	// ── LK-rip #77 egress control plane (wraps the proven PULL-mode recorder) ──
+	// Injectable seam so the egress/start path unit-tests with NO live RTK network. Absent in prod →
+	// the live join() + DefaultManagedRecordingApi are used. Never a public/wire input.
+	__egressDeps?: EgressDeps;
+}
+
+/** Injectable RTK primitives the egress/start path drives (live: realtimekit.join + ManagedApi.start). */
+interface EgressDeps {
+	join(env: Env, room: string): Promise<{ meetingId: string }>;
+	startRecording(env: Env, meetingId: string): Promise<{ recordingId: string }>;
+}
+
+/** Live egress deps: create an RTK meeting for the room, then start its (pull-mode) recording. */
+function liveEgressDeps(): EgressDeps {
+	return {
+		async join(env, room) {
+			const result = await join(
+				{ accountId: env.CF_ACCOUNT_ID ?? "", appId: env.RTK_APP_ID ?? "", token: env.CF_API_TOKEN ?? "" },
+				{ title: room, name: room },
+			);
+			return { meetingId: result.meetingId };
+		},
+		async startRecording(env, meetingId) {
+			return new ManagedApi(env).start(meetingId);
+		},
+	};
 }
 
 // Module-scoped so CF's webhook public key (fetched from the well-known doc) is cached for the isolate's
@@ -55,10 +97,22 @@ const recordingWebhookDeps = liveWebhookDeps();
 const REALTIME_INTENTS = new Set(["join", "publish", "subscribe", "renegotiate", "leave"]);
 /** POST /v1/realtime/rooms/:room/:intent */
 const REALTIME_ROUTE = /^\/v1\/realtime\/rooms\/([^/]+)\/([^/]+)\/?$/;
+/** RT-R9 hibernatable WS recorder route the SFU dials OUT to: /v1/realtime/recorder/:org/:room/:sessionId/:trackName.
+ *  :room is REQUIRED so a frame addresses the SAME RoomDO (keyed `${org}:${room}`) that holds the tap created on the
+ *  publish path — without it the frame lands on a DIFFERENT DO (keyed by sessionId) with no tap and is silently
+ *  dropped. The capability token still binds ONLY (org, sessionId, trackName); room is a routing key, not part of the
+ *  signed identity (a wrong room routes to a tap-less DO — a harmless no-op, never a forgery). */
+const RECORDER_ROUTE = /^\/v1\/realtime\/recorder\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
+/** LK-rip #77 egress control plane the gateway fronts (WSC WaveEgressProviderService #4984 drives these):
+ * POST /rtk/egress/start|stop|info. Intent allowlist — anything else is not a recognized egress route. */
+const EGRESS_INTENTS = new Set(["start", "stop", "info"]);
+const EGRESS_ROUTE = /^\/rtk\/egress\/([^/]+)\/?$/;
+/** Segment guards for the recorder route (SSRF-safe DO-key + frame-forward params). */
+const SAFE_SEGMENT = /^[A-Za-z0-9_:.-]{1,128}$/;
 
 // ── WAVE-native ingress listeners (LK-rip #42) — POST /v1/realtime/ingress/:protocol/:intent ──
-// Server-side counterpart to wave-gateway PR #204 (which forwards this exact path shape as the identity
-// edge path) and wave-surfer-connect PR #4982's WaveIngressProviderService contract. The protocol + intent
+// Server-side counterpart to wave-gateway PR #204 (which forwards this exact path shape as the identity  # guard:allow cross-repo PR reference in a design comment, not a leak
+// edge path) and wave-surfer-connect PR #4982's WaveIngressProviderService contract. The protocol + intent  # guard:allow cross-repo PR reference in a design comment, not a leak
 // allowlist MUST match #204 (rtmp/whip/srt/url + create/delete; plus protocol-less management). The
 // gateway already validates the shape; we re-validate here (defense in depth, never trust transport).
 //
@@ -245,11 +299,151 @@ export default {
 			}
 		}
 
+		// ── RT-R9 raw-SFU recorder WS route — /v1/realtime/recorder/:org/:room/:sessionId/:trackName ──
+		// The CF Realtime SFU dials OUT to this hibernatable WS endpoint (per the container-encoder adapter) and
+		// pushes ONE track's media as binary frames; each frame is forwarded to the room's DO tap. INERT: gated
+		// behind the SAME internal-secret chokepoint AND RT_RECORD==="1" — unarmed (live default) it 404s, so
+		// nothing can dial it. A non-Upgrade request → 426. The DO feed is fail-open (ctx.waitUntil), never blocks.
+		const recMatch = url.pathname.match(RECORDER_ROUTE);
+		if (recMatch) {
+			const [, rorg, rroom, rsession, rtrack] = recMatch;
+			if (![rorg, rroom, rsession, rtrack].every((s) => SAFE_SEGMENT.test(s)) || !env.ROOM) {
+				return Response.json({ error: "BAD_REQUEST", message: "invalid recorder path or no ROOM binding" }, { status: 400 });
+			}
+			// AUTH — accept EITHER a valid scoped capability token (?t=, how the third-party SFU dials in; it
+			// cannot send our internal header) OR the `x-wave-internal` header (the path for internal callers).
+			// When WAVE_INTERNAL_SECRET is unset (local/test) the token check is false AND gatewayGate enforces
+			// nothing → no enforcement, mirroring every other gated route.
+			const tok = url.searchParams.get("t");
+			const tokenOk =
+				!!tok && !!env.WAVE_INTERNAL_SECRET && (await verifyRecorderToken(env.WAVE_INTERNAL_SECRET, rorg, rsession, rtrack, tok));
+			if (!tokenOk) {
+				const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
+				if (denied) return denied;
+			}
+			// Disarmed (RT_RECORD!=="1", the live default) → the route does not exist (config-no-silent-noop:
+			// nothing dials it, so a 501 is the honest "no recorder here", not a silent accept).
+			if (env.RT_RECORD !== "1") {
+				return Response.json({ error: "REALTIME_NOT_IMPLEMENTED", path: url.pathname }, { status: 501 });
+			}
+			if ((request.headers.get("Upgrade") ?? "").toLowerCase() !== "websocket") {
+				return Response.json(
+					{ error: "UPGRADE_REQUIRED", message: "recorder route requires a WebSocket upgrade" },
+					{ status: 426 },
+				);
+			}
+			// Open a server WebSocket and forward every BINARY frame to the room's DO tap (keyed `${org}:${room}` —
+			// the SAME DO the publish path created the tap in). The DO feed is fully fail-open — a recording error
+			// never affects the live media the SFU is also pushing.
+			// WebSocketPair is a Workers-runtime global; referenced off globalThis so unit tests can stub it.
+			const WSP = (globalThis as unknown as { WebSocketPair?: new () => Record<string, WebSocket> }).WebSocketPair;
+			if (!WSP) {
+				return Response.json({ error: "REALTIME_NOT_CONFIGURED", message: "WebSocketPair unavailable" }, { status: 503 });
+			}
+			const pair = new WSP();
+			const client = (pair as unknown as Record<string, WebSocket>)[0];
+			const server = (pair as unknown as Record<string, WebSocket>)[1];
+			server.accept();
+			const id = env.ROOM.idFromName(`${rorg}:${rroom}`); // SAME DO as publish (org:room) → the tap lives here
+			const stub = env.ROOM.get(id);
+			server.addEventListener("message", (ev: MessageEvent) => {
+				const data = ev.data;
+				if (!(data instanceof ArrayBuffer)) return; // ignore text/keepalive — only binary media frames
+				const fwd = stub
+					.fetch(
+						new Request(`https://room/recorder-frame?sessionId=${encodeURIComponent(rsession)}&trackName=${encodeURIComponent(rtrack)}`, {
+							method: "POST",
+							body: data,
+						}),
+					)
+					.catch(() => {});
+				if (ctx) ctx.waitUntil(fwd);
+			});
+			// Workers accepts a 101 + webSocket ResponseInit (the WS-upgrade idiom). Some non-Workers runtimes
+			// (e.g. the Node test env) reject status 101 in the Response ctor — guard so the handler never throws.
+			try {
+				return new Response(null, { status: 101, webSocket: client } as ResponseInit & { webSocket: WebSocket });
+			} catch {
+				return new Response(null, { status: 200, webSocket: client } as ResponseInit & { webSocket: WebSocket });
+			}
+		}
+
 		// ── P5 CF-Calls SFU control plane — POST /v1/realtime/rooms/:room/:intent ──
 		// Routed through the Room DO (per-org isolation: the DO id is keyed `${org}:${room}`), which runs the
 		// Signaling orchestration (room.ts RoomDO.fetch). Same gateway-trust chokepoint as /rtk/*: when
 		// WAVE_INTERNAL_SECRET is set, only the gateway (x-wave-internal) may reach these paid endpoints. Org
 		// comes from the gateway-stamped `x-wave-org` header (the gateway authenticates + scopes upstream).
+		// ── LK-rip #77 egress control plane — POST /rtk/egress/start|stop|info ──
+		// The gateway-fronted WAVE-native recording-egress surface the WSC WaveEgressProviderService (#4984)
+		// drives. WRAPS the proven PULL-mode recorder (rtk-webhook pulls the finished file into our R2) — it does
+		// NOT build a raw-SFU tap (that stays NOT_SPIKED/dormant). Behind the SAME internal-secret chokepoint as
+		// the other /rtk/* routes. DORMANT by default: when pull mode is not configured (the live default —
+		// RT_RECORD!=="1" or creds/bindings absent) every intent 501s, which the #4984 client maps to
+		// RECORDER_BYTESOURCE_UNAVAILABLE (fail loud until the recorder is armed; never a faked file/silent ok).
+		{
+			const egMatch = request.method === "POST" ? url.pathname.match(EGRESS_ROUTE) : null;
+			if (egMatch && EGRESS_INTENTS.has(egMatch[1])) {
+				const deniedEg = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
+				if (deniedEg) return deniedEg;
+				const intent = egMatch[1];
+				if (!pullRecordingConfigured(env)) {
+					return Response.json({ error: "REALTIME_NOT_IMPLEMENTED", path: url.pathname }, { status: 501 });
+				}
+				let body: Record<string, unknown> = {};
+				try {
+					body = (await request.json()) as Record<string, unknown>;
+				} catch {
+					body = {};
+				}
+				const deps = env.__egressDeps ?? liveEgressDeps();
+
+				if (intent === "start") {
+					const org = request.headers.get("x-wave-org") ?? "";
+					if (!SAFE_ORG.test(org)) {
+						return Response.json(
+							{ error: "BAD_REQUEST", message: "missing or malformed org context (x-wave-org)" },
+							{ status: 400 },
+						);
+					}
+					const room = typeof body.room === "string" ? body.room : "";
+					try {
+						// egressId == the RTK meetingId == the recording sessionId, so the webhook pull lands ONE
+						// canonical object at the LIVE recordingKey() scheme
+						// `${org}/realtime-recordings/${meetingId}/recording.<ext>` (tier SKIP, lifecycle-applied).
+						const { meetingId } = await deps.join(env, room);
+						// Persist meetingId→org FIRST so the recording.statusUpdate webhook attributes the pull to this org.
+						await env.RT_MEETING_ORG?.put(meetingId, org, { expirationTtl: 60 * 60 * 24 * 14 });
+						const { recordingId } = await deps.startRecording(env, meetingId);
+						console.log(JSON.stringify({ msg: "rt-egress-started", egressId: meetingId, recordingId, org, room }));
+						return Response.json(
+							{ egressId: meetingId, sessionId: meetingId, recordingId, room, status: "starting" },
+							{ status: 200 },
+						);
+					} catch (e) {
+						const err = e instanceof RtkError ? e : new RtkError("REALTIME_ERROR", "egress start failed", 500);
+						return Response.json({ error: err.code, message: err.message }, { status: err.status });
+					}
+				}
+
+				// stop / info: egressId is the RTK meetingId. The RTK recording auto-stops at meeting end and the
+				// webhook pulls the finished file into R2, so STOP is a best-effort ack (we never tear down a live
+				// meeting from here) and INFO reports the correlation; full status detail is webhook-driven.
+				const egressId = typeof body.egressId === "string" ? body.egressId : "";
+				if (!egressId) {
+					return Response.json({ error: "BAD_REQUEST", message: "egressId is required" }, { status: 400 });
+				}
+				const org = (await env.RT_MEETING_ORG?.get(egressId)) ?? null;
+				if (intent === "stop") {
+					console.log(JSON.stringify({ msg: "rt-egress-stop", egressId, org }));
+					return Response.json({ egressId, sessionId: egressId, status: "stopping" }, { status: 200 });
+				}
+				return Response.json(
+					{ egressId, sessionId: egressId, org, status: org ? "active" : "unknown" },
+					{ status: 200 },
+				);
+			}
+		}
+
 		const rtMatch = request.method === "POST" ? url.pathname.match(REALTIME_ROUTE) : null;
 		if (rtMatch && REALTIME_INTENTS.has(rtMatch[2])) {
 			const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);

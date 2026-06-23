@@ -17,6 +17,16 @@
 import { RoomCore, Role, RoomType, TrackKind, WaitingResult } from "./room.js";
 import { SfuClient, SessionDescription, LocalTrack } from "./sfu.js";
 import { emitParticipantUsage, MeterEmitEnv } from "./metering.js";
+import {
+  EventEmitEnv,
+  emitEvent,
+  buildRoomStarted,
+  buildRoomFinished,
+  buildParticipantJoined,
+  buildParticipantLeft,
+  buildTrackPublished,
+  buildSessionEnded,
+} from "./event-emitter.js";
 
 /** A validated request context. AUTH is upstream (gateway) — see file header. */
 export interface SignalContext {
@@ -75,12 +85,30 @@ export class SignalError extends Error {
  * Signaling — constructed per request with a RoomCore (this room's DO state) + an SfuClient (SFU media
  * client built from env). Stateless beyond those two collaborators.
  */
+/**
+ * RT-R9 — the recording orchestration hook the signaling layer drives. publishTrack → onPublish (best-effort,
+ * NEVER blocks publish); leave/endRoom → finalize AFTER the leave is committed. DORMANT when the encoder is
+ * disarmed/managed. Injected by the RoomDO; absent in pure-signaling tests → recording is a no-op.
+ */
+export interface RecordingHook {
+  onPublish(org: string, sessionId: string, room: string, trackName: string, kind: TrackKind): Promise<void>;
+  finalize(sessionId: string): Promise<void>;
+}
+
 export class Signaling {
   constructor(
     private readonly room: RoomCore,
     private readonly sfu: SfuClient,
     /** P5.3 metering env (gateway URL + service token). Optional → emit is INERT until provisioned. */
     private readonly meterEnv: MeterEmitEnv = {},
+    /** RT-R9 recording hook. Optional → recording is a no-op (pure-signaling tests, or no recorder bound). */
+    private readonly recording?: RecordingHook,
+    /**
+     * LK-rip #46 event-emitter env (flag + shared HMAC secret + ingest URL). Optional → DORMANT: the SFU
+     * emits NO room/session lifecycle events to the WSC Argus ingest until WAVE_REALTIME_EVENTS_EMIT="1"
+     * AND the secret are provisioned (the Jake-named cutover). Every emit is fail-open (never blocks media).
+     */
+    private readonly eventEnv: EventEmitEnv = {},
   ) {}
 
   /**
@@ -103,13 +131,20 @@ export class Signaling {
     const waiting = await this.room.admissionCheck(ctx.org, { participantId: ctx.participantId, role, anon: ctx.anon });
     if (waiting) return waiting; // knocking — no SFU session minted
 
-    // Auto/no-policy: mint SFU session, then record in room state.
+    // Auto/no-policy: mint SFU session, then record in room state. Snapshot occupancy BEFORE seating so we
+    // can detect the room's FIRST participant → room.started (LK-rip #46). The DO serializes join, so this
+    // read→join is race-free per room.
+    const wasEmpty = (await this.room.listParticipants()).length === 0;
     const session = await this.sfu.newSession(opts.offer);
     const participant = await this.room.joinRoom(ctx.org, {
       participantId: ctx.participantId,
       sessionId: session.sessionId,
       role,
     });
+    // LK-rip #46: emit lifecycle events to the WSC Argus ingest (DORMANT until armed; fail-open — an emit
+    // failure never affects the join). State of record is committed first, then observability fans out.
+    if (wasEmpty) await emitEvent(this.eventEnv, buildRoomStarted({ org: ctx.org, room: ctx.room }));
+    await emitEvent(this.eventEnv, buildParticipantJoined({ org: ctx.org, room: ctx.room }, ctx.participantId));
     return {
       participantId: participant.participantId,
       sessionId: session.sessionId,
@@ -140,6 +175,18 @@ export class Signaling {
         participantId: ctx.participantId,
         kind: t.kind,
       });
+      // LK-rip #46: emit track.published to the WSC Argus ingest (DORMANT until armed; fail-open).
+      await emitEvent(this.eventEnv, buildTrackPublished({ org: ctx.org, room: ctx.room }, ctx.participantId, { name: t.trackName, kind: t.kind }));
+      // RT-R9: arm/forward to the raw-SFU recorder (best-effort). A recording error must NEVER block the
+      // publish (media-safety > recording, design §4) — the hook is internally fail-open, and this is wrapped
+      // again defensively so even a thrown hook can't fail the registered publish.
+      if (this.recording) {
+        try {
+          await this.recording.onPublish(ctx.org, participant.sessionId, ctx.room, t.trackName, t.kind);
+        } catch {
+          /* fail-open — recording never blocks publish */
+        }
+      }
     }
     return result;
   }
@@ -187,6 +234,25 @@ export class Signaling {
     // must NEVER affect the leave (media-safety > metering, design §4) — emitParticipantUsage is fail-open.
     const usage = await this.room.leaveRoom(ctx.org, ctx.participantId);
     if (usage) await emitParticipantUsage(this.meterEnv, usage);
+    // LK-rip #46: emit participant.left + the BILLABLE session.ended (carries session_minutes + org_id; the
+    // ingest meters wave_realtime_{video,audio}_minutes off it) to the WSC Argus ingest, then room.finished
+    // when this leave emptied the room. DORMANT until armed; fail-open — an emit never affects the leave.
+    if (usage) {
+      await emitEvent(this.eventEnv, buildParticipantLeft(usage));
+      await emitEvent(this.eventEnv, buildSessionEnded(usage));
+      if ((await this.room.listParticipants()).length === 0) {
+        await emitEvent(this.eventEnv, buildRoomFinished({ org: ctx.org, room: ctx.room }));
+      }
+    }
+    // RT-R9: finalize the raw-SFU recording AFTER the leave is committed (state of record first). Best-effort:
+    // a finalize-throw is swallowed so the leave still succeeds (media-safety > recording, design §4).
+    if (usage && this.recording) {
+      try {
+        await this.recording.finalize(usage.sessionId);
+      } catch {
+        /* fail-open — a recorder finalize error never fails the leave */
+      }
+    }
   }
 
   private assertCtx(ctx: SignalContext): void {
