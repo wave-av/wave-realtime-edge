@@ -324,9 +324,21 @@ export default {
 			server.accept();
 			const id = env.ROOM.idFromName(`${rorg}:${rroom}`); // SAME DO as publish (org:room) → the tap lives here
 			const stub = env.ROOM.get(id);
+			// DIAG (arm/rt-container-v4 only — NEVER merged): instrument the frame hop to locate where the WebM is lost.
+			let _rfN = 0; // ArrayBuffer media frames received
+			let _rfBytes = 0;
+			let _rfNonAb = 0; // non-ArrayBuffer (text/keepalive/blob) messages — the suspected discard
 			server.addEventListener("message", (ev: MessageEvent) => {
 				const data = ev.data;
-				if (!(data instanceof ArrayBuffer)) return; // ignore text/keepalive — only binary media frames
+				if (!(data instanceof ArrayBuffer)) {
+					_rfNonAb += 1;
+					if (_rfNonAb <= 4)
+						console.log(JSON.stringify({ msg: "rt-rec-ws-nonab", n: _rfNonAb, dtype: Object.prototype.toString.call(data), isString: typeof data === "string", len: typeof data === "string" ? (data as string).length : undefined }));
+					return; // ignore text/keepalive — only binary media frames
+				}
+				_rfN += 1;
+				_rfBytes += data.byteLength;
+				if (_rfN <= 3 || _rfN % 200 === 0) console.log(JSON.stringify({ msg: "rt-rec-ws-frame", n: _rfN, bytes: _rfBytes, thisLen: data.byteLength }));
 				const fwd = stub
 					.fetch(
 						new Request(`https://room/recorder-frame?sessionId=${encodeURIComponent(rsession)}&trackName=${encodeURIComponent(rtrack)}`, {
@@ -334,9 +346,15 @@ export default {
 							body: data,
 						}),
 					)
-					.catch(() => {});
+					.then((r) => {
+						if (_rfN <= 3) console.log(JSON.stringify({ msg: "rt-rec-fwd", n: _rfN, status: r.status }));
+					})
+					.catch((e) => console.log(JSON.stringify({ msg: "rt-rec-fwd-err", e: String((e && (e as Error).message) || e) })));
 				if (ctx) ctx.waitUntil(fwd);
 			});
+			server.addEventListener("close", () =>
+				console.log(JSON.stringify({ msg: "rt-rec-ws-close", frames: _rfN, bytes: _rfBytes, nonAb: _rfNonAb })),
+			);
 			// Workers accepts a 101 + webSocket ResponseInit (the WS-upgrade idiom). Some non-Workers runtimes
 			// (e.g. the Node test env) reject status 101 in the Response ctor — guard so the handler never throws.
 			try {

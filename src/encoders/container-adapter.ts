@@ -299,6 +299,7 @@ export class RawSfuTap {
   private recorder: RealtimeRecorder | null = null;
   private firstTs: number | null = null;
   private finalized = false;
+  private _n = 0; // DIAG (arm-v4 only): frames decoded by the tap
 
   constructor(opts: RawSfuTapOptions) {
     this.target = opts.target;
@@ -324,6 +325,8 @@ export class RawSfuTap {
   async onFrame(frame: Uint8Array): Promise<void> {
     if (this.finalized) return;
     const pkt = decodePacket(frame);
+    this._n += 1;
+    if (this._n <= 3 || this._n % 200 === 0) console.log(JSON.stringify({ msg: "rt-tap-frame", n: this._n, payloadLen: pkt.payload.length }));
     if (pkt.payload.length === 0) return; // keep-alive / empty frame
     if (this.firstTs === null) this.firstTs = pkt.timestamp;
     const tsMs = Math.max(0, Math.floor(this.tsToMs(pkt.timestamp - this.firstTs)));
@@ -344,6 +347,7 @@ export class RawSfuTap {
     this.finalized = true;
     this.muxer.finish();
     await this.flush();
+    console.log(JSON.stringify({ msg: "rt-tap-finalize", frames: this._n, hadRecorder: !!this.recorder, key: this.recorder?.key ?? null }));
     if (!this.recorder) return null; // never any media → no object
     return this.recorder.finalize();
   }
@@ -360,6 +364,7 @@ export class RawSfuTap {
     if (bytes.length === 0) return;
     if (!this.recorder) {
       this.recorder = await RealtimeRecorder.begin(this.target.bucket, this.target.org, this.target.sessionId, bytes);
+      console.log(JSON.stringify({ msg: "rt-tap-begin", key: this.recorder.key, bytes: bytes.length }));
     } else {
       await this.recorder.append(bytes);
     }

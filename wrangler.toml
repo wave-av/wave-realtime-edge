@@ -59,7 +59,9 @@ GATEWAY_BASE_URL = "https://api.wave.online"
 RT_RECORD = "1"
 # RT_ENCODER selects the adapter when armed: "managed" (C, the buildable path) | "container" (A) | "wasm"
 # (B). A/B are BLOCKED-ON-RT-P0.1-spike and throw NOT_SPIKED at begin until the §7 WS media-transport spike.
-RT_ENCODER = "managed"
+# STEP D DIAGNOSTIC ARM — branch arm/rt-container-v4 ONLY (main stays "managed"). Container encoder + frame-hop
+# instrumentation (worker WS onmessage + RawSfuTap) to locate where the WebM is lost. NOT for merge.
+RT_ENCODER = "container"
 # (PULL mode hands RTK NO storage_config, so there is no RT_RECORDINGS_BUCKET var — the bucket is bound
 # directly below as the R2 binding the webhook pull writes into.)
 
