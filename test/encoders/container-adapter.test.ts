@@ -177,6 +177,75 @@ describe("createWebsocketAdapter — verified create-adapter REST", () => {
   });
 });
 
+// ── 1b. createWebsocketAdapter — publish-race retry (not_found_track_error) ─────────────────────────────
+describe("createWebsocketAdapter — retries the create-time publish race", () => {
+  // The SFU's "track not on remote peer yet" response (publisher media not flowing at create time).
+  const notReady = () =>
+    jsonResponse(
+      { tracks: [{ errorCode: "not_found_track_error", errorDescription: "Track not found on remote peer. Make sure the publisher peer is connected and sending packets" }] },
+      503,
+    );
+
+  it("retries on not_found_track_error, then succeeds once the track starts sending", async () => {
+    const sleeps: number[] = [];
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls += 1;
+      return calls < 3 ? notReady() : jsonResponse({ adapterId: "adp_ok" });
+    };
+    const r = await createWebsocketAdapter(
+      { fetchImpl, retry: { maxAttempts: 6, delayMs: () => 7, sleep: async (ms) => void sleeps.push(ms) } },
+      { appId: APP_ID, bearer: "t", tracks: [track()] },
+    );
+    expect(r.adapterId).toBe("adp_ok");
+    expect(calls).toBe(3); // failed twice, then succeeded
+    expect(sleeps).toEqual([7, 7]); // slept before attempts 2 and 3
+  });
+
+  it("gives up with UPSTREAM after the attempt budget if the track never sends", async () => {
+    const sleeps: number[] = [];
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls += 1;
+      return notReady();
+    };
+    await expect(
+      createWebsocketAdapter(
+        { fetchImpl, retry: { maxAttempts: 4, delayMs: () => 1, sleep: async (ms) => void sleeps.push(ms) } },
+        { appId: APP_ID, bearer: "t", tracks: [track()] },
+      ),
+    ).rejects.toMatchObject({ code: "UPSTREAM", status: 502 });
+    expect(calls).toBe(4); // first + 3 retries
+    expect(sleeps).toHaveLength(3); // slept between the 4 attempts, not after the last
+  });
+
+  it("does NOT retry a non-race failure (other 503) even with a retry budget", async () => {
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls += 1;
+      return jsonResponse({ error: "boom" }, 503);
+    };
+    await expect(
+      createWebsocketAdapter(
+        { fetchImpl, retry: { maxAttempts: 5, delayMs: () => 0, sleep: async () => {} } },
+        { appId: APP_ID, bearer: "t", tracks: [track()] },
+      ),
+    ).rejects.toMatchObject({ code: "UPSTREAM" });
+    expect(calls).toBe(1); // terminal on the first non-race error
+  });
+
+  it("succeeds on the first try without sleeping when the track is already live", async () => {
+    const sleeps: number[] = [];
+    const fetchImpl = async () => jsonResponse({ adapterId: "adp_1" });
+    const r = await createWebsocketAdapter(
+      { fetchImpl, retry: { maxAttempts: 6, delayMs: () => 9, sleep: async (ms) => void sleeps.push(ms) } },
+      { appId: APP_ID, bearer: "t", tracks: [track()] },
+    );
+    expect(r.adapterId).toBe("adp_1");
+    expect(sleeps).toHaveLength(0);
+  });
+});
+
 // ── 2. decodePacket ─────────────────────────────────────────────────────────────────────────────────────
 describe("decodePacket — proto3 Packet wire decoder", () => {
   it("round-trips sequenceNumber, timestamp, and payload", () => {
