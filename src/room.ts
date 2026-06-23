@@ -1,30 +1,21 @@
-// P5.1 — Room Durable Object skeleton (per-room state, no signaling/auth).
-//
-// One Durable Object instance per room. Single source of truth for room state:
-//   • participant set (org-scoped — a room is bound to ONE org)
-//   • published/subscribed track registry keyed by CF Realtime track ids
-//   • per-participant permissions (grants)
-//   • join/leave handlers + a room TTL
-//   • registry reconcile against CF Realtime's 30s inactivity GC (design §4)
-//   • admission policy per room type (knock/auto, lock, capacity, waiting room, safety ops) — P5.2-auth
-//
-// Signaling and auth are DELIBERATELY OUT (P5.2). This file exposes a typed *internal API* the future
-// signaling layer will call (joinRoom / leaveRoom / register tracks / reconcile). The DO holds state;
-// it does not talk to the SFU or the network here. Tests inject the storage, so no live DO runtime is
-// needed (the class is also wired as a real DurableObject for when bindings land).
+// P5.1 — Room Durable Object. One DO instance per room; SSOT for room state: org-scoped participant
+// set, track registry (CF Realtime track ids), per-participant grants, join/leave + TTL, registry
+// reconcile vs CF Realtime's 30s inactivity GC (design §4), and admission policy (P5.2-auth).
+// Exposes a typed internal API the signaling layer calls (joinRoom/leaveRoom/register/reconcile);
+// the DO holds state, not network. Tests inject storage, so no live DO runtime is needed.
 
 import { SfuClient, SfuError } from "./sfu.js";
 import type { SessionDescription } from "./sfu.js";
 import { Signaling } from "./signaling.js";
 import type { SignalContext, PublishTrack } from "./signaling.js";
 import type { ParticipantSessionUsage, MeterEmitEnv } from "./metering.js";
+import type { EventEmitEnv } from "./event-emitter.js";
 import { selectEncoder } from "./encoders/factory.js";
 import type { EncoderEnv, EncoderHandle, EncoderKind, RecordingEncoder } from "./encoders/encoder.js";
 
 /** CF Realtime GCs a track after 30s of inactivity (design §4). Registry reconcile uses this. */
 export const TRACK_GC_MS = 30_000;
-/** Default room lifetime once empty/idle, after which the room is considered expired. */
-export const DEFAULT_ROOM_TTL_MS = 30 * 60_000; // 30 min
+/** Default room lifetime once empty/idle, after which the room is expired. */ export const DEFAULT_ROOM_TTL_MS = 30 * 60_000; // 30 min
 
 export type Role = "host" | "speaker" | "viewer";
 
@@ -549,22 +540,22 @@ interface DurableObjectStateLike {
 }
 
 /**
- * Env the RoomDO reads to build its SFU client + metering tap (referenced, never valued here):
- *   • CF_CALLS_APP_ID / CF_CALLS_APP_SECRET — CF Realtime SFU app creds (sfu.ts). Unset → join fails
- *     closed 503 REALTIME_NOT_CONFIGURED (preserving the /rtk surface).
- *   • GATEWAY_BASE_URL / WAVE_SERVICE_TOKEN — metering tap (metering.ts). Both unset → emit is INERT.
- * __sfuFetch / __meterFetch are TEST-ONLY injectables (no live network in tests); production leaves them
- * undefined so the real `fetch` is used.
+ * Env the RoomDO reads (referenced, never valued here): CF_CALLS_APP_ID/_SECRET = CF Realtime SFU
+ * creds (unset → join fails closed 503 REALTIME_NOT_CONFIGURED); GATEWAY_BASE_URL/WAVE_SERVICE_TOKEN
+ * = metering tap (both unset → INERT). __sfuFetch/__meterFetch are TEST-ONLY injectables.
  */
 export interface RoomDOEnv {
   CF_CALLS_APP_ID?: string;
   CF_CALLS_APP_SECRET?: string;
   GATEWAY_BASE_URL?: string;
   WAVE_SERVICE_TOKEN?: string;
-  // ── RT-R9 raw-SFU recording (DORMANT until ◆-armed). The DO builds the recording encoder lazily via
-  // selectEncoder(env) on the FIRST publish. RT_ENCODER stays "managed" in live wrangler.toml → the
-  // recordingHandle is a no-op (managed C has no onPublish/finalize state held here); only an ◆-armed
-  // RT_ENCODER="container" + RT_RECORD="1" + creds opens a real raw-SFU tap. ──
+  // ── LK-rip #46 SFU event emitter (DORMANT until cutover). DO forwards to Signaling → WSC Argus
+  // ingest ONLY when WAVE_REALTIME_EVENTS_EMIT="1" AND the shared HMAC secret is set (else inert). ──
+  WAVE_REALTIME_EVENTS_EMIT?: string; // "1" arms; absent/anything-else → inert
+  WAVE_REALTIME_WEBHOOK_SECRET?: string; // shared HMAC secret (Doppler, both sides); absent → inert
+  WSC_EVENTS_URL?: string; // ingest URL override (var); default = prod contract URL
+  // ── RT-R9 raw-SFU recording (DORMANT until ◆-armed). Encoder built lazily via selectEncoder(env) on
+  // first publish; RT_ENCODER stays "managed" → no-op. Only ◆-armed container + RT_RECORD="1" + creds taps. ──
   RT_RECORDINGS?: R2Bucket; // SKIP sink the container tap writes the one canonical object into
   RT_ENCODER?: EncoderKind; // selector; default "managed" (live). "container" = raw-SFU (◆).
   RT_RECORD?: string; // "1" to arm recording at all (default OFF — fully inert)
@@ -748,7 +739,7 @@ export class RoomDO {
     const ctx = body.ctx as SignalContext | undefined;
 
     try {
-      const signaling = new Signaling(this.core, this.buildSfu(), this.meterEnv(), this.recording);
+      const signaling = new Signaling(this.core, this.buildSfu(), this.meterEnv(), this.recording, this.eventEnv());
       switch (intent) {
         case "join":
           return Response.json(
@@ -796,5 +787,14 @@ export class RoomDO {
   /** Metering env for the leave-time tap. INERT until GATEWAY_BASE_URL + WAVE_SERVICE_TOKEN are set. */
   private meterEnv(): MeterEmitEnv {
     return { GATEWAY_BASE_URL: this.env.GATEWAY_BASE_URL, WAVE_SERVICE_TOKEN: this.env.WAVE_SERVICE_TOKEN };
+  }
+
+  /** LK-rip #46 event-emitter env. DORMANT until WAVE_REALTIME_EVENTS_EMIT="1" + the shared secret are set. */
+  private eventEnv(): EventEmitEnv {
+    return {
+      WAVE_REALTIME_EVENTS_EMIT: this.env.WAVE_REALTIME_EVENTS_EMIT,
+      WAVE_REALTIME_WEBHOOK_SECRET: this.env.WAVE_REALTIME_WEBHOOK_SECRET,
+      WSC_EVENTS_URL: this.env.WSC_EVENTS_URL,
+    };
   }
 }
