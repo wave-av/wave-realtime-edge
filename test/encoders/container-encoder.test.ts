@@ -131,6 +131,7 @@ describe("ContainerHandle.onPublish — audio opens a tap + posts the create-ada
     const enc = new ContainerEncoder(configuredEnv(bucket), { fetchImpl });
     const handle = (await enc.begin(SESSION)) as ContainerHandle;
     await handle.onPublish("mic", "audio");
+    await handle.whenAdapterSettled(); // the create is backgrounded (never blocks publish) — await it to assert
     expect(seen.url).toBe(`https://rtc.live.cloudflare.com/v1/apps/${APP_ID}/adapters/websocket/new`);
     const body = JSON.parse(String(seen.init?.body));
     expect(body.tracks[0].endpoint).toBe(`${DEFAULT_RECORDER_ENDPOINT_BASE}/org_x/${SESSION.sessionId}/mic`);
@@ -153,6 +154,7 @@ describe("ContainerHandle.onPublish — audio opens a tap + posts the create-ada
     const handle = (await enc.begin(SESSION)) as ContainerHandle;
     await handle.onPublish("mic", "audio");
     await handle.onPublish("mic", "audio");
+    await handle.whenAdapterSettled();
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(handle.tapsByTrack.size).toBe(1);
   });
@@ -162,6 +164,7 @@ describe("ContainerHandle.onPublish — audio opens a tap + posts the create-ada
     const enc = new ContainerEncoder(configuredEnv(new FakeBucket()), { fetchImpl });
     const handle = (await enc.begin(SESSION)) as ContainerHandle;
     await expect(handle.onPublish("mic", "audio")).resolves.toBeUndefined();
+    await handle.whenAdapterSettled(); // the backgrounded create rejected → swallowed (fail-open)
     expect(handle.tapsByTrack.has("mic")).toBe(true);
   });
 });

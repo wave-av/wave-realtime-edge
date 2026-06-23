@@ -68,13 +68,43 @@ export interface CreateAdapterResult {
 }
 
 /**
+ * Retry policy for the create-adapter call. The SFU answers `not_found_track_error` when the publisher's media
+ * isn't flowing YET — ICE/DTLS bring the track up ~hundreds of ms AFTER `/publish` returns, so a create issued
+ * the instant publish returns races ahead of the media (proven live: Step D, 2026-06-22). That is a TRANSIENT
+ * race, not a real failure, so we retry the CREATE until the track is sending. CF's adapter auto-reconnect only
+ * re-dials an ALREADY-established endpoint that dropped — it does NOT cover this create-time not-yet-ready — so
+ * the retry must live here. DEFAULT is no retry (maxAttempts 1, prior behavior); the live caller passes a budget.
+ */
+export interface AdapterRetry {
+  /** Total attempts including the first. 1 = no retry. */
+  maxAttempts: number;
+  /** Backoff (ms) before the next try, given the 1-based attempt that just failed. Default ramps to ~1s. */
+  delayMs?: (attempt: number) => number;
+  /** Injectable sleep (tests pass a synchronous fake; default real setTimeout). */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** True when a create-adapter response says a track is not (yet) on the remote peer — the publish-race signal. */
+function trackNotReady(json: unknown): boolean {
+  const tracks = (json as { tracks?: unknown } | null)?.tracks;
+  if (!Array.isArray(tracks)) return false;
+  return tracks.some((t) => {
+    if (t == null || typeof t !== "object") return false;
+    const code = (t as { errorCode?: unknown }).errorCode;
+    const desc = (t as { errorDescription?: unknown }).errorDescription;
+    return code === "not_found_track_error" || (typeof desc === "string" && /track not found/i.test(desc));
+  });
+}
+
+/**
  * Create a CF Realtime websocket media-transport adapter. POST {base}/apps/{appId}/adapters/websocket/new
  * with `{tracks}` and a Bearer token; the SFU then dials each track's `endpoint` wss and pushes media. The
- * fetch impl is injectable so every path is unit-tested with no live network. Throws SfuAdapterError at the
- * boundary; never logs the bearer or the raw upstream body.
+ * fetch impl is injectable so every path is unit-tested with no live network. On a `not_found_track_error`
+ * (publisher media not flowing yet — see AdapterRetry) the create is retried per `deps.retry` until the track
+ * sends or the budget is spent. Throws SfuAdapterError at the boundary; never logs the bearer or the raw body.
  */
 export async function createWebsocketAdapter(
-  deps: { fetchImpl?: FetchLike },
+  deps: { fetchImpl?: FetchLike; retry?: AdapterRetry },
   params: CreateAdapterParams,
 ): Promise<CreateAdapterResult> {
   if (!APPID.test(params.appId || "")) throw new SfuAdapterError("BAD_APP_ID", "invalid SFU app id", 400);
@@ -92,24 +122,37 @@ export async function createWebsocketAdapter(
   }
   const base = (params.sfuApiBase ?? DEFAULT_SFU_API_BASE).replace(/\/+$/, "");
   const doFetch = deps.fetchImpl ?? fetch;
-  const res = await doFetch(`${base}/apps/${params.appId}/adapters/websocket/new`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${params.bearer}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ tracks: params.tracks }),
-  });
-  let json: unknown = null;
-  try {
-    json = await res.json();
-  } catch {
-    json = null;
-  }
-  if (!res.ok) {
-    console.warn(`sfu-ws-adapter status=${res.status} ok=${res.ok}`); // observability only — never the token
+  const maxAttempts = Math.max(1, deps.retry?.maxAttempts ?? 1);
+  const delayMs = deps.retry?.delayMs ?? ((attempt: number) => Math.min(250 * attempt, 1000));
+  const sleep = deps.retry?.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+
+  for (let attempt = 1; ; attempt++) {
+    const res = await doFetch(`${base}/apps/${params.appId}/adapters/websocket/new`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${params.bearer}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ tracks: params.tracks }),
+    });
+    let json: unknown = null;
+    try {
+      json = await res.json();
+    } catch {
+      json = null;
+    }
+    const notReady = trackNotReady(json);
+    if (res.ok && !notReady) {
+      const obj = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
+      const id = obj.adapterId ?? obj.id;
+      return { adapterId: id != null ? String(id) : undefined, raw: json };
+    }
+    // Transient publish race (track not sending yet) → back off and retry the CREATE until the budget is spent.
+    if (notReady && attempt < maxAttempts) {
+      await sleep(delayMs(attempt));
+      continue;
+    }
+    // observability only — never the token; notReady distinguishes the race from a real upstream error.
+    console.warn(`sfu-ws-adapter status=${res.status} ok=${res.ok} notReady=${notReady} attempt=${attempt}`);
     throw new SfuAdapterError("UPSTREAM", `create websocket adapter returned ${res.status}`, 502);
   }
-  const obj = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
-  const id = obj.adapterId ?? obj.id;
-  return { adapterId: id != null ? String(id) : undefined, raw: json };
 }
 
 // ── 2. Packet wire decoder ───────────────────────────────────────────────────────────────────────────────
