@@ -27,10 +27,10 @@ describe("wrangler.toml stays INERT for raw-SFU recording", () => {
     expect(toml.length).toBeGreaterThan(0);
   });
 
-  it('RT_ENCODER is "managed" (the live, non-container path) — prod untouched', () => {
+  it('RT_ENCODER is "container" (Step D armed — raw-SFU recording; arm branch only, main stays "managed")', () => {
     const m = toml.match(/^\s*RT_ENCODER\s*=\s*"([^"]+)"/m);
     expect(m, "RT_ENCODER var must be present in wrangler.toml").not.toBeNull();
-    expect(m![1]).toBe("managed");
+    expect(m![1]).toBe("container");
   });
 
   it("the [[containers]] block IS LIVE (Step A armed the container infra — DO deploys)", () => {
