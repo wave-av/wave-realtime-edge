@@ -13,23 +13,45 @@
 //     muxer's RawSfuTap.videoEncoder / AudioEncoder seam. PURE transcode — no R2, no state, no creds.
 //   GET /health → 200 "ok" (the container readiness probe + the [[containers]] / docker HEALTHCHECK).
 //
-// SECURITY/SAFETY: body is capped (MAX_BODY) to bound memory; ffmpeg args are a fixed allowlist by
-// x-codec (never interpolated from request input → no arg injection); a transcode failure returns 502,
-// never crashes the server (the Worker's target is fail-open and drops the frame). No request logging of
-// payload bytes.
+// CODEC MATRIX (ADR adr-codec-matrix.md): the source codec (x-codec) is the DECODED frame format; an
+// OPTIONAL `x-target-codec` requests a specific output codec (vp9/av1/h264/h265/aac/…). When absent the
+// server emits the byte-unchanged DEFAULT (jpeg→VP8/IVF, pcm→Opus/Ogg). When present it selects the best
+// AVAILABLE encoder for THIS host (hardware-first, software fallback) and HONEST-FAILS (no silent codec
+// substitution) if the requested codec has no encoder. `GET /capabilities` reports the host's matrix.
+//
+// SECURITY/SAFETY: body is capped (MAX_BODY) to bound memory; ffmpeg args are built ONLY from the
+// registry/selection (encoder names are never interpolated from raw request input → no arg injection); a
+// transcode failure returns 502, never crashes the server (the Worker's target is fail-open and drops the
+// frame). No request logging of payload bytes.
 import http from "node:http";
 import { spawn } from "node:child_process";
+import { buildCommand } from "./command.mjs";
+import { probeCapability, emptyCapability } from "./capability.mjs";
+import { selectEncoder, CodecUnavailableError, UnknownCodecError } from "./select.mjs";
+import { CODECS } from "./codecs.mjs";
 
 const PORT = Number(process.env.PORT || 8080);
 const MAX_BODY = 8 * 1024 * 1024; // 8 MiB — one JPEG frame or a PCM chunk is far smaller; bounds memory.
 
-/** Fixed ffmpeg arg allowlists, keyed by SOURCE codec. NEVER built from request input (no injection). */
-const FFMPEG_ARGS = {
-  // JPEG (mjpeg) → VP8 in an IVF container (the muxer reads VP8 frames; IVF carries the frame cleanly).
-  jpeg: ["-hide_banner", "-loglevel", "error", "-f", "mjpeg", "-i", "-", "-c:v", "libvpx", "-f", "ivf", "-"],
-  // 16-bit-LE PCM @ 48kHz stereo → Opus in an Ogg container.
-  pcm: ["-hide_banner", "-loglevel", "error", "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "-", "-c:a", "libopus", "-f", "ogg", "-"],
-};
+/** Accepted SOURCE codecs (the decoded frame format the Worker POSTs). */
+const SOURCE_CODECS = new Set(["jpeg", "pcm"]);
+
+/**
+ * Host capability, probed lazily on first NON-default /encode (a target-codec request) or /capabilities,
+ * then cached. The DEFAULT path (no target) never needs it — libvpx/libopus are always in the image — so
+ * the proven path does not pay a probe cost and stays byte-identical even if ffmpeg -encoders is unusual.
+ * @type {import("./capability.mjs").Capability|null}
+ */
+let _cap = null;
+async function getCapability() {
+  if (_cap) return _cap;
+  try {
+    _cap = await probeCapability();
+  } catch {
+    _cap = emptyCapability(); // probe failed → empty set; target requests honest-fail, default unaffected.
+  }
+  return _cap;
+}
 
 /** Read the full request body into one Buffer, capping at MAX_BODY (over-cap → reject). */
 function readBody(req) {
@@ -50,11 +72,10 @@ function readBody(req) {
   });
 }
 
-/** Spawn ffmpeg with the allowlisted args for `codec`, pipe `input` to stdin, resolve the stdout bytes. */
-function transcode(codec, input) {
+/** Spawn ffmpeg with the (already-built, allowlisted) `args`, pipe `input` to stdin, resolve stdout bytes. */
+function transcode(args, input) {
   return new Promise((resolve, reject) => {
-    const args = FFMPEG_ARGS[codec];
-    if (!args) return reject(new Error(`unsupported codec: ${codec}`));
+    if (!Array.isArray(args) || args.length === 0) return reject(new Error("no ffmpeg args"));
     const ff = spawn("ffmpeg", args, { stdio: ["pipe", "pipe", "pipe"] });
     const out = [];
     let err = "";
@@ -78,12 +99,45 @@ const server = http.createServer(async (req, res) => {
       res.end("ok");
       return;
     }
+    // GET /capabilities — report THIS host's encoder matrix: which registry codecs have an available
+    // encoder, and the chosen impl (encoder/kind/accel). Additive, read-only; no effect on /encode.
+    if (req.method === "GET" && req.url === "/capabilities") {
+      const cap = await getCapability();
+      const codecs = {};
+      for (const [name, entry] of Object.entries(CODECS)) {
+        try {
+          const sel = selectEncoder(entry.media, name, cap.encoders);
+          codecs[name] = { media: entry.media, available: true, encoder: sel.encoder, encoderKind: sel.kind, accel: sel.accel };
+        } catch {
+          codecs[name] = { media: entry.media, available: false };
+        }
+      }
+      const payload = JSON.stringify({ hwaccels: [...cap.hwaccels], codecs });
+      res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(payload) });
+      res.end(payload);
+      return;
+    }
     if (req.method === "POST" && (req.url === "/encode" || req.url === "/encode/")) {
-      const codec = String(req.headers["x-codec"] || "").toLowerCase();
-      if (!FFMPEG_ARGS[codec]) {
+      const source = String(req.headers["x-codec"] || "").toLowerCase();
+      if (!SOURCE_CODECS.has(source)) {
         res.writeHead(400, { "content-type": "text/plain" });
         res.end("bad x-codec (expected jpeg|pcm)");
         return;
+      }
+      // OPTIONAL target codec. Absent → byte-unchanged DEFAULT path (no capability probe needed).
+      const target = String(req.headers["x-target-codec"] || "").toLowerCase() || null;
+      let cmd;
+      try {
+        const available = target ? (await getCapability()).encoders : new Set();
+        cmd = buildCommand({ sourceCodec: source, targetCodec: target, available });
+      } catch (e) {
+        // HONEST-FAIL: unknown/unavailable requested codec → 400 (caller error), never a silent substitute.
+        if (e instanceof CodecUnavailableError || e instanceof UnknownCodecError) {
+          res.writeHead(400, { "content-type": "text/plain" });
+          res.end(`codec not available: ${e.message}`);
+          return;
+        }
+        throw e;
       }
       const body = await readBody(req);
       if (body.length === 0) {
@@ -91,8 +145,14 @@ const server = http.createServer(async (req, res) => {
         res.end("empty body");
         return;
       }
-      const encoded = await transcode(codec, body);
-      res.writeHead(200, { "content-type": "application/octet-stream", "content-length": encoded.length });
+      const encoded = await transcode(cmd.args, body);
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "content-length": encoded.length,
+        "x-encoder": cmd.encoder, // observability: which encoder actually ran (default = libvpx/libopus).
+        "x-output-codec": cmd.target,
+        "x-output-container": cmd.container,
+      });
       res.end(encoded);
       return;
     }
