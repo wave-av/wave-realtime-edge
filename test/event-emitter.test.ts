@@ -22,8 +22,8 @@ import {
 import type { ParticipantSessionUsage } from "../src/metering.js";
 
 const MIN = 60_000;
-const SECRET = "shared-webhook-secret";
-const armed: EventEmitEnv = { WAVE_REALTIME_EVENTS_EMIT: "1", WAVE_REALTIME_WEBHOOK_SECRET: SECRET };
+const TEST_HMAC = "shared-webhook-secret";
+const armed: EventEmitEnv = { WAVE_REALTIME_EVENTS_EMIT: "1", WAVE_REALTIME_WEBHOOK_SECRET: TEST_HMAC };
 
 const usage: ParticipantSessionUsage = {
   org: "org_a",
@@ -39,13 +39,13 @@ const usage: ParticipantSessionUsage = {
 describe("isEmitArmed — DORMANT until flag + secret", () => {
   it("false when flag unset (default — fully inert)", () => {
     expect(isEmitArmed({})).toBe(false);
-    expect(isEmitArmed({ WAVE_REALTIME_WEBHOOK_SECRET: SECRET })).toBe(false);
+    expect(isEmitArmed({ WAVE_REALTIME_WEBHOOK_SECRET: TEST_HMAC })).toBe(false);
   });
   it("false when flag set but secret missing (cannot sign → inert)", () => {
     expect(isEmitArmed({ WAVE_REALTIME_EVENTS_EMIT: "1" })).toBe(false);
   });
   it("false when flag is anything other than exactly '1'", () => {
-    expect(isEmitArmed({ WAVE_REALTIME_EVENTS_EMIT: "true", WAVE_REALTIME_WEBHOOK_SECRET: SECRET })).toBe(false);
+    expect(isEmitArmed({ WAVE_REALTIME_EVENTS_EMIT: "true", WAVE_REALTIME_WEBHOOK_SECRET: TEST_HMAC })).toBe(false);
   });
   it("true only when flag='1' AND secret set", () => {
     expect(isEmitArmed(armed)).toBe(true);
@@ -114,13 +114,13 @@ describe("event builders — shape matches the #4985 schema", () => {
 
 describe("signBody — hex HMAC-SHA256 (the #4985 wave-signature)", () => {
   it("produces a 64-char lowercase hex digest, deterministic for same body+secret", async () => {
-    const sig1 = await signBody('{"a":1}', SECRET);
-    const sig2 = await signBody('{"a":1}', SECRET);
+    const sig1 = await signBody('{"a":1}', TEST_HMAC);
+    const sig2 = await signBody('{"a":1}', TEST_HMAC);
     expect(sig1).toMatch(/^[0-9a-f]{64}$/);
     expect(sig1).toBe(sig2);
   });
   it("differs for a different body", async () => {
-    expect(await signBody('{"a":1}', SECRET)).not.toBe(await signBody('{"a":2}', SECRET));
+    expect(await signBody('{"a":1}', TEST_HMAC)).not.toBe(await signBody('{"a":2}', TEST_HMAC));
   });
 });
 
@@ -143,7 +143,7 @@ describe("emitEvent — flag-off no-op, signed POST when armed, fail-open", () =
     expect(headers["content-type"]).toBe("application/json");
     // signature must be the HMAC of the EXACT body sent (sign-then-send the same string)
     const rawBody = init.body as string;
-    expect(headers["wave-signature"]).toBe(await signBody(rawBody, SECRET));
+    expect(headers["wave-signature"]).toBe(await signBody(rawBody, TEST_HMAC));
     expect(JSON.parse(rawBody)).toEqual(event);
   });
 
