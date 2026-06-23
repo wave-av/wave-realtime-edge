@@ -55,6 +55,16 @@ export interface RtkWebhookEvent {
   recording: RtkRecording;
 }
 
+/** LK-rip #77 — payload emitted once after a recording pull lands byte-exact (egress lifecycle + meter). */
+export interface EgressCompletedEvent {
+  egressId: string; // == the RTK meetingId == the recording sessionId
+  meetingId: string;
+  org: string;
+  key: string; // the canonical R2 object the pull wrote
+  bytes: number;
+  durationS?: number;
+}
+
 /** Decode a base64 string to bytes. Throws on invalid base64 (atob) — callers treat a throw as "reject". */
 export function b64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64);
@@ -307,6 +317,12 @@ export interface WebhookDeps {
   log?(msg: string, fields: Record<string, unknown>): void;
   /** PULL mode: when present, an UPLOADED event pulls the finished recording into our R2 (absent → observe-only). */
   sink?: RecordingPullSink;
+  /** LK-rip #77 egress lifecycle: when present, fire EXACTLY ONCE after the pull lands byte-exact on UPLOADED —
+   * emits `egress.completed` + meters `wave_sfu_egress_gb` (overage-only, see metering.ts). Injected so it is
+   * unit-fakeable; absent → no emit (observe-only). Idempotent: only fires on a non-null pull RESULT (a
+   * deterministic key means an Inngest/webhook retry that re-pulls the SAME object still emits once per landed
+   * recording, and the gateway de-dupes the meter by the stable event_id below). */
+  emitEgressCompleted?(ev: EgressCompletedEvent): Promise<void>;
   /** Background a long pull off the request (live: ctx.waitUntil). Absent → the pull is awaited (tests assert it). */
   waitUntil?(p: Promise<unknown>): void;
 }
@@ -351,13 +367,33 @@ export async function handleRecordingWebhook(request: Request, deps: WebhookDeps
     // won't re-deliver) — so we durably enqueue a pending-pull record the scheduled() cron reconcile re-pulls.
     const sink = deps.sink;
     if (sink) {
-      const pull = pullUploadedRecording(r, sink, deps.log).catch(async (err) => {
-        deps.log?.("rt-pull-failed", { ...base, error: String(err) });
-        if (r.meetingId && sink.markPending) {
-          await sink.markPending(r.id, r.meetingId).catch(() => {}); // durable retry; itself best-effort
-        }
-        return null;
-      });
+      const pull = pullUploadedRecording(r, sink, deps.log)
+        .then(async (result) => {
+          // LK-rip #77: fire the egress lifecycle event + meter EXACTLY ONCE, only after the pull landed a real
+          // object (non-null result). A retried webhook re-pulls the SAME deterministic key and re-emits, but the
+          // gateway de-dupes the meter on the stable event_id (egressId:wave_sfu_egress_gb), so billing is once.
+          if (result && deps.emitEgressCompleted && r.meetingId) {
+            const org = (await sink.lookupOrg(r.meetingId).catch(() => null)) ?? UNATTRIBUTED_ORG;
+            await deps
+              .emitEgressCompleted({
+                egressId: r.meetingId,
+                meetingId: r.meetingId,
+                org,
+                key: result.key,
+                bytes: result.bytes,
+                durationS: r.recordingDuration,
+              })
+              .catch((err) => deps.log?.("rt-egress-emit-failed", { ...base, error: String(err) }));
+          }
+          return result;
+        })
+        .catch(async (err) => {
+          deps.log?.("rt-pull-failed", { ...base, error: String(err) });
+          if (r.meetingId && sink.markPending) {
+            await sink.markPending(r.id, r.meetingId).catch(() => {}); // durable retry; itself best-effort
+          }
+          return null;
+        });
       if (deps.waitUntil) deps.waitUntil(pull);
       else await pull;
     }
