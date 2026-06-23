@@ -71,6 +71,36 @@ export function isVp8Keyframe(payload: Uint8Array): boolean {
 }
 
 /**
+ * RT-R10 (#78) — extract the REAL frame geometry from a VP8 KEYFRAME header (RFC 6386 §9.1).
+ *
+ * Why: the WebM muxer declares PixelWidth/PixelHeight in its Tracks header, but it only learns the true
+ * dimensions from the VP8 bitstream — VP8 is self-describing, so the declared dims (placeholder 1280×720)
+ * were wrong on the proven recording (320×240 source ⇒ Tracks said 1280×720). The video glue reads the dims
+ * from the first keyframe and threads them into the muxer before the header is written.
+ *
+ * VP8 keyframe layout (little-endian 16-bit fields, each with a 2-bit upscale factor in the HIGH bits so
+ * mask &0x3fff to get the raw pixel dimension):
+ *   bytes 0-2  uncompressed data chunk tag (frame type / version / show_frame / first-partition size)
+ *   bytes 3-5  the keyframe start code  0x9d 0x01 0x2a
+ *   bytes 6-7  u16 LE width  (low 14 bits = width,  high 2 bits = horizontal scale)
+ *   bytes 8-9  u16 LE height (low 14 bits = height, high 2 bits = vertical scale)
+ *
+ * PURE + fail-soft: returns null (never throws) when the payload is not a VP8 keyframe, is too short, lacks
+ * the 0x9d 0x01 0x2a start code, or decodes a 0 dimension. A null result ⇒ the caller keeps the muxer defaults.
+ */
+export function vp8KeyframeDimensions(payload: Uint8Array): { width: number; height: number } | null {
+  // Need bytes 0..9 and a keyframe (bit0 of byte0 === 0).
+  if (payload.length < 10) return null;
+  if (!isVp8Keyframe(payload)) return null;
+  // The 3-byte start code MUST be present at bytes 3-5 for a keyframe; absent ⇒ not a parseable keyframe header.
+  if (payload[3] !== 0x9d || payload[4] !== 0x01 || payload[5] !== 0x2a) return null;
+  const width = (payload[6] | (payload[7] << 8)) & 0x3fff; // low 14 bits (high 2 bits = horizontal scale)
+  const height = (payload[8] | (payload[9] << 8)) & 0x3fff; // low 14 bits (high 2 bits = vertical scale)
+  if (width === 0 || height === 0) return null; // a 0 dimension is never valid — keep the muxer defaults
+  return { width, height };
+}
+
+/**
  * Parse an IVF buffer (DKIF file header + N frames) → the list of RAW VP8 frames with keyframe flags.
  *
  * Tolerant + fail-soft (the bytes come from a best-effort transcode, never trusted blindly):
