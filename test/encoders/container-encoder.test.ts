@@ -134,7 +134,8 @@ describe("ContainerHandle.onPublish — audio opens a tap + posts the create-ada
     await handle.whenAdapterSettled(); // the create is backgrounded (never blocks publish) — await it to assert
     expect(seen.url).toBe(`https://rtc.live.cloudflare.com/v1/apps/${APP_ID}/adapters/websocket/new`);
     const body = JSON.parse(String(seen.init?.body));
-    expect(body.tracks[0].endpoint).toBe(`${DEFAULT_RECORDER_ENDPOINT_BASE}/org_x/${SESSION.sessionId}/mic`);
+    // endpoint carries :room (r1) so frames reach the SAME RoomDO (org:room) that holds this tap.
+    expect(body.tracks[0].endpoint).toBe(`${DEFAULT_RECORDER_ENDPOINT_BASE}/org_x/r1/${SESSION.sessionId}/mic`);
     expect(body.tracks[0].outputCodec).toBe("pcm");
     expect(handle.tapsByTrack.has("mic")).toBe(true);
   });

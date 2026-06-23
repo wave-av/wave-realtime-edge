@@ -1,8 +1,9 @@
-// RT-R9 P2 — Worker recorder WS route /v1/realtime/recorder/:org/:sessionId/:trackName. Stub ROOM namespace;
+// RT-R9 P2 — Worker recorder WS route /v1/realtime/recorder/:org/:room/:sessionId/:trackName. Stub ROOM namespace;
 // no live DO/WS runtime. Proves: gated behind the internal-secret chokepoint; DORMANT unless RT_RECORD==='1'
 // (disarmed → 501, so nothing dials it); non-upgrade → 426; an Upgrade with RT_RECORD='1' → 101 + the DO id is
-// keyed `${org}:${sessionId}` (per-org isolation). INERT: the live wrangler default (RT_RECORD set but
-// RT_ENCODER managed) still 101s the route but the DO feed is a no-op for managed — covered in orchestration.
+// keyed `${org}:${room}` — the SAME DO the publish path created the tap in (REGRESSION GUARD: keying by sessionId
+// instead routes frames to a tap-less DO and silently records nothing). INERT: the live wrangler default
+// (RT_RECORD set but RT_ENCODER managed) still 101s the route but the DO feed is a no-op for managed.
 import { describe, it, expect, beforeAll } from "vitest";
 import worker from "../src/worker.js";
 import { mintRecorderToken } from "../src/encoders/recorder-auth.js";
@@ -47,7 +48,7 @@ function env(over: Record<string, unknown> = {}) {
   return { ROOM: stubRoomNamespace(), ...over } as never;
 }
 
-const PATH = "/v1/realtime/recorder/org_x/sess_ABC12345/mic";
+const PATH = "/v1/realtime/recorder/org_x/r1/sess_ABC12345/mic"; // :org/:room/:sessionId/:trackName
 
 function req(headers: Record<string, string> = {}): Request {
   return new Request(`https://rt.wave.online${PATH}`, { method: "GET", headers });
@@ -135,13 +136,23 @@ describe("recorder route — upgrade + routing", () => {
     const res = await worker.fetch(req(), env({ RT_RECORD: "1" }), ctx);
     expect(res.status).toBe(426);
   });
-  it("armed + upgrade → upgraded (not 4xx) and DO id keyed `${org}:${sessionId}`", async () => {
+  it("armed + upgrade → upgraded (not 4xx) and DO id keyed `${org}:${room}` (NOT sessionId — the tap's DO)", async () => {
     accepted = 0;
     const ns = stubRoomNamespace();
     const res = await worker.fetch(req({ Upgrade: "websocket" }), env({ RT_RECORD: "1", ROOM: ns }), ctx);
     expect(res.status).toBeLessThan(400);
     expect(accepted).toBe(1);
-    expect(ns.seen.name).toBe("org_x:sess_ABC12345");
+    expect(ns.seen.name).toBe("org_x:r1"); // regression: must address the publish-path DO (org:room), not org:sessionId
+  });
+  it("a legacy 3-segment path (no :room) does NOT match the recorder route → 501 fallback (never a tap-less accept)", async () => {
+    accepted = 0;
+    const res = await worker.fetch(
+      new Request("https://rt.wave.online/v1/realtime/recorder/org_x/sess_ABC12345/mic", { method: "GET", headers: { Upgrade: "websocket" } }),
+      env({ WAVE_INTERNAL_SECRET: "s", RT_RECORD: "1" }),
+      ctx,
+    );
+    expect(res.status).toBe(501); // unmatched → REALTIME_NOT_IMPLEMENTED fallback, not a recorder accept
+    expect(accepted).toBe(0); // and crucially never opened a WS to a tap-less DO
   });
   it("armed + upgrade but no ROOM binding → 400 (loud, not silent)", async () => {
     const res = await worker.fetch(req({ Upgrade: "websocket" }), { RT_RECORD: "1" } as never, ctx);

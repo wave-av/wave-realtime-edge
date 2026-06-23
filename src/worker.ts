@@ -70,8 +70,12 @@ const recordingWebhookDeps = liveWebhookDeps();
 const REALTIME_INTENTS = new Set(["join", "publish", "subscribe", "renegotiate", "leave"]);
 /** POST /v1/realtime/rooms/:room/:intent */
 const REALTIME_ROUTE = /^\/v1\/realtime\/rooms\/([^/]+)\/([^/]+)\/?$/;
-/** RT-R9 hibernatable WS recorder route the SFU dials OUT to: /v1/realtime/recorder/:org/:sessionId/:trackName */
-const RECORDER_ROUTE = /^\/v1\/realtime\/recorder\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
+/** RT-R9 hibernatable WS recorder route the SFU dials OUT to: /v1/realtime/recorder/:org/:room/:sessionId/:trackName.
+ *  :room is REQUIRED so a frame addresses the SAME RoomDO (keyed `${org}:${room}`) that holds the tap created on the
+ *  publish path — without it the frame lands on a DIFFERENT DO (keyed by sessionId) with no tap and is silently
+ *  dropped. The capability token still binds ONLY (org, sessionId, trackName); room is a routing key, not part of the
+ *  signed identity (a wrong room routes to a tap-less DO — a harmless no-op, never a forgery). */
+const RECORDER_ROUTE = /^\/v1\/realtime\/recorder\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
 /** Segment guards for the recorder route (SSRF-safe DO-key + frame-forward params). */
 const SAFE_SEGMENT = /^[A-Za-z0-9_:.-]{1,128}$/;
 /** Whitelists for the UNTRUSTED gateway-stamped role/type values (reject anything off-list). */
@@ -242,15 +246,15 @@ export default {
 			}
 		}
 
-		// ── RT-R9 raw-SFU recorder WS route — /v1/realtime/recorder/:org/:sessionId/:trackName ──
+		// ── RT-R9 raw-SFU recorder WS route — /v1/realtime/recorder/:org/:room/:sessionId/:trackName ──
 		// The CF Realtime SFU dials OUT to this hibernatable WS endpoint (per the container-encoder adapter) and
 		// pushes ONE track's media as binary frames; each frame is forwarded to the room's DO tap. INERT: gated
 		// behind the SAME internal-secret chokepoint AND RT_RECORD==="1" — unarmed (live default) it 404s, so
 		// nothing can dial it. A non-Upgrade request → 426. The DO feed is fail-open (ctx.waitUntil), never blocks.
 		const recMatch = url.pathname.match(RECORDER_ROUTE);
 		if (recMatch) {
-			const [, rorg, rsession, rtrack] = recMatch;
-			if (![rorg, rsession, rtrack].every((s) => SAFE_SEGMENT.test(s)) || !env.ROOM) {
+			const [, rorg, rroom, rsession, rtrack] = recMatch;
+			if (![rorg, rroom, rsession, rtrack].every((s) => SAFE_SEGMENT.test(s)) || !env.ROOM) {
 				return Response.json({ error: "BAD_REQUEST", message: "invalid recorder path or no ROOM binding" }, { status: 400 });
 			}
 			// AUTH — accept EITHER a valid scoped capability token (?t=, how the third-party SFU dials in; it
@@ -275,8 +279,9 @@ export default {
 					{ status: 426 },
 				);
 			}
-			// Open a server WebSocket and forward every BINARY frame to the room's DO tap (per-org keyed). The DO
-			// feed is fully fail-open — a recording error never affects the live media the SFU is also pushing.
+			// Open a server WebSocket and forward every BINARY frame to the room's DO tap (keyed `${org}:${room}` —
+			// the SAME DO the publish path created the tap in). The DO feed is fully fail-open — a recording error
+			// never affects the live media the SFU is also pushing.
 			// WebSocketPair is a Workers-runtime global; referenced off globalThis so unit tests can stub it.
 			const WSP = (globalThis as unknown as { WebSocketPair?: new () => Record<string, WebSocket> }).WebSocketPair;
 			if (!WSP) {
@@ -286,7 +291,7 @@ export default {
 			const client = (pair as unknown as Record<string, WebSocket>)[0];
 			const server = (pair as unknown as Record<string, WebSocket>)[1];
 			server.accept();
-			const id = env.ROOM.idFromName(`${rorg}:${rsession}`);
+			const id = env.ROOM.idFromName(`${rorg}:${rroom}`); // SAME DO as publish (org:room) → the tap lives here
 			const stub = env.ROOM.get(id);
 			server.addEventListener("message", (ev: MessageEvent) => {
 				const data = ev.data;
