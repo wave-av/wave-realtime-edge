@@ -109,6 +109,28 @@ const EGRESS_INTENTS = new Set(["start", "stop", "info"]);
 const EGRESS_ROUTE = /^\/rtk\/egress\/([^/]+)\/?$/;
 /** Segment guards for the recorder route (SSRF-safe DO-key + frame-forward params). */
 const SAFE_SEGMENT = /^[A-Za-z0-9_:.-]{1,128}$/;
+
+// ── WAVE-native ingress listeners (LK-rip #42) — POST /v1/realtime/ingress/:protocol/:intent ──
+// Server-side counterpart to wave-gateway PR #204 (which forwards this exact path shape as the identity  # guard:allow cross-repo PR reference in a design comment, not a leak
+// edge path) and wave-surfer-connect PR #4982's WaveIngressProviderService contract. The protocol + intent  # guard:allow cross-repo PR reference in a design comment, not a leak
+// allowlist MUST match #204 (rtmp/whip/srt/url + create/delete; plus protocol-less management). The
+// gateway already validates the shape; we re-validate here (defense in depth, never trust transport).
+//
+// FEASIBILITY (correctness-by-design, no fabrication): a Cloudflare Worker cannot accept raw inbound TCP
+// (RTMP) or UDP (SRT) sockets, and has no media pipeline to decode an arbitrary pulled URL into SFU tracks.
+//   • WHIP  → LIVE: WHIP is WebRTC-over-HTTP (POST an SDP offer, return an SDP answer) — exactly the SFU
+//     newSession(offer)→answer the room/join path already performs. We forward WHIP create to the Room DO
+//     `join` intent (reusing org:room isolation + admission), returning the SFU answer as the WHIP 201 body.
+//   • rtmp / srt / url → honest 501 (ingress_protocol_requires_vm_listener): these REQUIRE an out-of-Worker
+//     VM listener (raw socket / media decode) that bridges into the room — a separate follow-up slice. We do
+//     NOT fake a Worker listener for them.
+const INGRESS_ROUTE = /^\/v1\/realtime\/ingress\/([a-z]+)\/([a-z]+)\/?$/;
+/** Worker-feasible ingress protocols served LIVE here. WHIP only (WebRTC-over-HTTP). */
+const INGRESS_LIVE_PROTOCOLS = new Set(["whip"]);
+/** Protocols that need an out-of-Worker VM listener → honest 501 with a machine-readable marker. */
+const INGRESS_VM_PROTOCOLS = new Set(["rtmp", "srt", "url"]);
+/** Per-protocol intents (must match gateway #204's INGRESS_PROTOCOL_INTENTS). */
+const INGRESS_PROTOCOL_INTENTS = new Set(["create", "delete"]);
 /** Whitelists for the UNTRUSTED gateway-stamped role/type values (reject anything off-list). */
 const ROLES = new Set(["host", "speaker", "viewer"]);
 const ROOM_TYPE_VALUES = new Set(["meeting", "webinar", "event", "breakout"]);
@@ -477,6 +499,94 @@ export default {
 			const id = env.ROOM.idFromName(`${org}:${room}`);
 			const stub = env.ROOM.get(id);
 			const intentReq = new Request(`https://room/${intent}`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ ...payload, ctx: { org, room, participantId, role, type, anon } }),
+			});
+			return stub.fetch(intentReq);
+		}
+
+		// ── WAVE-native ingress listeners — POST /v1/realtime/ingress/:protocol/:intent (LK-rip #42) ──
+		// Same gateway-trust chokepoint + org/room/DO wiring as the rooms block above. WHIP is LIVE
+		// (WebRTC-over-HTTP → SFU); rtmp/srt/url are honest 501 (need an out-of-Worker VM listener).
+		const ingMatch = request.method === "POST" ? url.pathname.match(INGRESS_ROUTE) : null;
+		if (ingMatch) {
+			const protocol = ingMatch[1];
+			const intent = ingMatch[2];
+			// Defense in depth: reject anything off the allowlist (the gateway already validated, but never trust transport).
+			if (!INGRESS_PROTOCOL_INTENTS.has(intent)) {
+				return Response.json({ error: "INGRESS_BAD_INTENT", message: `unknown ingress intent: ${intent}` }, { status: 404 });
+			}
+			if (!INGRESS_LIVE_PROTOCOLS.has(protocol) && !INGRESS_VM_PROTOCOLS.has(protocol)) {
+				// e.g. whep (egress, not ingress) or any unknown protocol.
+				return Response.json({ error: "INGRESS_UNSUPPORTED_PROTOCOL", protocol }, { status: 404 });
+			}
+
+			const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
+			if (denied) return denied;
+
+			const org = request.headers.get("x-wave-org") ?? "";
+			if (!org) {
+				return Response.json(
+					{ error: "BAD_REQUEST", message: "missing org context (x-wave-org) — stamped by the gateway" },
+					{ status: 400 },
+				);
+			}
+
+			// rtmp/srt/url: a raw TCP/UDP listener or media-decode pipeline cannot run on a Worker. Honest 501
+			// with a machine-readable marker so the gateway/WSC can branch — NOT a fabricated Worker listener.
+			if (INGRESS_VM_PROTOCOLS.has(protocol)) {
+				return Response.json(
+					{ error: "ingress_protocol_requires_vm_listener", protocol, intent },
+					{ status: 501 },
+				);
+			}
+
+			// WHIP (LIVE). delete has no SFU teardown primitive of its own yet (sessions GC on idle / leave),
+			// so a WHIP delete is acknowledged idempotently without touching the room.
+			if (intent === "delete") {
+				return Response.json({ ok: true, protocol, intent }, { status: 200 });
+			}
+			if (!env.ROOM) {
+				// config-no-silent-noop: a missing DO binding must be loud, not a silent 501.
+				return Response.json(
+					{ error: "REALTIME_NOT_CONFIGURED", message: "ROOM durable object binding is not configured" },
+					{ status: 503 },
+				);
+			}
+
+			// WHIP create: the body is the WebRTC SDP offer (+ a room/stream id + participant). We forward to the
+			// Room DO `join` intent — which mints the SFU session from the offer and returns the SFU answer — and
+			// surface that as the WHIP 201 (the publisher is now in the room, exactly like a browser join). Room
+			// isolation is the DO id (org:room); role is gateway-stamped (x-wave-role), validated as in rooms.
+			let payload: Record<string, unknown> = {};
+			try {
+				payload = (await request.json()) as Record<string, unknown>;
+			} catch {
+				payload = {}; // empty/invalid JSON → validated inside the DO/signaling layer
+			}
+			// The room/stream the source publishes into: explicit body.room/streamKey, else the participant id.
+			const room =
+				typeof payload.room === "string" ? payload.room :
+				typeof payload.streamKey === "string" ? payload.streamKey : "";
+			if (!room) {
+				return Response.json(
+					{ error: "BAD_REQUEST", message: "WHIP ingress requires a room or streamKey in the body" },
+					{ status: 400 },
+				);
+			}
+			const participantId = typeof payload.participantId === "string" ? payload.participantId : `whip-${room}`;
+			const role = ROLES.has(request.headers.get("x-wave-role") ?? "")
+				? (request.headers.get("x-wave-role") as string)
+				: "speaker"; // an ingress source publishes → default speaker (can be narrowed by the gateway)
+			const rawType = request.headers.get("x-wave-room-type") ??
+				(typeof payload.type === "string" ? payload.type : undefined);
+			const type = rawType !== undefined && ROOM_TYPE_VALUES.has(rawType) ? rawType : undefined;
+			const anon = (request.headers.get("x-wave-anon") ?? "") !== "";
+
+			const id = env.ROOM.idFromName(`${org}:${room}`);
+			const stub = env.ROOM.get(id);
+			const intentReq = new Request("https://room/join", {
 				method: "POST",
 				headers: { "content-type": "application/json" },
 				body: JSON.stringify({ ...payload, ctx: { org, room, participantId, role, type, anon } }),
