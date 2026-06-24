@@ -47,10 +47,15 @@ GATEWAY_BASE_URL = "https://api.wave.online"
 # ── B3 (#98) — IETF WHIP v1 ingest surface (/v1/whip/*). DEFAULT OFF / INERT. ──
 # WHIP_INGEST_ENABLED gates the whole /v1/whip/{publish,resource/{id}} listener (src/whip.ts). Absent/"0" →
 # the surface is inert: a /v1/whip/* request falls through to the honest 501 catch-all (worker.ts), exactly
-# as before this builder. Flipping it to "1" is a ◆ Jake-named crossing (whip-v1-frozen-contract.md §8): it
-# activates the NEW LIVE INGEST path and REQUIRES the gateway WHIP_EDGE origin + the shared x-wave-internal
-# gateway-trust secret on both + the STRIPE_PRICE_WHIP_INGEST_MIN binding. Left OFF here so the deploy is inert.
-WHIP_INGEST_ENABLED = "0"
+# as before this builder. ARMED "1" (#77 go-live, Jake-authorized 2026-06-24). Preconditions MET:
+#   • gateway WHIP_EDGE=https://rt.wave.online is set — POST /v1/whip/publish with a real whip:write key proved
+#     the 503→501 transition (gateway auth→scope→forward all green; only this flag gates the listener);
+#   • the x-wave-internal seal is the LIVE realtime secret (this worker's WAVE_INTERNAL_SECRET == gateway
+#     WAVE_REALTIME_INTERNAL_SECRET, already proven by realtime forwarding) — no new secret;
+#   • metering is counts-but-bills-$0 until STRIPE_PRICE_WHIP_INGEST_MIN is bound (money ◆, bill-from-launch).
+# SAFE rollout: ingest REQUIRES the whip:write scope, which NO customer key holds yet (only WAVE test keys), so
+# enabling customers stays a deliberate per-key scope-grant — flipping this exposes nothing broken to customers.
+WHIP_INGEST_ENABLED = "1"
 
 # ── RT-P1.5 — pluggable recording encoders (design §6). DEFAULT DISARMED / DORMANT. ──
 # RT_RECORD arms recording at all; absent/"0" → selectEncoder() returns the inert DisarmedEncoder (begin →
