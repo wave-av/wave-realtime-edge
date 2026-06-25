@@ -17,8 +17,11 @@ name: deploy
 #   CLOUDFLARE_API_TOKEN   — CF API token: Workers Scripts:Edit, Workers KV:Edit, Zone Workers Routes:Edit
 #   CLOUDFLARE_ACCOUNT_ID  — the WAVE CF account id
 #
-# Worker runtime secrets are NOT set here — provision them with the `sync-secrets.yml` workflow_dispatch job
-# (Doppler wave/prd -> stdin -> wrangler secret put; the permanent capable-node path). They include:
+# Worker runtime secrets are NOT set here — and NOT from this PUBLIC repo's CI (GitHub won't expose the org
+# DOPPLER_TOKEN to a public repo, and prod creds must never live here). Provision them from the PRIVATE
+# foundation hub: run wave-av/wave-foundation `provision-worker-secrets.yml` (workflow_dispatch) with
+# worker=wave-realtime-edge and secret_names="WAVE_SERVICE_TOKEN ELEVENLABS_API_KEY ELEVENLABS_VOICE_ID
+# CF_CALLS_APP_ID CF_CALLS_APP_SECRET" — values flow Doppler -> foundation CI -> Cloudflare. They include:
 #   CF_CALLS_APP_ID, CF_CALLS_APP_SECRET   — CF Realtime SFU app creds (sfu.ts)
 #   WAVE_SERVICE_TOKEN                     — gateway bearer: metering tap (room.ts) AND, via
 #                                            normalizeGatewayEnv, the voice-agent LLM/STT/tools paths

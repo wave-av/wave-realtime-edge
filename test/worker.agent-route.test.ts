@@ -44,6 +44,10 @@ describe("inert without VOICE_AGENT_PROVIDER=wave", () => {
     const res = await worker.fetch(new Request("https://rt/v1/realtime/agents/egress/o/r/sess_abc12345/mic", { headers: { Upgrade: "websocket" } }), {} as never, ctx);
     expect(res.status).toBe(501);
   });
+  it("ingest route falls through to 501", async () => {
+    const res = await worker.fetch(new Request("https://rt/v1/realtime/agents/ingest/o/r/sess_abc12345/agent-a1", { headers: { Upgrade: "websocket" } }), {} as never, ctx);
+    expect(res.status).toBe(501);
+  });
 });
 
 describe("dispatch (flag on)", () => {
@@ -87,5 +91,26 @@ describe("egress WS route (flag on)", () => {
   it("401 with neither a token nor the internal header when the secret is set", async () => {
     const res = await worker.fetch(new Request("https://rt/v1/realtime/agents/egress/org1/r1/sess_abc12345/mic", { headers: { Upgrade: "websocket" } }), { ...base, WAVE_INTERNAL_SECRET: "s", AGENT_SESSION: stubAgentNs() } as never, ctx);
     expect(res.status).toBe(401);
+  });
+});
+
+describe("ingest WS route (flag on)", () => {
+  const base = { VOICE_AGENT_PROVIDER: "wave" };
+  it("426 when not a websocket upgrade", async () => {
+    const res = await worker.fetch(new Request("https://rt/v1/realtime/agents/ingest/org1/r1/sess_abc12345/agent-a1"), { ...base, AGENT_SESSION: stubAgentNs() } as never, ctx);
+    expect(res.status).toBe(426);
+  });
+  it("401 with neither a token nor the internal header when the secret is set", async () => {
+    const res = await worker.fetch(new Request("https://rt/v1/realtime/agents/ingest/org1/r1/sess_abc12345/agent-a1", { headers: { Upgrade: "websocket" } }), { ...base, WAVE_INTERNAL_SECRET: "s", AGENT_SESSION: stubAgentNs() } as never, ctx);
+    expect(res.status).toBe(401);
+  });
+  it("forwards the upgrade to the DO keyed org:room (same DO as bind + egress)", async () => {
+    const ns = stubAgentNs();
+    const secret = "s";
+    const tok = await mintRecorderToken(secret, "org1", "sess_abc12345", "agent-a1");
+    const res = await worker.fetch(new Request(`https://rt/v1/realtime/agents/ingest/org1/r1/sess_abc12345/agent-a1?t=${tok}`, { headers: { Upgrade: "websocket" } }), { ...base, WAVE_INTERNAL_SECRET: secret, AGENT_SESSION: ns } as never, ctx);
+    expect(res.status).toBeLessThan(400);
+    expect(ns.seen.name).toBe("org1:r1");
+    expect(ns.seen.forwards[0].url).toContain("/ingest");
   });
 });

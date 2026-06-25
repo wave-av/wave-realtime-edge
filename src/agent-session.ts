@@ -328,6 +328,51 @@ export class AgentSessionDO {
       }
       return new Response(null, { status: 204 });
     }
+    // The agent INGEST WS: the SFU dials IN to PULL the agent's published audio (createIngestAdapter
+    // location:"local"). We perform the upgrade HERE so THIS DO owns the live socket — buildMediaDeps()
+    // .ingestSocket() reads `this.ingest`, so both the echo core and the turn-taking core publish the agent's
+    // PCM through this same socket. Without this leg the agent could hear the room (egress) but never speak
+    // back (every outbound frame was dropped at AgentSessionCore.echoFrame's `if (!sock) return`).
+    if (path === "ingest" && (request.headers.get("Upgrade") ?? "").toLowerCase() === "websocket") {
+      const WSP = (globalThis as unknown as { WebSocketPair?: new () => Record<string, WebSocket> }).WebSocketPair;
+      if (!WSP) {
+        return Response.json({ error: "REALTIME_NOT_CONFIGURED", message: "WebSocketPair unavailable" }, { status: 503 });
+      }
+      const pair = new WSP();
+      const client = (pair as unknown as Record<string, WebSocket>)[0];
+      const server = (pair as unknown as Record<string, WebSocket>)[1];
+      server.accept();
+      try {
+        (server as unknown as { binaryType?: string }).binaryType = "arraybuffer";
+      } catch {
+        /* binaryType not settable on some runtimes — we only SEND on this socket, so it's non-fatal */
+      }
+      // Hold the live socket as the ingest sink. Null it on close/error so a dropped SFU connection stops sends
+      // cleanly; the SFU re-dials on reconnect → a fresh upgrade installs a new sink (the `===` guard means a
+      // late close event from an old socket can't clear a newer one).
+      const sink: IngestSocket = {
+        send: (d) => server.send(d),
+        close: () => {
+          try {
+            server.close();
+          } catch {
+            /* best-effort */
+          }
+        },
+      };
+      this.ingest = sink;
+      const clear = (): void => {
+        if (this.ingest === sink) this.ingest = null;
+      };
+      server.addEventListener("close", clear);
+      server.addEventListener("error", clear);
+      console.log(JSON.stringify({ msg: "agent-ingest-open", bound: this.core.bound?.roomId ?? null }));
+      try {
+        return new Response(null, { status: 101, webSocket: client } as ResponseInit & { webSocket: WebSocket });
+      } catch {
+        return new Response(null, { status: 200, webSocket: client } as ResponseInit & { webSocket: WebSocket });
+      }
+    }
     try {
       if (path === "bind" && request.method === "POST") {
         const body = (await request.json().catch(() => ({}))) as { config?: AgentSessionConfig };

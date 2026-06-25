@@ -3,14 +3,16 @@
 // two-adapters-on-one-DO proof) with the right endpoints; the echo harness decodes egress PCM and re-sends
 // it on the ingest socket (round-trip via the real decode/encode, not a faked protocol); timing samples are
 // recorded for both directions; fail-safe on a bad frame. The adapter WS is MOCKED (no live SFU).
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeAll } from "vitest";
 import {
   AgentSessionCore,
+  AgentSessionDO,
   voiceAgentEnabled,
   type AgentMediaDeps,
   type IngestSocket,
 } from "../src/agent-session.js";
 import { encodeIngestFrame } from "../src/agent-ingest-adapter.js";
+import { decodePacket } from "../src/encoders/container-adapter.js";
 
 const SESSION = "sess_ABCdef12345678";
 
@@ -118,5 +120,55 @@ describe("echo harness PCM round-trip", () => {
     core.bind(goodCfg);
     await core.echoFrame(encodeIngestFrame(new Uint8Array([1, 2]), { sequenceNumber: 1, timestamp: 1 }));
     expect(core.timingSamples().map((s) => s.direction)).toEqual(["in"]); // recorded in, no out
+  });
+});
+
+describe("AgentSessionDO ingest WS wiring — the DO owns the publish socket", () => {
+  let serverWS: { sent: Uint8Array[] };
+  class FakeWS {
+    binaryType = "blob";
+    sent: Uint8Array[] = [];
+    accept() {}
+    addEventListener() {}
+    send(d: ArrayBufferView | ArrayBuffer) { this.sent.push(new Uint8Array(d as ArrayBuffer)); }
+    close() {}
+  }
+  beforeAll(() => {
+    (globalThis as unknown as { WebSocketPair: unknown }).WebSocketPair = class {
+      0 = new FakeWS();
+      1 = (serverWS = new FakeWS());
+    } as unknown;
+  });
+
+  const mkState = () => ({ storage: { get: async () => undefined, put: async () => {} } }) as never;
+
+  it("installs the ingest socket on upgrade, then echo frames publish on it (egress→ingest closes the loop)", async () => {
+    const session = new AgentSessionDO(mkState(), { VOICE_AGENT_PROVIDER: "wave" } as never);
+    // 1) The SFU dials the ingest WS → DO performs the upgrade and holds the server socket as this.ingest.
+    const up = await session.fetch(new Request("https://agent/ingest", { headers: { Upgrade: "websocket" } }));
+    expect(up.status).toBeLessThan(400);
+    // 2) An egress frame arrives (NOT bound → turn core is null → the echo harness runs) → the SAME PCM is
+    //    published back out the installed ingest socket. Before this route, this.ingest was always null and
+    //    every outbound frame was dropped at AgentSessionCore.echoFrame's `if (!sock) return`.
+    const pcm = new Uint8Array([5, 6, 7, 8]);
+    const frame = encodeIngestFrame(pcm, { sequenceNumber: 3, timestamp: 9600 }, "packet");
+    await session.fetch(new Request("https://agent/echo-frame", { method: "POST", body: frame }));
+    expect(serverWS.sent.length).toBe(1);
+    expect(Array.from(decodePacket(serverWS.sent[0]).payload)).toEqual([5, 6, 7, 8]);
+  });
+
+  it("returns 503 when WebSocketPair is unavailable (config-no-silent-noop)", async () => {
+    const saved = (globalThis as unknown as { WebSocketPair: unknown }).WebSocketPair;
+    (globalThis as unknown as { WebSocketPair: unknown }).WebSocketPair = undefined;
+    const session = new AgentSessionDO(mkState(), { VOICE_AGENT_PROVIDER: "wave" } as never);
+    const res = await session.fetch(new Request("https://agent/ingest", { headers: { Upgrade: "websocket" } }));
+    expect(res.status).toBe(503);
+    (globalThis as unknown as { WebSocketPair: unknown }).WebSocketPair = saved;
+  });
+
+  it("ingest upgrade is inert (501) without VOICE_AGENT_PROVIDER=wave", async () => {
+    const session = new AgentSessionDO(mkState(), {} as never);
+    const res = await session.fetch(new Request("https://agent/ingest", { headers: { Upgrade: "websocket" } }));
+    expect(res.status).toBe(501);
   });
 });

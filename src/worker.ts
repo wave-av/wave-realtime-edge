@@ -133,6 +133,11 @@ const AGENT_DISPATCH_INTENTS = new Set(["bind", "info"]);
  *  Mirrors RECORDER_ROUTE; the DO key is `${org}:${room}`-derived so a frame reaches the SAME AgentSessionDO
  *  the dispatch bound. The capability token (?t=) authorizes the third-party SFU dial-in (it can't send x-wave-internal). */
 const AGENT_EGRESS_ROUTE = /^\/v1\/realtime\/agents\/egress\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
+/** Task #81 — agent INGEST WS the SFU dials IN to PULL the agent's published PCM (createIngestAdapter
+ *  location:"local"): /v1/realtime/agents/ingest/:org/:room/:sessionId/:trackName. Symmetric to AGENT_EGRESS_ROUTE,
+ *  but the upgrade is FORWARDED to the `${org}:${room}` AgentSessionDO so the DO owns the live socket it sends on
+ *  (egress forwards per-frame over HTTP; ingest must hold a durable socket the agent pushes to over time). */
+const AGENT_INGEST_ROUTE = /^\/v1\/realtime\/agents\/ingest\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
 
 // ── WAVE-native ingress listeners (LK-rip #42) — POST /v1/realtime/ingress/:protocol/:intent ──
 // Server-side counterpart to wave-gateway PR #204 (which forwards this exact path shape as the identity  # guard:allow cross-repo PR reference in a design comment, not a leak
@@ -731,6 +736,33 @@ export default {
 				} catch {
 					return new Response(null, { status: 200, webSocket: client } as ResponseInit & { webSocket: WebSocket });
 				}
+			}
+
+			// 3) Ingest WS: the SFU dials IN to PULL the agent's published PCM. Forward the upgrade to the SAME
+			// room-scoped AgentSessionDO (the one /bind armed + egress feeds) so the DO owns the live socket it
+			// SENDS frames on. Symmetric auth to egress: the capability token (?t=) the SFU carries, OR the
+			// gateway-trust seal. The DO performs the WebSocketPair upgrade; we relay its 101 (with the client
+			// socket) back to the SFU verbatim.
+			const aiMatch = url.pathname.match(AGENT_INGEST_ROUTE);
+			if (aiMatch) {
+				const [, aorg, aroom, asession, atrack] = aiMatch;
+				if (![aorg, aroom, asession, atrack].every((s) => SAFE_SEGMENT.test(s)) || !env.AGENT_SESSION) {
+					return Response.json({ error: "BAD_REQUEST", message: "invalid agent ingest path or no AGENT_SESSION binding" }, { status: 400 });
+				}
+				const tok = url.searchParams.get("t");
+				const tokenOk = !!tok && !!env.WAVE_INTERNAL_SECRET && (await verifyRecorderToken(env.WAVE_INTERNAL_SECRET, aorg, asession, atrack, tok));
+				if (!tokenOk) {
+					const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
+					if (denied) return denied;
+				}
+				if ((request.headers.get("Upgrade") ?? "").toLowerCase() !== "websocket") {
+					return Response.json({ error: "UPGRADE_REQUIRED", message: "agent ingest route requires a WebSocket upgrade" }, { status: 426 });
+				}
+				const id = env.AGENT_SESSION.idFromName(`${aorg}:${aroom}`);
+				const stub = env.AGENT_SESSION.get(id);
+				// Pass the original request as init so the Upgrade header + the WS-upgrade intent are preserved
+				// across the stub boundary (the DO returns the 101 + webSocket client we relay back).
+				return stub.fetch(new Request(`https://agent/ingest?sessionId=${encodeURIComponent(asession)}&trackName=${encodeURIComponent(atrack)}`, request));
 			}
 		}
 
