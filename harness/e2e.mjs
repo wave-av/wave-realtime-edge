@@ -10,6 +10,7 @@
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { createPublisher } from "./lib-publisher.mjs";
+import { createSubscriber } from "./lib-subscriber.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SFU_BASE = process.env.SFU_API_BASE ?? "https://rtc.live.cloudflare.com/v1";
@@ -47,9 +48,12 @@ async function bindAgent({ sessionId, trackName }) {
 async function main() {
   log("e2e-start", { org: ORG, room: ROOM, agentId: AGENT_ID, edge: EDGE_BASE });
 
+  // loops=3 → the phrase plays 4× (~10s), covering bind + egress setup, then STOPS. The trailing silence lets
+  // the agent's VAD endpoint the utterance and complete ONE clean turn (STT→LLM→TTS→publish) — continuous audio
+  // (loops=-1) never endpoints and every turn is interrupted before the agent speaks.
   const pub = await createPublisher({
     sfuBase: SFU_BASE, appId: APP_ID, appSecret: APP_SECRET,
-    wavPath: join(HERE, "fixtures", "phrase.wav"), log,
+    wavPath: join(HERE, "fixtures", "phrase.wav"), loops: 3, log,
   });
   log("publisher-created", { sessionId: pub.sessionId, trackName: pub.trackName });
 
@@ -84,11 +88,52 @@ async function main() {
     log("LEG1-FAIL", { status: bind.status, body: bind.json ?? bind.text.slice(0, 300) });
   }
 
-  // Keep media flowing a moment so any async adapter dial-back / turn activity can surface in worker logs.
-  await new Promise((r) => setTimeout(r, 3000));
+  // LEG 2: subscribe to the agent's published track and prove it SPEAKS back. The DO publishes agent-<id> as a
+  // LOCAL track on the participant's session, so we pull it as a REMOTE track keyed by (participantSessionId,
+  // agentTrackName). Keep the publisher flowing so the agent has input to transcribe → answer → speak.
+  let leg2 = "SKIP";
+  if (result === "PASS") {
+    const agentTrackName = bind.json.bound?.agentTrackName ?? `agent-${AGENT_ID}`;
+    try {
+      const sub = await createSubscriber({
+        sfuBase: SFU_BASE, appId: APP_ID, appSecret: APP_SECRET,
+        remoteSessionId: pub.sessionId, agentTrackName, log,
+      });
+      const subOk = await sub.connected();
+      log("subscriber-connected", { ok: subOk });
+
+      // Wait for the agent's reply audio to flow back. The turn loop (STT→LLM→TTS) was observed taking up to
+      // ~20s, so poll up to 35s for the first RTP on the agent track.
+      const startWait = Date.now();
+      const DEADLINE_MS = 35000;
+      while (sub.rtpRecv() === 0 && Date.now() - startWait < DEADLINE_MS) {
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      const ttfb = sub.firstRtpMs() ? sub.firstRtpMs() - startWait : -1;
+      // Let a little more audio accumulate for a duration signal.
+      if (sub.rtpRecv() > 0) await new Promise((r) => setTimeout(r, 3000));
+
+      if (sub.rtpRecv() > 0) {
+        leg2 = "PASS";
+        log("LEG2-PASS", {
+          agentTrackName, rtpRecv: sub.rtpRecv(), timeToFirstAgentAudioMs: ttfb,
+          opusPayloadsCaptured: sub.payloads().length,
+          note: "agent track flowed RTP back ⇒ ingest half proven: STT→LLM→TTS→publish reaches the subscriber",
+        });
+      } else {
+        log("LEG2-FAIL", { agentTrackName, waitedMs: Date.now() - startWait, note: "no RTP on agent track within deadline" });
+      }
+      await sub.stop();
+    } catch (e) {
+      log("LEG2-ERROR", { message: (e?.stack || String(e)).slice(0, 400) });
+      leg2 = "ERROR";
+    }
+  }
+
   await pub.stop();
-  log("e2e-done", { result });
-  process.exit(result === "PASS" ? 0 : 2);
+  const overall = result === "PASS" && leg2 === "PASS" ? "PASS" : result === "PASS" ? "PARTIAL" : "FAIL";
+  log("e2e-done", { leg1: result, leg2, overall });
+  process.exit(overall === "PASS" ? 0 : overall === "PARTIAL" ? 3 : 2);
 }
 
 main().catch((e) => die(e?.stack || String(e)));

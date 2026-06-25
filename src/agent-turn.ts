@@ -146,6 +146,16 @@ export const DEFAULT_SYSTEM_PROMPT =
 /** Step-5 hard default cap on tool-call iterations within ONE turn (anti-runaway). Overridable per-core. */
 export const DEFAULT_MAX_TOOL_ITERATIONS = 5;
 
+/**
+ * Hard cap on the accumulated-utterance PCM buffer (bounded-backpressure). The buffer holds participant PCM
+ * since the last FINAL transcript; without a cap it grows for the WHOLE session when audio never endpoints (a
+ * continuous talker, partial-only STT, or a long in-flight turn) and resets the DO isolate at the 128 MB cap —
+ * which kills the turn before TTS publishes. ~15 s of 48 kHz / 16-bit / stereo PCM (192 KB/s) ≈ 5.76 MB is far
+ * more than any single utterance needs and stays well under the isolate limit; over the cap we evict OLDEST
+ * frames (keep the most recent context for STT + barge-in). Pure constant → unit-testable.
+ */
+export const MAX_UTTERANCE_BYTES = 48_000 * 2 * 2 * 15;
+
 /** The configured persona, or the default. Pure → unit-testable. */
 export function buildTurnSystemPrompt(config: Pick<TurnTakingConfig, "systemPrompt">): string {
   const p = (config.systemPrompt ?? "").trim();
@@ -163,8 +173,10 @@ export class TurnTakingCore {
   private readonly config: TurnTakingConfig;
   private readonly framing: IngestFraming;
   private readonly messages: LlmMessage[];
-  /** PCM accumulated since the last FINAL transcript (the current user utterance). */
+  /** PCM accumulated since the last FINAL transcript (the current user utterance). Bounded by MAX_UTTERANCE_BYTES. */
   private utterance: Uint8Array[] = [];
+  /** Running byte total of `utterance` (avoids re-summing on every frame; drives bounded eviction). */
+  private utteranceBytes = 0;
   private outSeq = 0;
   /** Guards against re-entrant turns (a turn is in flight while we await STT/LLM/TTS). */
   private turnInFlight = false;
@@ -223,7 +235,7 @@ export class TurnTakingCore {
       // VAD runs on EVERY decoded frame (design §L2.1) — it's the barge-in trigger AND the silence sensor.
       stage = "vad";
       const vadEvent = this.vad.feed(pkt.payload);
-      this.utterance.push(pkt.payload);
+      this.pushUtterance(pkt.payload);
       if (this.turnInFlight) {
         // Agent is speaking. A sustained speech ONSET = the user barged in → abort the in-flight turn NOW so the
         // agent goes silent immediately. The interrupting PCM is already accumulating (pushed above) → it becomes
@@ -246,7 +258,7 @@ export class TurnTakingCore {
       const stt = await this.deps.transcribe(pcm);
       if (!stt.isFinal) return; // partial — keep accumulating (v1 endpointing is final-driven)
       const userText = stt.transcript.trim();
-      this.utterance = []; // consume the utterance now that it's final
+      this.resetUtterance(); // consume the utterance now that it's final
       if (userText.length === 0) return; // final-but-empty (silence) → no turn
       await this.runTurn(userText);
     } catch (e) {
@@ -464,6 +476,27 @@ export class TurnTakingCore {
       // TODO(#81 step 4 LIVE-spike): on the Jake-named edge deploy, derive wall-ms from frame source timestamps
       //                              (FrameTiming) to PROVE detected-onset→silence < ~300ms end-to-end.
     });
+  }
+
+  /**
+   * Append one PCM frame to the accumulated utterance, BOUNDED. Without this cap the buffer grows for the whole
+   * session whenever audio never endpoints (continuous talker / partial-only STT / long in-flight turn) until the
+   * DO isolate hits its 128 MB limit and resets mid-turn — the agent never gets to speak. Over MAX_UTTERANCE_BYTES
+   * we drop OLDEST frames (always keep ≥1) so STT + barge-in still see the most recent ~15 s of context.
+   */
+  private pushUtterance(payload: Uint8Array): void {
+    this.utterance.push(payload);
+    this.utteranceBytes += payload.length;
+    while (this.utteranceBytes > MAX_UTTERANCE_BYTES && this.utterance.length > 1) {
+      const dropped = this.utterance.shift()!;
+      this.utteranceBytes -= dropped.length;
+    }
+  }
+
+  /** Clear the accumulated utterance + its byte counter (after a FINAL transcript consumes it). */
+  private resetUtterance(): void {
+    this.utterance = [];
+    this.utteranceBytes = 0;
   }
 
   private idFields(): Record<string, unknown> {

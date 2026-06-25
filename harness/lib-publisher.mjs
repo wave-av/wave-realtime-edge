@@ -24,7 +24,7 @@ function waitIce(pc, ms = 3000) {
  * Publish `wavPath` into a new SFU session. Returns { sessionId, trackName, pc, connected(), stop() }.
  * @param log ndjson logger (msg, fields)
  */
-export async function createPublisher({ sfuBase, appId, appSecret, wavPath, trackName = "harness-mic", udpPort = 5004, log = () => {} }) {
+export async function createPublisher({ sfuBase, appId, appSecret, wavPath, trackName = "harness-mic", udpPort = 5004, loops = -1, log = () => {} }) {
   const pc = new RTCPeerConnection({ codecs: { audio: [OPUS] } });
   const track = new MediaStreamTrack({ kind: "audio" });
   const transceiver = pc.addTransceiver(track, { direction: "sendonly" });
@@ -53,9 +53,12 @@ export async function createPublisher({ sfuBase, appId, appSecret, wavPath, trac
   if (!tres.ok) throw new Error(`publisher tracks/new ${tres.status}: ${(await tres.text()).slice(0, 300)}`);
   log("pub-track", { trackName, mid: transceiver.mid });
 
-  // ffmpeg → Opus/RTP/UDP. -re paces to realtime; -stream_loop -1 loops so the track keeps flowing.
+  // ffmpeg → Opus/RTP/UDP. -re paces to realtime; -stream_loop N repeats the file (N=-1 infinite keeps the
+  // track flowing forever — good for Leg 1; a finite N plays a bounded burst then STOPS, leaving a trailing
+  // silence so the agent's VAD can endpoint the utterance and actually complete a turn — needed for Leg 2,
+  // because continuous audio never endpoints and every turn gets interrupted before the agent can speak).
   const ff = spawn("ffmpeg", [
-    "-hide_banner", "-loglevel", "error", "-re", "-stream_loop", "-1", "-i", wavPath,
+    "-hide_banner", "-loglevel", "error", "-re", "-stream_loop", String(loops), "-i", wavPath,
     "-c:a", "libopus", "-ar", "48000", "-ac", "2", "-application", "voip",
     "-payload_type", String(OPUS_PT), "-ssrc", "11111111",
     "-f", "rtp", `rtp://127.0.0.1:${udpPort}`,
