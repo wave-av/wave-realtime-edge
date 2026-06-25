@@ -36,7 +36,7 @@ describe("buildTurnDeps — env gating (fail CLOSED, never a fake)", () => {
   it("throws *_NOT_CONFIGURED when creds are unset", async () => {
     const deps = buildTurnDeps({ VOICE_AGENT_PROVIDER: "wave" } as AgentTurnEnv, media, vi.fn());
     await expect(deps.transcribe(new Uint8Array([1]))).rejects.toMatchObject({ code: "STT_NOT_CONFIGURED" });
-    await expect(collect(deps.complete([]))).rejects.toMatchObject({ code: "LLM_NOT_CONFIGURED" });
+    await expect(collect(deps.complete([], []))).rejects.toMatchObject({ code: "LLM_NOT_CONFIGURED" });
     await expect(collect(deps.synthesize("hi"))).rejects.toMatchObject({ code: "TTS_NOT_CONFIGURED" });
   });
 });
@@ -54,8 +54,8 @@ describe("buildTurnDeps — gateway LLM streaming", () => {
       { role: "system", content: "sys" },
       { role: "user", content: "hi" },
     ];
-    const out = await collect(deps.complete(msgs));
-    expect(out.join("")).toBe("Hello");
+    const out = await collect(deps.complete(msgs, []));
+    expect(out.map((e) => (e.type === "text" ? e.text : "")).join("")).toBe("Hello");
     const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe("https://api.wave.online/v1/messages");
     expect(url).not.toContain("secret-gw-token"); // secret never in the URL
@@ -74,7 +74,7 @@ describe("buildTurnDeps — gateway LLM streaming", () => {
       WAVE_GATEWAY_TOKEN: "t",
       VOICE_AGENT_LLM_MODEL: "claude-opus-4-5",
     };
-    await collect(buildTurnDeps(env, media, fetchImpl).complete([{ role: "user", content: "q" }]));
+    await collect(buildTurnDeps(env, media, fetchImpl).complete([{ role: "user", content: "q" }], []));
     const body = JSON.parse((fetchImpl.mock.calls[0] as unknown as [string, RequestInit])[1].body as string);
     expect(body.model).toBe("claude-opus-4-5");
   });
@@ -82,7 +82,7 @@ describe("buildTurnDeps — gateway LLM streaming", () => {
   it("throws LLM_UPSTREAM on a non-200", async () => {
     const fetchImpl = vi.fn(async () => new Response("nope", { status: 502 }));
     const env: AgentTurnEnv = { WAVE_GATEWAY_BASE: "https://api.wave.online", WAVE_GATEWAY_TOKEN: "t" };
-    await expect(collect(buildTurnDeps(env, media, fetchImpl).complete([]))).rejects.toMatchObject({
+    await expect(collect(buildTurnDeps(env, media, fetchImpl).complete([], []))).rejects.toMatchObject({
       code: "LLM_UPSTREAM",
     });
   });

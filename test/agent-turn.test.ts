@@ -13,6 +13,7 @@ import {
   type TurnTakingConfig,
   type SttResult,
   type LlmMessage,
+  type ToolDefinition,
 } from "../src/agent-turn.js";
 import type { AgentMediaDeps, IngestSocket } from "../src/agent-session.js";
 import { encodeIngestFrame } from "../src/agent-ingest-adapter.js";
@@ -42,12 +43,15 @@ function mkDeps(over: Partial<AgentTurnDeps & AgentMediaDeps> = {}) {
       ? { isFinal: true, transcript: "hello agent" }
       : { isFinal: false, transcript: "hello" };
   });
-  // Fake LLM gateway: echoes the last user message into an assistant reply; records the message history.
-  const complete = vi.fn(async function* (messages: LlmMessage[]) {
+  // Fake LLM gateway: echoes the last user message into an assistant reply; records the message history. Yields the
+  // step-5 CompletionEvent union (text events). Text-only by default → the bounded loop terminates in one iteration.
+  const complete = vi.fn(async function* (messages: LlmMessage[], _tools: ToolDefinition[]) {
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
-    yield "Reply to: ";
-    yield lastUser?.content ?? "";
+    yield { type: "text", text: "Reply to: " } as const;
+    yield { type: "text", text: (lastUser?.content as string) ?? "" } as const;
   });
+  // Fake tool executor: deterministic echo of name (overridable per-test). Never hits the network.
+  const callTool = vi.fn(async (name: string, _input: unknown) => `result:${name}`);
   // Fake ElevenLabs: emit two PCM chunks for any text (deterministic so we can assert round-trip bytes).
   const synthesize = vi.fn(async function* (_text: string) {
     yield new Uint8Array([1, 2, 3, 4]);
@@ -63,10 +67,11 @@ function mkDeps(over: Partial<AgentTurnDeps & AgentMediaDeps> = {}) {
     log: (msg, fields) => logs.push({ msg, fields }),
     transcribe,
     complete,
+    callTool,
     synthesize,
     ...over,
   };
-  return { deps, sent, logs, transcribe, complete, synthesize };
+  return { deps, sent, logs, transcribe, complete, callTool, synthesize };
 }
 
 /** Build an egress Packet frame carrying `pcm` (same wire the SFU pushes), via the verified encoder. */
@@ -124,10 +129,10 @@ describe("TurnTakingCore — one full turn", () => {
     // First turn's LLM throws; second turn succeeds. The committed history (and the second request) must stay
     // strictly alternating (no two consecutive user turns) — guards the atomic user+assistant commit.
     let call = 0;
-    const complete = vi.fn(async function* (_messages: LlmMessage[]) {
+    const complete = vi.fn(async function* (_messages: LlmMessage[], _tools: ToolDefinition[]) {
       call += 1;
       if (call === 1) throw new Error("llm boom"); // turn 1 fails AFTER the user utterance was transcribed
-      yield "ok"; // turn 2 succeeds
+      yield { type: "text", text: "ok" } as const; // turn 2 succeeds
     });
     const { deps } = mkDeps({ complete });
     const core = new TurnTakingCore(deps, goodCfg);
@@ -250,7 +255,7 @@ describe("TurnTakingCore — fail-safety (never throws up the media path)", () =
       complete: vi.fn(async function* () {
         throw new Error("llm boom");
         // eslint-disable-next-line no-unreachable
-        yield "";
+        yield { type: "text", text: "" } as const;
       }),
     });
     const core = new TurnTakingCore(deps, goodCfg);

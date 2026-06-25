@@ -42,6 +42,17 @@ import {
 import { decodePacket } from "./encoders/container-adapter.js";
 import { chunkPcm, encodeIngestFrame, type IngestFraming } from "./agent-ingest-adapter.js";
 import { Vad, vadConfigFromEnv, type VadConfig, type VadEnv } from "./agent-vad.js";
+import {
+  ToolAllowlist,
+  toolAllowlistFromEnv,
+  redactToolInput,
+  assistantToolUseMessage,
+  userToolResultMessage,
+  type ToolDefinition,
+  type ToolUse,
+  type ToolResult,
+  type CompletionEvent,
+} from "./agent-tools.js";
 
 // ── Public contracts (the injectable-deps seam) ──────────────────────────────────────────────────────────────
 
@@ -52,10 +63,15 @@ export interface SttResult {
   transcript: string;
 }
 
-/** One LLM chat message — the gateway/Claude message shape (system + alternating user/assistant). */
+/**
+ * One LLM chat message — the gateway/Claude message shape (system + alternating user/assistant). `content` is a
+ * plain string for the common case, OR an Anthropic content-block array for the tool turns (an assistant message
+ * carrying `tool_use` blocks, and the matching `user` message carrying `tool_result` blocks). The strict
+ * user/assistant alternation Claude requires is preserved across tool turns by the bounded loop in runTurn.
+ */
 export interface LlmMessage {
   role: "system" | "user" | "assistant";
-  content: string;
+  content: string | Array<Record<string, unknown>>;
 }
 
 /**
@@ -70,11 +86,22 @@ export interface AgentTurnDeps {
    */
   transcribe(pcm: Uint8Array): Promise<SttResult>;
   /**
-   * LLM via the WAVE gateway (Claude Opus/Sonnet, ALWAYS). Stream the assistant text given the full message
-   * history (system + alternating user/assistant). An async generator so the assistant text is streamed to TTS
-   * incrementally (and is cancellable in step 4). Fail-safe: a throw is caught (logged stage="llm").
+   * LLM via the WAVE gateway (Claude Opus/Sonnet, ALWAYS). Streams a DISCRIMINATED UNION of events given the full
+   * message history (system + alternating user/assistant) AND the allowlisted tool definitions to offer the model:
+   *   • { type:"text", text }                — an assistant text delta (streamed to TTS, exactly as step 3/4).
+   *   • { type:"tool_use", id, name, input } — a COMPLETED tool_use block (Anthropic), to be executed mid-turn.
+   * An async generator so text streams to TTS incrementally and is cancellable on barge-in (step 4). The `tools`
+   * arg is the agent-least-privilege allowlist (step 5) — only these are ever advertised to the model. Fail-safe:
+   * a throw is caught by the core (logged stage="llm").
    */
-  complete(messages: LlmMessage[]): AsyncIterable<string>;
+  complete(messages: LlmMessage[], tools: ToolDefinition[]): AsyncIterable<CompletionEvent>;
+  /**
+   * Execute ONE allowlisted tool via the WAVE gateway / MCP (step 5). The core only ever calls this AFTER its
+   * allowlist check passes (agent-least-privilege). Returns the stringified tool result. Fail-safe: a throw is
+   * caught by the core (logged stage="tool", turned into an is_error tool_result; the turn is abandoned cleanly).
+   * Secrets/PII in `input` are NEVER logged verbatim (the core logs name + a redacted size summary only).
+   */
+  callTool(name: string, input: unknown): Promise<string>;
   /**
    * TTS = ElevenLabs streaming → pcm_48000 chunks (16-bit LE, 48 kHz — matches the ingest path, zero transcode).
    * An async generator so audio streams out as it's synthesized. Fail-safe: a throw is caught (logged stage="tts").
@@ -96,6 +123,9 @@ export interface TurnTakingConfig {
 /** The default agent persona when none is configured (honest, generic — a real persona is set per-agent). */
 export const DEFAULT_SYSTEM_PROMPT =
   "You are a helpful, concise WAVE voice agent. Reply in short, natural spoken sentences.";
+
+/** Step-5 hard default cap on tool-call iterations within ONE turn (anti-runaway). Overridable per-core. */
+export const DEFAULT_MAX_TOOL_ITERATIONS = 5;
 
 /** The configured persona, or the default. Pure → unit-testable. */
 export function buildTurnSystemPrompt(config: Pick<TurnTakingConfig, "systemPrompt">): string {
@@ -125,17 +155,33 @@ export class TurnTakingCore {
   private readonly vad: Vad;
   /** Frame counter (since the in-flight turn started) used to instrument barge-in detection→abort latency. */
   private framesThisTurn = 0;
+  /** Step-5 agent-least-privilege: the EXPLICIT tool definitions this agent may run (empty = text-only). */
+  private readonly tools: ToolAllowlist;
+  /** Step-5 hard cap on tool-call iterations within ONE turn — prevents an infinite (model→tool→model→…) loop. */
+  private readonly maxToolIterations: number;
 
   constructor(
     deps: AgentTurnDeps & AgentMediaDeps,
     config: TurnTakingConfig,
-    opts?: { framing?: IngestFraming; vad?: Partial<VadConfig> },
+    opts?: {
+      framing?: IngestFraming;
+      vad?: Partial<VadConfig>;
+      /** Step-5: the agent-least-privilege tool allowlist. Omitted/empty → the agent runs text-only. */
+      tools?: ToolAllowlist;
+      /** Step-5: hard max-iterations cap for the agentic tool loop (default DEFAULT_MAX_TOOL_ITERATIONS). */
+      maxToolIterations?: number;
+    },
   ) {
     this.deps = deps;
     this.config = config;
     this.framing = opts?.framing ?? "packet";
     this.messages = [{ role: "system", content: buildTurnSystemPrompt(config) }];
     this.vad = new Vad(opts?.vad);
+    this.tools = opts?.tools ?? new ToolAllowlist([]);
+    this.maxToolIterations =
+      typeof opts?.maxToolIterations === "number" && opts.maxToolIterations >= 1
+        ? Math.floor(opts.maxToolIterations)
+        : DEFAULT_MAX_TOOL_ITERATIONS;
   }
 
   /** A copy of the conversation history (system + alternating user/assistant). For tests + DO snapshotting. */
@@ -188,9 +234,17 @@ export class TurnTakingCore {
   }
 
   /**
-   * Run ONE turn for a final user transcript: append to history → stream the LLM → stream TTS → publish PCM out.
-   * Each external is its own fail-safe stage so one stage's failure is logged with WHERE it failed and the turn
-   * is abandoned cleanly (history is only committed for stages that actually produced output).
+   * Run ONE turn for a final user transcript — the BOUNDED AGENTIC TOOL LOOP (step 5):
+   *   complete(history, tools) → if the model emitted tool_use blocks: execute each (allowlist-gated), append the
+   *   assistant(tool_use) + user(tool_result) pair to the working history (strict Anthropic shapes), re-call.
+   *   Repeat until the model returns TEXT with no tool_use OR a HARD max-iterations cap (anti-runaway). Then the
+   *   final assistant TEXT → ElevenLabs TTS → publish PCM out (the step-3/4 path, unchanged).
+   *
+   * History correctness + atomicity: the user message and every assistant/tool pair accumulate in a LOCAL working
+   * list; `this.messages` is committed ATOMICALLY (one splice) ONLY on a successful, non-aborted final reply — so an
+   * aborted / empty / failed turn leaves NO dangling user (or half-applied tool) messages and the strict
+   * user/assistant alternation Claude requires is preserved across tool turns. `aborted` (barge-in) is honored at
+   * EVERY await — the LLM stream, between iterations, DURING tool execution, and the TTS publish.
    */
   private async runTurn(userText: string): Promise<void> {
     this.turnInFlight = true;
@@ -202,61 +256,136 @@ export class TurnTakingCore {
     const startMs = this.deps.now();
     let stage = "llm";
     try {
-      // Build the request history WITHOUT mutating committed state. The user + assistant turns are committed
-      // ATOMICALLY only after a successful, non-empty, non-aborted reply (below), so an aborted / empty / failed
-      // turn NEVER leaves a dangling user message — which would otherwise produce two consecutive user turns on
-      // the NEXT utterance and break the strict user/assistant alternation the gateway/Claude requires.
       const userMsg: LlmMessage = { role: "user", content: userText };
-      const reqMessages = [...this.messages, userMsg];
+      // The working history for THIS turn (committed state + this turn's user/assistant/tool messages). Nothing is
+      // pushed to this.messages until the final atomic commit below.
+      const working: LlmMessage[] = [...this.messages, userMsg];
+      const toolDefs = this.tools.definitions();
+      let toolsUsed = 0;
 
-      // LLM (gateway/Claude) — stream the assistant text. Collected for history + fed to TTS. The request list is
-      // a fresh snapshot so a long stream can't observe a later mutation + deps serialize a stable history.
-      let assistant = "";
-      for await (const delta of this.deps.complete(reqMessages)) {
-        if (this.aborted) break; // step-4 barge-in seam: cancel the in-flight stream
-        assistant += delta;
-      }
-      if (this.aborted) return;
-      assistant = assistant.trim();
-      if (assistant.length === 0) {
-        this.deps.log("agent-turn-empty-llm", this.idFields());
-        return;
-      }
-      // Commit BOTH turns atomically now that we have a real reply (history stays strictly alternating).
-      this.messages.push(userMsg, { role: "assistant", content: assistant });
-
-      // TTS (ElevenLabs streaming pcm_48000) → ingest socket via the EXACT echoFrame send path.
-      stage = "tts";
-      let pcmBytesOut = 0;
-      const sock = this.deps.ingestSocket();
-      for await (const pcm of this.deps.synthesize(assistant)) {
-        if (this.aborted) break; // barge-in: stop publishing the now-stale reply mid-stream
-        if (!sock || pcm.length === 0) continue;
-        for (const chunk of chunkPcm(pcm)) {
-          const seq = this.outSeq++;
-          // timestamp 0: a real source timeline lands with the live ingest wiring slice; the contract field is
-          // present + monotonic-by-seq. (proven-live-or-not-done: not claiming a real media timeline yet.)
-          const wire = encodeIngestFrame(chunk, { sequenceNumber: seq, timestamp: 0 }, this.framing);
-          sock.send(wire);
-          pcmBytesOut += chunk.length;
+      // ── the bounded agentic loop ──────────────────────────────────────────────────────────────────────────
+      for (let iter = 0; ; iter++) {
+        stage = "llm";
+        // Stream this iteration: collect text (only the FINAL no-tool iteration's text is spoken) + tool_use blocks.
+        let assistant = "";
+        const toolUses: ToolUse[] = [];
+        for await (const evt of this.deps.complete([...working], toolDefs)) {
+          if (this.aborted) break; // step-4 barge-in: cancel the in-flight stream
+          if (evt.type === "text") assistant += evt.text;
+          else toolUses.push({ id: evt.id, name: evt.name, input: evt.input });
         }
-      }
+        if (this.aborted) return;
 
-      // Metering seam (step 7): structured-log the honest counts we have. NO fake meter emit.
-      this.deps.log("agent-turn-meter", {
-        ...this.idFields(),
-        userChars: userText.length,
-        assistantChars: assistant.length,
-        pcmBytesOut,
-        turnWallMs: this.deps.now() - startMs,
-        // TODO(#81 step 7): emit voice_agent_minutes + llm tokens + elevenlabs chars to the gateway
-        //                   (mirror src/metering.ts emitParticipantUsage → POST /v1/internal/usage).
-      });
+        // No tool calls → this is the final assistant turn. Speak it.
+        if (toolUses.length === 0) {
+          assistant = assistant.trim();
+          if (assistant.length === 0) {
+            this.deps.log("agent-turn-empty-llm", this.idFields());
+            return; // nothing to say + nothing to commit → clean abandon (no dangling user)
+          }
+          working.push({ role: "assistant", content: assistant });
+          // Commit the WHOLE turn atomically (user + every assistant/tool message produced this turn).
+          this.messages.push(...working.slice(this.messages.length));
+          stage = "tts";
+          const pcmBytesOut = await this.speak(assistant);
+          if (pcmBytesOut < 0) return; // aborted mid-TTS (already committed history is valid + alternating)
+          this.logMeter(userText, assistant, toolsUsed, pcmBytesOut, startMs);
+          return;
+        }
+
+        // The model wants to use tools. Stop at the hard cap (anti-runaway) — DON'T execute another round.
+        if (iter >= this.maxToolIterations) {
+          this.deps.log("agent-turn-tool-cap", { ...this.idFields(), maxToolIterations: this.maxToolIterations });
+          return; // abandon cleanly — no commit (no partial tool turn leaks into committed history)
+        }
+
+        // Append the assistant(tool_use) message verbatim (history must replay the model's tool_use blocks), then
+        // execute each requested tool (allowlist-gated) and append the matching user(tool_result) message.
+        working.push(assistantToolUseMessage(toolUses) as LlmMessage);
+        stage = "tool";
+        const results = await this.executeTools(toolUses);
+        if (this.aborted) return; // barge-in DURING tool execution → abandon (nothing committed)
+        toolsUsed += results.length;
+        working.push(userToolResultMessage(results) as LlmMessage);
+        // loop: re-call the LLM with the tool_result(s) in history
+      }
     } catch (e) {
       this.deps.log("agent-turn-error", { stage, ...this.idFields(), message: (e as Error)?.message ?? "unknown" });
     } finally {
       this.turnInFlight = false;
     }
+  }
+
+  /**
+   * Execute the model-requested tool_use blocks (agent-least-privilege). For EACH: refuse (an is_error tool_result,
+   * logged, NEVER executed) any name not on the allowlist; otherwise call `callTool` and return its result. A
+   * thrown executor is fail-safe — it becomes an is_error tool_result (the model can react / the loop ends), it is
+   * NOT thrown up the media path. Audit: each tool is structured-logged by NAME + a REDACTED input size summary —
+   * the raw input (possible PII/secrets) is never logged verbatim. Honors barge-in between tools.
+   */
+  private async executeTools(toolUses: ToolUse[]): Promise<ToolResult[]> {
+    const results: ToolResult[] = [];
+    for (const t of toolUses) {
+      if (this.aborted) break;
+      const audit = redactToolInput(t.input);
+      if (!this.tools.isAllowed(t.name)) {
+        // REFUSE — a model-requested tool not on the explicit allowlist is never executed (least-privilege).
+        this.deps.log("agent-tool-refused", { ...this.idFields(), tool: t.name, ...audit });
+        results.push({ tool_use_id: t.id, content: `tool not permitted: ${t.name}`, is_error: true });
+        continue;
+      }
+      try {
+        const out = await this.deps.callTool(t.name, t.input);
+        this.deps.log("agent-tool-call", { ...this.idFields(), tool: t.name, ok: true, ...audit });
+        results.push({ tool_use_id: t.id, content: out, is_error: false });
+      } catch (e) {
+        // Fail-safe: an executor throw is captured as an error tool_result (logged), never thrown up the media path.
+        this.deps.log("agent-tool-error", {
+          ...this.idFields(),
+          tool: t.name,
+          ...audit,
+          message: (e as Error)?.message ?? "unknown",
+        });
+        results.push({ tool_use_id: t.id, content: `tool error: ${t.name}`, is_error: true });
+      }
+    }
+    return results;
+  }
+
+  /**
+   * Speak the final assistant text via ElevenLabs streaming TTS → ingest socket (the EXACT echoFrame send path).
+   * Returns the PCM bytes published, or -1 if a barge-in aborted mid-stream (the agent went silent). Honors abort.
+   */
+  private async speak(text: string): Promise<number> {
+    let pcmBytesOut = 0;
+    const sock = this.deps.ingestSocket();
+    for await (const pcm of this.deps.synthesize(text)) {
+      if (this.aborted) return -1; // barge-in: stop publishing the now-stale reply mid-stream
+      if (!sock || pcm.length === 0) continue;
+      for (const chunk of chunkPcm(pcm)) {
+        const seq = this.outSeq++;
+        // timestamp 0: a real source timeline lands with the live ingest wiring slice; the contract field is
+        // present + monotonic-by-seq. (proven-live-or-not-done: not claiming a real media timeline yet.)
+        const wire = encodeIngestFrame(chunk, { sequenceNumber: seq, timestamp: 0 }, this.framing);
+        sock.send(wire);
+        pcmBytesOut += chunk.length;
+      }
+    }
+    return pcmBytesOut;
+  }
+
+  /** Structured-log the honest per-turn counts we have (step-7 metering seam). NO fake meter emit. */
+  private logMeter(userText: string, assistant: string, toolsUsed: number, pcmBytesOut: number, startMs: number): void {
+    this.deps.log("agent-turn-meter", {
+      ...this.idFields(),
+      userChars: userText.length,
+      assistantChars: assistant.length,
+      toolsUsed,
+      pcmBytesOut,
+      turnWallMs: this.deps.now() - startMs,
+      // TODO(#81 step 7): emit voice_agent_minutes + llm tokens + elevenlabs chars + tool calls to the gateway
+      //                   (mirror src/metering.ts emitParticipantUsage → POST /v1/internal/usage).
+    });
   }
 
   /**
@@ -329,6 +458,13 @@ export interface AgentTurnEnv extends AgentSessionEnv, VadEnv {
   VOICE_AGENT_STT_BASE?: string;
   /** Streaming STT provider key (secret; never logged). */
   VOICE_AGENT_STT_KEY?: string;
+  /**
+   * Step-5 agent-least-privilege tool ALLOWLIST (var; JSON array of {name,description,input_schema}). The agent
+   * advertises ONLY these to the model + refuses any unlisted tool. Unset/blank/garbage → NO tools (fail closed).
+   */
+  VOICE_AGENT_TOOLS?: string;
+  /** Step-5 gateway tool-exec path override (var). Default /v1/internal/tools/exec (TODO #81: pin with gateway). */
+  VOICE_AGENT_TOOL_EXEC_PATH?: string;
 }
 
 /** Default Claude model routed through the gateway. Sonnet = the sensible voice default (latency/cost); Opus is
@@ -362,11 +498,19 @@ export function buildTurnDeps(
       }
       return transcribeViaProvider(fetchImpl, env, pcm);
     },
-    async *complete(messages: LlmMessage[]): AsyncIterable<string> {
+    async *complete(messages: LlmMessage[], tools: ToolDefinition[]): AsyncIterable<CompletionEvent> {
       if (!env.WAVE_GATEWAY_BASE || !env.WAVE_GATEWAY_TOKEN) {
         throw new AgentSessionError("LLM_NOT_CONFIGURED", "WAVE gateway base/token not provisioned", 503);
       }
-      yield* streamGatewayLlm(fetchImpl, env, messages);
+      yield* streamGatewayLlm(fetchImpl, env, messages, tools);
+    },
+    async callTool(name: string, input: unknown): Promise<string> {
+      if (!env.WAVE_GATEWAY_BASE || !env.WAVE_GATEWAY_TOKEN) {
+        // Fail CLOSED — a tool can ONLY be executed through the provisioned gateway (agent-least-privilege +
+        // metering authority). Unprovisioned → throw (the core turns it into an is_error tool_result, logged).
+        throw new AgentSessionError("TOOL_NOT_CONFIGURED", "WAVE gateway base/token not provisioned", 503);
+      }
+      return callGatewayTool(fetchImpl, env, name, input);
     },
     async *synthesize(text: string): AsyncIterable<Uint8Array> {
       if (!env.ELEVENLABS_API_KEY || !env.ELEVENLABS_VOICE_ID) {
@@ -388,11 +532,15 @@ async function* streamGatewayLlm(
   fetchImpl: FetchLike,
   env: AgentTurnEnv,
   messages: LlmMessage[],
-): AsyncIterable<string> {
+  tools: ToolDefinition[] = [],
+): AsyncIterable<CompletionEvent> {
   const base = env.WAVE_GATEWAY_BASE!.replace(/\/+$/, "");
   const model = env.VOICE_AGENT_LLM_MODEL ?? DEFAULT_VOICE_LLM_MODEL;
   const system = messages.find((m) => m.role === "system")?.content;
   const turns = messages.filter((m) => m.role !== "system");
+  const body: Record<string, unknown> = { model, max_tokens: 1024, stream: true, system, messages: turns };
+  // agent-least-privilege: advertise ONLY the allowlisted tools (omit the field entirely when there are none).
+  if (tools.length > 0) body.tools = tools;
   const res = await fetchImpl(`${base}/v1/messages`, {
     method: "POST",
     headers: {
@@ -400,15 +548,93 @@ async function* streamGatewayLlm(
       authorization: `Bearer ${env.WAVE_GATEWAY_TOKEN}`, // gateway service token — never logged
       accept: "text/event-stream",
     },
-    body: JSON.stringify({ model, max_tokens: 1024, stream: true, system, messages: turns }),
+    body: JSON.stringify(body),
   });
   if (!res.ok || !res.body) {
     throw new AgentSessionError("LLM_UPSTREAM", `gateway LLM returned ${res.status}`, 502);
   }
-  for await (const evt of sseEvents(res.body)) {
-    // Anthropic SSE: { type:"content_block_delta", delta:{ type:"text_delta", text } }
-    const text = (evt as { delta?: { text?: string } })?.delta?.text;
-    if (typeof text === "string" && text.length > 0) yield text;
+  yield* parseAnthropicStream(res.body);
+}
+
+/**
+ * Parse the Anthropic streaming envelope into CompletionEvents. Handles BOTH text and tool_use content blocks:
+ *   • content_block_start {index, content_block:{type:"tool_use", id, name}} — begin accumulating a tool_use.
+ *   • content_block_delta {index, delta:{type:"text_delta", text}}           — emit a text event.
+ *   • content_block_delta {index, delta:{type:"input_json_delta", partial_json}} — accumulate the tool input JSON.
+ *   • content_block_stop  {index} — a finished tool_use block is emitted (its accumulated partial JSON is parsed).
+ * Per-event fail-soft (a malformed event is skipped, never kills the stream) — the SSE layer already skips bad JSON.
+ */
+async function* parseAnthropicStream(body: ReadableStream<Uint8Array>): AsyncIterable<CompletionEvent> {
+  // Accumulate streamed tool_use blocks by content-block index (id+name from start, partial JSON from deltas).
+  const pending = new Map<number, { id: string; name: string; json: string }>();
+  for await (const raw of sseEvents(body)) {
+    const evt = raw as {
+      type?: string;
+      index?: number;
+      content_block?: { type?: string; id?: string; name?: string };
+      delta?: { type?: string; text?: string; partial_json?: string };
+    };
+    if (evt.type === "content_block_start" && evt.content_block?.type === "tool_use") {
+      pending.set(evt.index ?? 0, { id: evt.content_block.id ?? "", name: evt.content_block.name ?? "", json: "" });
+      continue;
+    }
+    if (evt.type === "content_block_delta") {
+      const d = evt.delta;
+      if (d?.type === "text_delta" && typeof d.text === "string" && d.text.length > 0) {
+        yield { type: "text", text: d.text };
+      } else if (d?.type === "input_json_delta" && typeof d.partial_json === "string") {
+        const acc = pending.get(evt.index ?? 0);
+        if (acc) acc.json += d.partial_json;
+      }
+      continue;
+    }
+    if (evt.type === "content_block_stop") {
+      const acc = pending.get(evt.index ?? 0);
+      if (acc) {
+        pending.delete(evt.index ?? 0);
+        let input: unknown = {};
+        try {
+          input = acc.json.length > 0 ? JSON.parse(acc.json) : {};
+        } catch {
+          input = {}; // a malformed tool input → empty object (the tool/loop handles it; never crash the stream)
+        }
+        yield { type: "tool_use", id: acc.id, name: acc.name, input };
+      }
+    }
+  }
+}
+
+/**
+ * Execute ONE tool via the WAVE gateway tool-exec endpoint (step 5). Posts {name,input} with the internal Bearer;
+ * returns the stringified result. TODO(#81): the EXACT gateway tool-exec/MCP path is pinned with the gateway side —
+ * until then this targets a sensible `/v1/internal/tools/exec` (mirrors the `/v1/internal/usage` server-to-server
+ * convention already used in metering.ts). It is NOT a fake: it makes a real call when the gateway is provisioned
+ * and the core fails CLOSED (an is_error tool_result, logged) when it errors. The agent NEVER fabricates a result.
+ */
+async function callGatewayTool(
+  fetchImpl: FetchLike,
+  env: AgentTurnEnv,
+  name: string,
+  input: unknown,
+): Promise<string> {
+  const base = env.WAVE_GATEWAY_BASE!.replace(/\/+$/, "");
+  const path = env.VOICE_AGENT_TOOL_EXEC_PATH ?? "/v1/internal/tools/exec";
+  const res = await fetchImpl(`${base}${path.startsWith("/") ? path : `/${path}`}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${env.WAVE_GATEWAY_TOKEN}`, // gateway service token — never logged
+    },
+    body: JSON.stringify({ name, input }),
+  });
+  if (!res.ok) throw new AgentSessionError("TOOL_UPSTREAM", `gateway tool-exec returned ${res.status}`, 502);
+  // Accept either a JSON {result} envelope or a raw string body — stringify so the model always gets text.
+  const text = await res.text();
+  try {
+    const j = JSON.parse(text) as { result?: unknown };
+    return typeof j.result === "string" ? j.result : JSON.stringify(j.result ?? j);
+  } catch {
+    return text; // non-JSON body → pass through verbatim
   }
 }
 
@@ -504,3 +730,12 @@ async function* sseEvents(body: ReadableStream<Uint8Array>): AsyncIterable<unkno
 
 /** Re-export for callers that need it next to the turn module. */
 export type { IngestSocket };
+/** Step-5 re-exports so the DO + callers reach the tool types/allowlist from the turn module. */
+export {
+  ToolAllowlist,
+  toolAllowlistFromEnv,
+  type ToolDefinition,
+  type ToolUse,
+  type ToolResult,
+  type CompletionEvent,
+} from "./agent-tools.js";
