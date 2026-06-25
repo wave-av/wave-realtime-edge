@@ -48,6 +48,7 @@ import {
   type CreateIngestAdapterResult,
 } from "./agent-ingest-adapter.js";
 import { TurnTakingCore, buildTurnDeps, type AgentTurnEnv } from "./agent-turn.js";
+import { vadConfigFromEnv } from "./agent-vad.js";
 
 /** The flag value that arms the WAVE voice agent. Anything else → fully inert. */
 export const VOICE_AGENT_PROVIDER_WAVE = "wave";
@@ -369,6 +370,7 @@ export class AgentSessionDO {
       const deps = buildTurnDeps(this.env, media, this.env.__agentFetch ?? fetch);
       this.turn = new TurnTakingCore(deps, { ...bound, systemPrompt: this.env.VOICE_AGENT_SYSTEM_PROMPT }, {
         framing: this.env.AGENT_INGEST_FRAMING,
+        vad: vadConfigFromEnv(this.env), // step 4: barge-in VAD thresholds (env-overridable, sensible defaults)
       });
       media.log("agent-turn-armed", { org: bound.org, room: bound.roomId, agentId: bound.agentId });
     } catch (e) {

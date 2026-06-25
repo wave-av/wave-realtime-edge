@@ -153,6 +153,85 @@ describe("TurnTakingCore — one full turn", () => {
   });
 });
 
+describe("TurnTakingCore — barge-in (step 4 interrupt controller)", () => {
+  const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+  // Loud PCM (16-bit LE samples of ~10000 → RMS ≫ default 500) = "speech"; no 0x00 so it never reads as STT-final.
+  const loud = () => egressFrame([0x10, 0x27, 0x10, 0x27, 0x10, 0x27], 9);
+  // Quiet PCM (zero samples → RMS 0) = "silence" for the VAD.
+  const quiet = () => egressFrame([0, 0, 0, 0], 9);
+  const startTurn = () => egressFrame([30, 0x00], 1); // quiet + 0x00 terminator → STT-final → starts a turn
+
+  it("user speech mid-turn aborts the in-flight TTS — agent goes silent, interrupt is logged", async () => {
+    let releaseTts!: () => void;
+    const ttsGate = new Promise<void>((r) => (releaseTts = r));
+    const synthesize = vi.fn(async function* (_t: string) {
+      yield new Uint8Array([1, 2, 3, 4]); // chunk 1 publishes before the barge-in
+      await ttsGate; // hold the stream open → the turn is "in flight"
+      yield new Uint8Array([5, 6, 7, 8]); // chunk 2 must be SUPPRESSED once aborted
+    });
+    const { deps, sent, logs } = mkDeps({ synthesize });
+    // onsetFrames:1 → a single loud frame fires the barge-in (keeps the test deterministic).
+    const core = new TurnTakingCore(deps, goodCfg, { vad: { onsetFrames: 1, rmsThreshold: 500 } });
+
+    const turnP = core.onFrame(startTurn()); // do NOT await — parks at the TTS gate
+    await tick();
+    expect(sent.length).toBe(1); // chunk 1 already out
+    await core.onFrame(loud()); // barge-in while the agent is talking → abort
+    releaseTts();
+    await turnP;
+
+    expect(logs.some((l) => l.msg === "agent-turn-interrupt")).toBe(true);
+    expect(sent.length).toBe(1); // chunk 2 was suppressed by the abort (agent went silent)
+  });
+
+  it("silence mid-turn does NOT abort — the agent keeps talking", async () => {
+    let releaseTts!: () => void;
+    const ttsGate = new Promise<void>((r) => (releaseTts = r));
+    const synthesize = vi.fn(async function* (_t: string) {
+      yield new Uint8Array([1, 2, 3, 4]);
+      await ttsGate;
+      yield new Uint8Array([5, 6, 7, 8]);
+    });
+    const { deps, sent, logs } = mkDeps({ synthesize });
+    const core = new TurnTakingCore(deps, goodCfg, { vad: { onsetFrames: 1, rmsThreshold: 500 } });
+
+    const turnP = core.onFrame(startTurn());
+    await tick();
+    await core.onFrame(quiet()); // silence mid-turn → no onset → no barge-in
+    releaseTts();
+    await turnP;
+
+    expect(logs.some((l) => l.msg === "agent-turn-interrupt")).toBe(false);
+    expect(sent.length).toBe(2); // both chunks delivered — the agent finished its turn
+  });
+
+  it("after a barge-in the next utterance is a clean new turn (history still alternates)", async () => {
+    let releaseTts!: () => void;
+    const ttsGate = new Promise<void>((r) => (releaseTts = r));
+    const synthesize = vi.fn(async function* (_t: string) {
+      yield new Uint8Array([1, 2, 3, 4]);
+      await ttsGate;
+      yield new Uint8Array([5, 6, 7, 8]);
+    });
+    const { deps, complete } = mkDeps({ synthesize });
+    const core = new TurnTakingCore(deps, goodCfg, { vad: { onsetFrames: 1, rmsThreshold: 500 } });
+
+    const turnP = core.onFrame(startTurn()); // turn 1 — LLM committed assistant, then parks in TTS
+    await tick();
+    await core.onFrame(loud()); // barge-in turn 1
+    releaseTts();
+    await turnP;
+
+    await core.onFrame(egressFrame([31, 0x00], 2)); // turn 2 — a fresh utterance
+    // History is strictly alternating: system + (turn1 user/assistant) + (turn2 user/assistant), no dangling users.
+    expect(core.history().map((m) => m.role)).toEqual(["system", "user", "assistant", "user", "assistant"]);
+    const secondReq = (complete as ReturnType<typeof vi.fn>).mock.calls[1][0] as LlmMessage[];
+    for (let i = 1; i < secondReq.length; i++) {
+      expect(secondReq[i].role === "user" && secondReq[i - 1].role === "user").toBe(false);
+    }
+  });
+});
+
 describe("TurnTakingCore — fail-safety (never throws up the media path)", () => {
   it("STT throwing is logged and swallowed", async () => {
     const { deps, logs, complete } = mkDeps({
