@@ -130,7 +130,7 @@ const SAFE_SEGMENT = /^[A-Za-z0-9_:.-]{1,128}$/;
 const AGENT_DISPATCH_ROUTE = /^\/v1\/realtime\/agents\/([a-z]+)\/?$/;
 const AGENT_DISPATCH_INTENTS = new Set(["bind", "info"]);
 /** Task #81 — agent egress WS the SFU dials OUT to (PCM in): /v1/realtime/agents/egress/:org/:room/:sessionId/:trackName.
- *  Mirrors RECORDER_ROUTE; the DO key is `${org}:${room}:${agentId}`-derived so a frame reaches the SAME AgentSessionDO
+ *  Mirrors RECORDER_ROUTE; the DO key is `${org}:${room}`-derived so a frame reaches the SAME AgentSessionDO
  *  the dispatch bound. The capability token (?t=) authorizes the third-party SFU dial-in (it can't send x-wave-internal). */
 const AGENT_EGRESS_ROUTE = /^\/v1\/realtime\/agents\/egress\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
 
@@ -642,7 +642,7 @@ export default {
 		// When the flag is off, BOTH blocks below are skipped and the request falls through to the 501 catch-all,
 		// UNCHANGED. When on, the SAME gateway-trust chokepoint as every paid route gates dispatch; the egress WS
 		// route additionally accepts the per-(org,session,track) capability token the SFU appends (it can't send
-		// x-wave-internal). The AgentSessionDO is keyed `${org}:${room}:${agentId}` so dispatch + egress address one DO.
+		// x-wave-internal). The AgentSessionDO is keyed `${org}:${room}` so dispatch + egress address one DO.
 		if (voiceAgentEnabled(env)) {
 			// 1) Dispatch: POST /v1/realtime/agents/:intent (bind|info) → bind/inspect an AgentSessionDO for a room.
 			const adMatch = request.method === "POST" ? url.pathname.match(AGENT_DISPATCH_ROUTE) : null;
@@ -669,8 +669,10 @@ export default {
 				if (adMatch[1] === "bind" && (!SAFE_SEGMENT.test(room) || !SAFE_SEGMENT.test(agentId))) {
 					return Response.json({ error: "BAD_REQUEST", message: "bind requires config.roomId and config.agentId" }, { status: 400 });
 				}
-				// The DO id binds the agent session to (org, room, agent) — one agent per room per design §L1.
-				const doKey = adMatch[1] === "bind" ? `${org}:${room}:${agentId}` : `${org}:${room}:${agentId}`;
+				// One agent-session DO per room (design §L1), so the DO id is room-scoped — dispatch and egress
+				// derive the SAME id from `${org}:${room}` and always resolve one stub.
+				// TODO(#81): thread agentId through the egress URL if we ever need >1 agent per room.
+				const doKey = `${org}:${room}`;
 				const id = env.AGENT_SESSION.idFromName(doKey);
 				const stub = env.AGENT_SESSION.get(id);
 				const method = adMatch[1] === "info" ? "GET" : "POST";
@@ -710,11 +712,10 @@ export default {
 				} catch {
 					/* binaryType not settable on some runtimes — the Blob branch below still catches it */
 				}
-				// The egress route doesn't carry agentId (the SFU adapter endpoint is per session/track); the DO is
-				// addressed by `${org}:${room}` here and the dispatch bound the SAME-prefixed id — see PR note: a later
-				// wiring slice threads agentId through the endpoint so egress lands on the exact bound DO. For the
-				// skeleton, frames forward to the room+session-keyed DO (echo is per-DO, fail-open).
-				const id = env.AGENT_SESSION.idFromName(`${aorg}:${aroom}:${asession}`);
+				// Room-scoped DO key `${org}:${room}` — identical to the dispatch /bind key, so echo frames forward to
+				// the SAME AgentSessionDO that /bind initialized (one agent-session DO per room, design §L1).
+				// TODO(#81): thread agentId through the egress URL if we ever need >1 agent per room.
+				const id = env.AGENT_SESSION.idFromName(`${aorg}:${aroom}`);
 				const stub = env.AGENT_SESSION.get(id);
 				server.addEventListener("message", (ev: MessageEvent) => {
 					const data = ev.data;

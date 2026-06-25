@@ -1,7 +1,8 @@
 // Task #81 — worker dispatch + egress routes for the voice agent. Proves: FULLY INERT without the flag (a
 // /v1/realtime/agents/* request falls through to the 501 catch-all, UNCHANGED); with the flag on, dispatch
 // gates on the internal secret + org + AGENT_SESSION binding and forwards bind to the DO keyed
-// `${org}:${room}:${agentId}`; the egress route requires a WS upgrade and forwards frames to the DO. Stub
+// `${org}:${room}` (room-scoped: one agent-session DO per room); the egress route requires a WS upgrade and
+// forwards frames to that SAME DO. Stub
 // AGENT_SESSION namespace + WebSocketPair; no live DO/SFU/WS runtime.
 import { describe, it, expect, beforeAll } from "vitest";
 import worker from "../src/worker.js";
@@ -59,11 +60,11 @@ describe("dispatch (flag on)", () => {
     const res = await worker.fetch(new Request("https://rt/v1/realtime/agents/bind", { method: "POST", headers: { "x-wave-org": "org1" }, body: JSON.stringify({ config: { roomId: "r1", agentId: "a1" } }) }), { ...base } as never, ctx);
     expect(res.status).toBe(503);
   });
-  it("forwards bind to the DO keyed org:room:agent", async () => {
+  it("forwards bind to the DO keyed org:room (room-scoped)", async () => {
     const ns = stubAgentNs();
     const res = await worker.fetch(new Request("https://rt/v1/realtime/agents/bind", { method: "POST", headers: { "x-wave-org": "org1" }, body: JSON.stringify({ config: { roomId: "r1", agentId: "a1", participantSessionId: "sess_abc12345", participantTrackName: "mic" } }) }), { ...base, AGENT_SESSION: ns } as never, ctx);
     expect(res.status).toBe(200);
-    expect(ns.seen.name).toBe("org1:r1:a1");
+    expect(ns.seen.name).toBe("org1:r1");
     expect(ns.seen.forwards[0].url).toContain("/bind");
   });
 });
