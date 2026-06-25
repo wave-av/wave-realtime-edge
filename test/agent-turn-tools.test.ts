@@ -156,11 +156,13 @@ describe("TurnTakingCore — fail-safety during tool calls", () => {
   });
 
   it("does NOT log the raw tool input verbatim (audit redaction — name + size only)", async () => {
-    const { deps, logs } = mkDeps([[tool("tu_s", "lookup", { secret: "p@ssw0rd-DO-NOT-LOG" })], [text("ok")]]);
+    // NB: use a benign sentinel (NOT a secret-named key/value) so the no-secrets-in-git enforcer doesn't flag the
+    // fixture — the test still proves the raw input VALUE never reaches the logs (which is the redaction contract).
+    const { deps, logs } = mkDeps([[tool("tu_s", "lookup", { q: "RAW-INPUT-MUST-NOT-APPEAR" })], [text("ok")]]);
     const core = new TurnTakingCore(deps, cfg, { tools: allowlist });
     await core.onFrame(fire());
     const serialized = JSON.stringify(logs);
-    expect(serialized).not.toContain("p@ssw0rd-DO-NOT-LOG"); // the VALUE is never logged
+    expect(serialized).not.toContain("RAW-INPUT-MUST-NOT-APPEAR"); // the VALUE is never logged
     const callLog = logs.find((l) => l.msg === "agent-tool-call");
     expect(callLog!.fields).toMatchObject({ tool: "lookup" });
     expect(typeof callLog!.fields.inputBytes).toBe("number"); // a size summary IS logged
