@@ -49,6 +49,7 @@ import {
 } from "./agent-ingest-adapter.js";
 import { TurnTakingCore, buildTurnDeps, toolAllowlistFromEnv, type AgentTurnEnv } from "./agent-turn.js";
 import { vadConfigFromEnv } from "./agent-vad.js";
+import { mintRecorderToken } from "./encoders/recorder-auth.js";
 
 /** The flag value that arms the WAVE voice agent. Anything else → fully inert. */
 export const VOICE_AGENT_PROVIDER_WAVE = "wave";
@@ -101,8 +102,14 @@ export interface AgentMediaDeps {
 export interface AgentEndpoints {
   /** e.g. wss://rt.wave.online — the agent egress route + ingest route hang off this. */
   baseWss: string;
-  /** Capability token appended as ?t= to the egress endpoint (SFU can't send x-wave-internal). */
+  /** Capability token (?t=) for the EGRESS endpoint — bound to (org, participantSessionId, participantTrackName).
+   *  The SFU can't send x-wave-internal, so without this its dial-in 401s and CF returns
+   *  "create websocket adapter returned 503" (websocket_handshake_failed). */
   egressToken?: string;
+  /** Capability token (?t=) for the INGEST endpoint — bound to (org, participantSessionId, agentTrackName).
+   *  MUST be a SEPARATE token from egressToken: the route verifies it against the AGENT track name, not the
+   *  participant's, so one token cannot authorize both endpoints. */
+  ingestToken?: string;
 }
 
 /** One timing sample for the barge-in measurement a LIVE run will later analyze (logged, never claimed). */
@@ -175,13 +182,17 @@ export class AgentSessionCore {
     if (!/^wss:\/\//.test(endpoints.baseWss || "")) {
       throw new AgentSessionError("BAD_ENDPOINT", "baseWss must be a wss:// URL", 400);
     }
-    const tokenQs = endpoints.egressToken ? `?t=${encodeURIComponent(endpoints.egressToken)}` : "";
+    // Per-endpoint capability tokens — egress binds the PARTICIPANT track, ingest binds the AGENT track, so
+    // they MUST differ (each route verifies the token against its own trackName segment). A missing/mismatched
+    // token makes the SFU's WS dial-in 401 → CF reports websocket_handshake_failed → "returned 503".
+    const egTokenQs = endpoints.egressToken ? `?t=${encodeURIComponent(endpoints.egressToken)}` : "";
+    const inTokenQs = endpoints.ingestToken ? `?t=${encodeURIComponent(endpoints.ingestToken)}` : "";
     const egressEndpoint =
       `${endpoints.baseWss.replace(/\/+$/, "")}/v1/realtime/agents/egress/` +
-      `${encodeURIComponent(c.org)}/${encodeURIComponent(c.roomId)}/${encodeURIComponent(c.participantSessionId)}/${encodeURIComponent(c.participantTrackName)}${tokenQs}`;
+      `${encodeURIComponent(c.org)}/${encodeURIComponent(c.roomId)}/${encodeURIComponent(c.participantSessionId)}/${encodeURIComponent(c.participantTrackName)}${egTokenQs}`;
     const ingestEndpoint =
       `${endpoints.baseWss.replace(/\/+$/, "")}/v1/realtime/agents/ingest/` +
-      `${encodeURIComponent(c.org)}/${encodeURIComponent(c.roomId)}/${encodeURIComponent(c.participantSessionId)}/${encodeURIComponent(c.agentTrackName!)}${tokenQs}`;
+      `${encodeURIComponent(c.org)}/${encodeURIComponent(c.roomId)}/${encodeURIComponent(c.participantSessionId)}/${encodeURIComponent(c.agentTrackName!)}${inTokenQs}`;
 
     this.egress = await this.deps.createEgress([
       { location: "remote", sessionId: c.participantSessionId, trackName: c.participantTrackName, endpoint: egressEndpoint, outputCodec: "pcm" },
@@ -379,7 +390,17 @@ export class AgentSessionDO {
         if (!body.config) throw new AgentSessionError("BAD_REQUEST", "config is required", 400);
         const bound = this.core.bind(body.config);
         const baseWss = this.env.AGENT_PUBLIC_WSS ?? "wss://rt.wave.online";
-        const { egress, ingest } = await this.core.openAdapters({ baseWss });
+        // Mint the per-endpoint capability tokens the SFU appends as ?t= on its dial-in (it can't send
+        // x-wave-internal). Egress binds the participant track; ingest binds the agent track. Without these
+        // the SFU handshake 401s → CF returns "create websocket adapter returned 503" (the live-spike bug).
+        const secret = this.env.WAVE_INTERNAL_SECRET;
+        const egressToken = secret
+          ? await mintRecorderToken(secret, bound.org, bound.participantSessionId, bound.participantTrackName)
+          : undefined;
+        const ingestToken = secret
+          ? await mintRecorderToken(secret, bound.org, bound.participantSessionId, bound.agentTrackName!)
+          : undefined;
+        const { egress, ingest } = await this.core.openAdapters({ baseWss, egressToken, ingestToken });
         this.armTurnTaking(bound); // step 3: arm the turn core for this binding (replaces echo on frames)
         return Response.json(
           { ok: true, bound, egressAdapterId: egress.adapterId, ingestAdapterId: ingest.adapterId },
