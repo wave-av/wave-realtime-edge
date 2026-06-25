@@ -50,7 +50,7 @@ describe("buildTurnDeps — gateway LLM streaming", () => {
       WAVE_GATEWAY_BASE: "https://api.wave.online/",
       WAVE_GATEWAY_TOKEN: "secret-gw-token",
     };
-    const deps = buildTurnDeps(env, media, fetchImpl);
+    const deps = buildTurnDeps(env, media, fetchImpl, "org_acme"); // org → x-wave-org tenant attribution
     const msgs: LlmMessage[] = [
       { role: "system", content: "sys" },
       { role: "user", content: "hi" },
@@ -58,14 +58,15 @@ describe("buildTurnDeps — gateway LLM streaming", () => {
     const out = await collect(deps.complete(msgs, []));
     expect(out.map((e) => (e.type === "text" ? e.text : "")).join("")).toBe("Hello");
     const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toBe("https://api.wave.online/v1/messages");
+    // The LLM proxy is the gateway's INTERNAL (service-token-gated) route, not the customer /v1/messages.
+    expect(url).toBe("https://api.wave.online/v1/internal/messages");
     expect(url).not.toContain("secret-gw-token"); // secret never in the URL
     const body = JSON.parse((init as RequestInit).body as string);
     expect(body.model).toBe(DEFAULT_VOICE_LLM_MODEL);
     expect(body.system).toBe("sys");
     expect(body.stream).toBe(true);
     expect(body.messages.map((m: LlmMessage) => m.role)).toEqual(["user"]); // system hoisted out
-    expect((init as RequestInit).headers).toMatchObject({ authorization: "Bearer secret-gw-token" });
+    expect((init as RequestInit).headers).toMatchObject({ authorization: "Bearer secret-gw-token", "x-wave-org": "org_acme" });
   });
 
   it("honors VOICE_AGENT_LLM_MODEL override (Opus)", async () => {
@@ -121,19 +122,21 @@ describe("buildTurnDeps — ElevenLabs TTS streaming", () => {
 });
 
 describe("buildTurnDeps — STT via the WAVE transcribe spoke (gateway-fronted, WAV-wrapped batch)", () => {
-  it("WAV-wraps the PCM, posts to /v1/transcribe?engine=auto with the service Bearer, maps text->final", async () => {
+  it("WAV-wraps the PCM, posts to /v1/internal/transcribe?engine=auto with the service Bearer + x-wave-org, maps text->final", async () => {
     const fetchImpl = vi.fn(async () =>
       new Response(JSON.stringify({ text: "hi there", durationSec: 1.2 }), { status: 200 }),
     );
     const env: AgentTurnEnv = { VOICE_AGENT_STT_BASE: "https://api.wave.online/", VOICE_AGENT_STT_TOKEN: "stt-secret" };
-    const r = await buildTurnDeps(env, media, fetchImpl).transcribe(new Uint8Array([9, 9, 9, 9]));
+    const r = await buildTurnDeps(env, media, fetchImpl, "org_acme").transcribe(new Uint8Array([9, 9, 9, 9]));
     expect(r).toEqual({ isFinal: true, transcript: "hi there" }); // batch result IS the final user turn
     const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toBe("https://api.wave.online/v1/transcribe?engine=auto");
+    // STT is reached via the gateway's INTERNAL (service-token-gated) route, not the customer /v1/transcribe.
+    expect(url).toBe("https://api.wave.online/v1/internal/transcribe?engine=auto");
     expect(url).not.toContain("stt-secret"); // secret never in the URL
     expect((init as RequestInit).headers).toMatchObject({
       authorization: "Bearer stt-secret",
       "content-type": "audio/wav",
+      "x-wave-org": "org_acme",
     });
     // The body is a WAV container (44-byte RIFF header) wrapping the raw PCM, not headerless PCM.
     const body = new Uint8Array((init as RequestInit).body as ArrayBuffer);
@@ -148,7 +151,7 @@ describe("buildTurnDeps — STT via the WAVE transcribe spoke (gateway-fronted, 
     const r = await buildTurnDeps(env, media, fetchImpl).transcribe(new Uint8Array([1]));
     expect(r.isFinal).toBe(true);
     const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toBe("https://api.wave.online/v1/transcribe?engine=auto");
+    expect(url).toBe("https://api.wave.online/v1/internal/transcribe?engine=auto");
     expect((init as RequestInit).headers).toMatchObject({ authorization: "Bearer gw-tok" });
   });
 
@@ -246,7 +249,7 @@ describe("buildTurnDeps — the established edge convention alone provisions LLM
     const out = await collect(buildTurnDeps(env, media, fetchImpl).complete([{ role: "user", content: "hi" }], []));
     expect(out.map((e) => (e.type === "text" ? e.text : "")).join("")).toBe("ok");
     const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toBe("https://api.wave.online/v1/messages");
+    expect(url).toBe("https://api.wave.online/v1/internal/messages");
     expect((init as RequestInit).headers).toMatchObject({ authorization: "Bearer svc-tok" });
   });
 
@@ -255,7 +258,7 @@ describe("buildTurnDeps — the established edge convention alone provisions LLM
     const env: AgentTurnEnv = { GATEWAY_BASE_URL: "https://api.wave.online", WAVE_SERVICE_TOKEN: "svc-tok" };
     const r = await buildTurnDeps(env, media, fetchImpl).transcribe(new Uint8Array([1]));
     expect(r).toEqual({ isFinal: true, transcript: "hi" });
-    expect((fetchImpl.mock.calls[0] as unknown as [string])[0]).toBe("https://api.wave.online/v1/transcribe?engine=auto");
+    expect((fetchImpl.mock.calls[0] as unknown as [string])[0]).toBe("https://api.wave.online/v1/internal/transcribe?engine=auto");
   });
 });
 

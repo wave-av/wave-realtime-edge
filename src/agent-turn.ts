@@ -499,6 +499,8 @@ export interface AgentTurnEnv extends AgentSessionEnv, VadEnv, VoiceMeterEnv {
   WAVE_GATEWAY_TOKEN?: string;
   /** Claude model id routed through the gateway (Opus/Sonnet per design). Defaults to a sensible Sonnet. */
   VOICE_AGENT_LLM_MODEL?: string;
+  /** LLM proxy path on the gateway (var). Default /v1/internal/messages (the service-token-gated internal route). */
+  VOICE_AGENT_LLM_PATH?: string;
   /** ElevenLabs API key (secret; server-side ONLY, never client, never logged). */
   ELEVENLABS_API_KEY?: string;
   /** ElevenLabs voice id for the agent persona (var). */
@@ -512,7 +514,7 @@ export interface AgentTurnEnv extends AgentSessionEnv, VadEnv, VoiceMeterEnv {
   VOICE_AGENT_STT_TOKEN?: string;
   /** STT engine routed by the transcribe spoke (var): auto|whisper|deepgram|elevenlabs. Default "auto". */
   VOICE_AGENT_STT_ENGINE?: string;
-  /** STT path on the gateway/spoke (var). Default /v1/transcribe (the transcribe spoke's batch endpoint). */
+  /** STT path on the gateway (var). Default /v1/internal/transcribe (the service-token-gated internal STT route). */
   VOICE_AGENT_STT_PATH?: string;
   /**
    * Step-5 agent-least-privilege tool ALLOWLIST (var; JSON array of {name,description,input_schema}). The agent
@@ -556,9 +558,12 @@ export function buildTurnDeps(
   rawEnv: AgentTurnEnv,
   media: AgentMediaDeps,
   fetchImpl: FetchLike = fetch,
+  org = "",
 ): AgentTurnDeps & AgentMediaDeps {
   // One canonical gateway base/token for ALL paths (LLM, STT, tools, metering) — either convention provisions all.
   const env = normalizeGatewayEnv(rawEnv);
+  // `org` (the bound tenant) is asserted as x-wave-org on each gateway call so the gateway's internal STT/LLM
+  // routes attribute + meter usage to the right tenant. Empty only in non-bound test paths.
   return {
     ...media,
     async transcribe(pcm: Uint8Array): Promise<SttResult> {
@@ -568,13 +573,13 @@ export function buildTurnDeps(
         // Fail CLOSED + loud — the WAVE transcribe spoke (gateway-fronted) is not provisioned. NEVER a fake.
         throw new AgentSessionError("STT_NOT_CONFIGURED", "STT gateway base/token not provisioned", 503);
       }
-      return transcribeViaProvider(fetchImpl, env, base, token, pcm);
+      return transcribeViaProvider(fetchImpl, env, org, base, token, pcm);
     },
     async *complete(messages: LlmMessage[], tools: ToolDefinition[]): AsyncIterable<CompletionEvent> {
       if (!env.WAVE_GATEWAY_BASE || !env.WAVE_GATEWAY_TOKEN) {
         throw new AgentSessionError("LLM_NOT_CONFIGURED", "WAVE gateway base/token not provisioned", 503);
       }
-      yield* streamGatewayLlm(fetchImpl, env, messages, tools);
+      yield* streamGatewayLlm(fetchImpl, env, org, messages, tools);
     },
     async callTool(name: string, input: unknown): Promise<string> {
       if (!env.WAVE_GATEWAY_BASE || !env.WAVE_GATEWAY_TOKEN) {
@@ -582,7 +587,7 @@ export function buildTurnDeps(
         // metering authority). Unprovisioned → throw (the core turns it into an is_error tool_result, logged).
         throw new AgentSessionError("TOOL_NOT_CONFIGURED", "WAVE gateway base/token not provisioned", 503);
       }
-      return callGatewayTool(fetchImpl, env, name, input);
+      return callGatewayTool(fetchImpl, env, org, name, input);
     },
     async *synthesize(text: string): AsyncIterable<Uint8Array> {
       if (!env.ELEVENLABS_API_KEY || !env.ELEVENLABS_VOICE_ID) {

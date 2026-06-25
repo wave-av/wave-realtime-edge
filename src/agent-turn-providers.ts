@@ -36,23 +36,31 @@ export const ELEVENLABS_OUTPUT_FORMAT = "pcm_48000";
 export async function* streamGatewayLlm(
   fetchImpl: FetchLike,
   env: AgentTurnEnv,
+  org: string,
   messages: LlmMessage[],
   tools: ToolDefinition[] = [],
 ): AsyncIterable<CompletionEvent> {
   const base = env.WAVE_GATEWAY_BASE!.replace(/\/+$/, "");
+  // The gateway exposes the LLM proxy as an INTERNAL route (service-token gated): /v1/internal/messages.
+  // Overridable via VOICE_AGENT_LLM_PATH. The org is asserted via x-wave-org so the gateway meters the tokens
+  // to the right tenant (wave_ai_tokens_<tier>_<dir>).
+  const rawPath = env.VOICE_AGENT_LLM_PATH ?? "/v1/internal/messages";
+  const path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
   const model = env.VOICE_AGENT_LLM_MODEL ?? DEFAULT_VOICE_LLM_MODEL;
   const system = messages.find((m) => m.role === "system")?.content;
   const turns = messages.filter((m) => m.role !== "system");
   const body: Record<string, unknown> = { model, max_tokens: 1024, stream: true, system, messages: turns };
   // agent-least-privilege: advertise ONLY the allowlisted tools (omit the field entirely when there are none).
   if (tools.length > 0) body.tools = tools;
-  const res = await fetchImpl(`${base}/v1/messages`, {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    authorization: `Bearer ${env.WAVE_GATEWAY_TOKEN}`, // gateway service token — never logged
+    accept: "text/event-stream",
+  };
+  if (org) headers["x-wave-org"] = org; // tenant attribution for gateway metering
+  const res = await fetchImpl(`${base}${path}`, {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${env.WAVE_GATEWAY_TOKEN}`, // gateway service token — never logged
-      accept: "text/event-stream",
-    },
+    headers,
     body: JSON.stringify(body),
   });
   if (!res.ok || !res.body) {
@@ -119,17 +127,20 @@ async function* parseAnthropicStream(body: ReadableStream<Uint8Array>): AsyncIte
 export async function callGatewayTool(
   fetchImpl: FetchLike,
   env: AgentTurnEnv,
+  org: string,
   name: string,
   input: unknown,
 ): Promise<string> {
   const base = env.WAVE_GATEWAY_BASE!.replace(/\/+$/, "");
   const path = env.VOICE_AGENT_TOOL_EXEC_PATH ?? "/v1/internal/tools/exec";
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    authorization: `Bearer ${env.WAVE_GATEWAY_TOKEN}`, // gateway service token — never logged
+  };
+  if (org) headers["x-wave-org"] = org; // tenant attribution
   const res = await fetchImpl(`${base}${path.startsWith("/") ? path : `/${path}`}`, {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${env.WAVE_GATEWAY_TOKEN}`, // gateway service token — never logged
-    },
+    headers,
     body: JSON.stringify({ name, input }),
   });
   if (!res.ok) throw new AgentSessionError("TOOL_UPSTREAM", `gateway tool-exec returned ${res.status}`, 502);
@@ -190,21 +201,26 @@ export async function* streamElevenLabs(
 export async function transcribeViaProvider(
   fetchImpl: FetchLike,
   env: AgentTurnEnv,
+  org: string,
   base: string,
   token: string,
   pcm: Uint8Array,
 ): Promise<SttResult> {
   const origin = base.replace(/\/+$/, "");
-  const rawPath = env.VOICE_AGENT_STT_PATH ?? "/v1/transcribe";
+  // STT is reached via the gateway's INTERNAL route (/v1/internal/transcribe — service-token gated). The
+  // org is asserted via x-wave-org so the gateway attributes the transcribe minutes to the right tenant.
+  const rawPath = env.VOICE_AGENT_STT_PATH ?? "/v1/internal/transcribe";
   const path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
   const engine = env.VOICE_AGENT_STT_ENGINE ?? "auto";
   const wav = pcmToWav(pcm); // 48k/16-bit/stereo PCM → WAV container (the spoke engines need a container)
+  const headers: Record<string, string> = {
+    "content-type": WAV_MIME,
+    authorization: `Bearer ${token}`, // gateway internal service token — never logged
+  };
+  if (org) headers["x-wave-org"] = org; // tenant attribution for gateway metering
   const res = await fetchImpl(`${origin}${path}?engine=${encodeURIComponent(engine)}`, {
     method: "POST",
-    headers: {
-      "content-type": WAV_MIME,
-      authorization: `Bearer ${token}`, // gateway internal service token — never logged
-    },
+    headers,
     body: wav,
   });
   if (!res.ok) throw new AgentSessionError("STT_UPSTREAM", `STT returned ${res.status}`, 502);
