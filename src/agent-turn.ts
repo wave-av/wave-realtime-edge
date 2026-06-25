@@ -534,11 +534,33 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
  *   • synthesize → ElevenLabs streaming TTS, pcm_48000, key server-side only.
  * Tests pass fakes instead of calling this. The DO calls this ONLY behind voiceAgentEnabled(env).
  */
+/**
+ * Normalize the gateway base/token to ONE canonical pair so a single operator-provided set provisions EVERY
+ * gateway path (LLM, STT, tools, metering). The voice runtime introduced `WAVE_GATEWAY_BASE`/`WAVE_GATEWAY_TOKEN`,
+ * but the established edge convention (metering.ts, room.ts) is `GATEWAY_BASE_URL`/`WAVE_SERVICE_TOKEN`. Without
+ * this, setting one pair leaves the other path silently INERT (e.g. LLM works but billing emits nothing) — a
+ * config-no-silent-noop trap. We fill BOTH names from whichever is set (voice name wins when both are present),
+ * so an operator may provision EITHER convention and every path resolves. Pure → unit-testable.
+ */
+export function normalizeGatewayEnv(env: AgentTurnEnv): AgentTurnEnv {
+  const base = env.WAVE_GATEWAY_BASE ?? env.GATEWAY_BASE_URL;
+  const token = env.WAVE_GATEWAY_TOKEN ?? env.WAVE_SERVICE_TOKEN;
+  return {
+    ...env,
+    WAVE_GATEWAY_BASE: base,
+    WAVE_GATEWAY_TOKEN: token,
+    GATEWAY_BASE_URL: env.GATEWAY_BASE_URL ?? base,
+    WAVE_SERVICE_TOKEN: env.WAVE_SERVICE_TOKEN ?? token,
+  };
+}
+
 export function buildTurnDeps(
-  env: AgentTurnEnv,
+  rawEnv: AgentTurnEnv,
   media: AgentMediaDeps,
   fetchImpl: FetchLike = fetch,
 ): AgentTurnDeps & AgentMediaDeps {
+  // One canonical gateway base/token for ALL paths (LLM, STT, tools, metering) — either convention provisions all.
+  const env = normalizeGatewayEnv(rawEnv);
   return {
     ...media,
     async transcribe(pcm: Uint8Array): Promise<SttResult> {
@@ -571,8 +593,9 @@ export function buildTurnDeps(
       yield* streamElevenLabs(fetchImpl, env, text);
     },
     async emitMeter(usage: VoiceTurnUsage): Promise<void> {
-      // Step-7 real usage emit (mirrors metering.ts). INERT until GATEWAY_BASE_URL + WAVE_SERVICE_TOKEN are
-      // provisioned; fail-OPEN so a metering error never breaks the turn (emitVoiceTurnUsage swallows + logs).
+      // Step-7 real usage emit (mirrors metering.ts). INERT until the gateway base + service token are
+      // provisioned (now resolved from EITHER convention by normalizeGatewayEnv); fail-OPEN so a metering
+      // error never breaks the turn (emitVoiceTurnUsage swallows + logs).
       await emitVoiceTurnUsage(env, usage, fetchImpl as unknown as typeof fetch);
     },
   };

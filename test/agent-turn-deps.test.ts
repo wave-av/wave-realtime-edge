@@ -4,6 +4,7 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   buildTurnDeps,
+  normalizeGatewayEnv,
   DEFAULT_VOICE_LLM_MODEL,
   ELEVENLABS_OUTPUT_FORMAT,
   type AgentTurnEnv,
@@ -203,5 +204,70 @@ describe("buildTurnDeps — voice_agent_minutes metering emit", () => {
     });
     const env: AgentTurnEnv = { GATEWAY_BASE_URL: "https://api.wave.online", WAVE_SERVICE_TOKEN: "t" };
     await expect(buildTurnDeps(env, media, fetchImpl).emitMeter(usage)).resolves.toBeUndefined();
+  });
+});
+
+describe("normalizeGatewayEnv — one convention provisions ALL gateway paths (config-no-silent-noop)", () => {
+  it("fills BOTH name pairs from the voice-runtime names", () => {
+    const r = normalizeGatewayEnv({ WAVE_GATEWAY_BASE: "https://api.wave.online", WAVE_GATEWAY_TOKEN: "tok" });
+    expect(r.WAVE_GATEWAY_BASE).toBe("https://api.wave.online");
+    expect(r.GATEWAY_BASE_URL).toBe("https://api.wave.online"); // metering name backfilled
+    expect(r.WAVE_GATEWAY_TOKEN).toBe("tok");
+    expect(r.WAVE_SERVICE_TOKEN).toBe("tok"); // metering token backfilled
+  });
+
+  it("fills BOTH name pairs from the established edge names", () => {
+    const r = normalizeGatewayEnv({ GATEWAY_BASE_URL: "https://api.wave.online", WAVE_SERVICE_TOKEN: "svc" });
+    expect(r.WAVE_GATEWAY_BASE).toBe("https://api.wave.online"); // LLM/STT name backfilled
+    expect(r.WAVE_GATEWAY_TOKEN).toBe("svc");
+    expect(r.GATEWAY_BASE_URL).toBe("https://api.wave.online");
+    expect(r.WAVE_SERVICE_TOKEN).toBe("svc");
+  });
+
+  it("voice names WIN when both conventions are present (deterministic precedence)", () => {
+    const r = normalizeGatewayEnv({
+      WAVE_GATEWAY_BASE: "https://voice.example",
+      WAVE_GATEWAY_TOKEN: "voice-tok",
+      GATEWAY_BASE_URL: "https://edge.example",
+      WAVE_SERVICE_TOKEN: "edge-tok",
+    });
+    expect(r.WAVE_GATEWAY_BASE).toBe("https://voice.example");
+    expect(r.WAVE_GATEWAY_TOKEN).toBe("voice-tok");
+    // The metering names keep their own explicit value (not clobbered) — both remain set, no silent loss.
+    expect(r.GATEWAY_BASE_URL).toBe("https://edge.example");
+    expect(r.WAVE_SERVICE_TOKEN).toBe("edge-tok");
+  });
+});
+
+describe("buildTurnDeps — the established edge convention alone provisions LLM + STT (not just metering)", () => {
+  it("GATEWAY_BASE_URL + WAVE_SERVICE_TOKEN drives the LLM proxy (no LLM_NOT_CONFIGURED)", async () => {
+    const fetchImpl = vi.fn(async () => sseResponse(["ok"]));
+    const env: AgentTurnEnv = { GATEWAY_BASE_URL: "https://api.wave.online", WAVE_SERVICE_TOKEN: "svc-tok" };
+    const out = await collect(buildTurnDeps(env, media, fetchImpl).complete([{ role: "user", content: "hi" }], []));
+    expect(out.map((e) => (e.type === "text" ? e.text : "")).join("")).toBe("ok");
+    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.wave.online/v1/messages");
+    expect((init as RequestInit).headers).toMatchObject({ authorization: "Bearer svc-tok" });
+  });
+
+  it("GATEWAY_BASE_URL + WAVE_SERVICE_TOKEN drives STT (no STT_NOT_CONFIGURED)", async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ text: "hi" }), { status: 200 }));
+    const env: AgentTurnEnv = { GATEWAY_BASE_URL: "https://api.wave.online", WAVE_SERVICE_TOKEN: "svc-tok" };
+    const r = await buildTurnDeps(env, media, fetchImpl).transcribe(new Uint8Array([1]));
+    expect(r).toEqual({ isFinal: true, transcript: "hi" });
+    expect((fetchImpl.mock.calls[0] as unknown as [string])[0]).toBe("https://api.wave.online/v1/transcribe?engine=auto");
+  });
+});
+
+describe("buildTurnDeps — the voice-runtime convention alone provisions metering (not just LLM)", () => {
+  it("WAVE_GATEWAY_BASE + WAVE_GATEWAY_TOKEN drives the meter emit (no silent metering no-op)", async () => {
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+    const env: AgentTurnEnv = { WAVE_GATEWAY_BASE: "https://api.wave.online", WAVE_GATEWAY_TOKEN: "gw-tok" };
+    await buildTurnDeps(env, media, fetchImpl).emitMeter({
+      org: "org1", room: "room1", agentId: "a1", turnId: "t0", turnWallMs: 60_000,
+    });
+    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.wave.online/v1/internal/usage");
+    expect((init as RequestInit).headers).toMatchObject({ authorization: "Bearer gw-tok" });
   });
 });
