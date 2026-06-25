@@ -47,6 +47,7 @@ import {
   type IngestFraming,
   type CreateIngestAdapterResult,
 } from "./agent-ingest-adapter.js";
+import { TurnTakingCore, buildTurnDeps, type AgentTurnEnv } from "./agent-turn.js";
 
 /** The flag value that arms the WAVE voice agent. Anything else → fully inert. */
 export const VOICE_AGENT_PROVIDER_WAVE = "wave";
@@ -269,6 +270,8 @@ export interface AgentSessionEnv {
   AGENT_PUBLIC_WSS?: string; // our public wss base the SFU dials back to (default rt.wave.online)
   /** Send-side ingest framing override; "packet" (default, modeled) | "raw" (the live spike may select). */
   AGENT_INGEST_FRAMING?: IngestFraming;
+  /** Step-3: the agent persona / system prompt for turn-taking (var; default in buildTurnSystemPrompt). */
+  VOICE_AGENT_SYSTEM_PROMPT?: string;
   /** test-only: injected adapter-create fetch (defaults to global fetch). Never a wire input. */
   __agentFetch?: typeof fetch;
   // ── HONEST EXTENSION POINTS (later #81 steps — NOT stubbed to pretend they work) ──
@@ -294,10 +297,12 @@ export interface AgentSessionEnv {
  */
 export class AgentSessionDO {
   private readonly core: AgentSessionCore;
-  private readonly env: AgentSessionEnv;
+  private readonly env: AgentTurnEnv;
   private ingest: IngestSocket | null = null;
+  /** Step-3 turn-taking core, armed on bind when the provider is WAVE (replaces echo as the live behavior). */
+  private turn: TurnTakingCore | null = null;
 
-  constructor(_state: DurableObjectStateLike, env?: AgentSessionEnv) {
+  constructor(_state: DurableObjectStateLike, env?: AgentTurnEnv) {
     this.env = env ?? {};
     this.core = new AgentSessionCore(this.buildMediaDeps(), { framing: this.env.AGENT_INGEST_FRAMING });
   }
@@ -314,7 +319,9 @@ export class AgentSessionDO {
     if (path === "echo-frame" && request.method === "POST") {
       try {
         const buf = new Uint8Array(await request.arrayBuffer());
-        if (buf.length > 0) await this.core.echoFrame(buf);
+        // Step 3: once a turn-taking core is armed (bound under VOICE_AGENT_PROVIDER=wave) frames drive a real
+        // conversational turn; until armed (or if turn-taking is unwired) we fall back to the echo harness.
+        if (buf.length > 0) await (this.turn ? this.turn.onFrame(buf) : this.core.echoFrame(buf));
       } catch {
         /* fail-open */
       }
@@ -327,6 +334,7 @@ export class AgentSessionDO {
         const bound = this.core.bind(body.config);
         const baseWss = this.env.AGENT_PUBLIC_WSS ?? "wss://rt.wave.online";
         const { egress, ingest } = await this.core.openAdapters({ baseWss });
+        this.armTurnTaking(bound); // step 3: arm the turn core for this binding (replaces echo on frames)
         return Response.json(
           { ok: true, bound, egressAdapterId: egress.adapterId, ingestAdapterId: ingest.adapterId },
           { status: 200 },
@@ -343,9 +351,29 @@ export class AgentSessionDO {
     }
   }
 
-  /** Feed one decoded egress WS frame to the echo harness (called by the agent egress WS route). */
+  /** Feed one decoded egress WS frame: a real turn when armed (step 3), else the echo harness (fallback). */
   echoFrame(frame: Uint8Array): Promise<void> {
-    return this.core.echoFrame(frame);
+    return this.turn ? this.turn.onFrame(frame) : this.core.echoFrame(frame);
+  }
+
+  /**
+   * Arm the step-3 turn-taking core for a binding. INERT unless VOICE_AGENT_PROVIDER=wave. Lazily imported so
+   * the skeleton's binding/migration deploy is unaffected. Wires LIVE STT/gateway-LLM/ElevenLabs deps from env
+   * (creds referenced, never logged) over the same media deps the echo core uses. Fail-soft: if arming throws,
+   * the DO keeps the echo fallback (media safety > agent) — never crashes the bind.
+   */
+  private armTurnTaking(bound: AgentSessionConfig): void {
+    if (!voiceAgentEnabled(this.env)) return;
+    try {
+      const media = this.buildMediaDeps();
+      const deps = buildTurnDeps(this.env, media, this.env.__agentFetch ?? fetch);
+      this.turn = new TurnTakingCore(deps, { ...bound, systemPrompt: this.env.VOICE_AGENT_SYSTEM_PROMPT }, {
+        framing: this.env.AGENT_INGEST_FRAMING,
+      });
+      media.log("agent-turn-armed", { org: bound.org, room: bound.roomId, agentId: bound.agentId });
+    } catch (e) {
+      this.buildMediaDeps().log("agent-turn-arm-error", { message: (e as Error)?.message ?? "unknown" });
+    }
   }
 
   /** Live media deps: real adapter-create calls + the DO-held ingest socket. SFU bearer from app creds. */
