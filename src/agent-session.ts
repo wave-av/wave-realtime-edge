@@ -433,7 +433,7 @@ export class AgentSessionDO {
     if (!voiceAgentEnabled(this.env)) return;
     try {
       const media = this.buildMediaDeps();
-      const deps = buildTurnDeps(this.env, media, this.env.__agentFetch ?? fetch);
+      const deps = buildTurnDeps(this.env, media, this.env.__agentFetch ?? fetch, bound.org);
       const tools = toolAllowlistFromEnv(this.env); // step 5: agent-least-privilege allowlist (env-driven)
       this.turn = new TurnTakingCore(deps, { ...bound, systemPrompt: this.env.VOICE_AGENT_SYSTEM_PROMPT }, {
         framing: this.env.AGENT_INGEST_FRAMING,
