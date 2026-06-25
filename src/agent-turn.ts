@@ -41,6 +41,7 @@ import {
 } from "./agent-session.js";
 import { decodePacket } from "./encoders/container-adapter.js";
 import { chunkPcm, encodeIngestFrame, type IngestFraming } from "./agent-ingest-adapter.js";
+import { Vad, vadConfigFromEnv, type VadConfig, type VadEnv } from "./agent-vad.js";
 
 // ── Public contracts (the injectable-deps seam) ──────────────────────────────────────────────────────────────
 
@@ -118,18 +119,23 @@ export class TurnTakingCore {
   private outSeq = 0;
   /** Guards against re-entrant turns (a turn is in flight while we await STT/LLM/TTS). */
   private turnInFlight = false;
-  /** Set by a step-4 interrupt controller via onUserSpeech() to cancel an in-flight turn (barge-in seam). */
+  /** Set by the step-4 interrupt controller (onUserSpeech / VAD barge-in) to cancel an in-flight turn. */
   private aborted = false;
+  /** Step-4 VAD: detects user speech ONSET on every frame → drives true barge-in while the agent talks. */
+  private readonly vad: Vad;
+  /** Frame counter (since the in-flight turn started) used to instrument barge-in detection→abort latency. */
+  private framesThisTurn = 0;
 
   constructor(
     deps: AgentTurnDeps & AgentMediaDeps,
     config: TurnTakingConfig,
-    opts?: { framing?: IngestFraming },
+    opts?: { framing?: IngestFraming; vad?: Partial<VadConfig> },
   ) {
     this.deps = deps;
     this.config = config;
     this.framing = opts?.framing ?? "packet";
     this.messages = [{ role: "system", content: buildTurnSystemPrompt(config) }];
+    this.vad = new Vad(opts?.vad);
   }
 
   /** A copy of the conversation history (system + alternating user/assistant). For tests + DO snapshotting. */
@@ -147,8 +153,27 @@ export class TurnTakingCore {
     try {
       const pkt = decodePacket(frame);
       if (pkt.payload.length === 0) return; // keep-alive / empty
+      // VAD runs on EVERY decoded frame (design §L2.1) — it's the barge-in trigger AND the silence sensor.
+      stage = "vad";
+      const vadEvent = this.vad.feed(pkt.payload);
       this.utterance.push(pkt.payload);
-      if (this.turnInFlight) return; // already responding — accumulate; step 4 turns this into barge-in
+      if (this.turnInFlight) {
+        // Agent is speaking. A sustained speech ONSET = the user barged in → abort the in-flight turn NOW so the
+        // agent goes silent immediately. The interrupting PCM is already accumulating (pushed above) → it becomes
+        // the next utterance. This is the real barge-in wiring (onUserSpeech was only an external seam in step 3).
+        this.framesThisTurn += 1;
+        if (vadEvent === "speech-start") this.bargeIn();
+        return; // while a turn is in flight we never start STT — accumulate + (maybe) interrupt
+      }
+      if (vadEvent === "speech-end") {
+        // VAD endpointing SEAM (design §L2.2): a real silence-hangover ended the user's speech. v1 endpointing
+        // stays final-transcript-driven below (STT decides the turn) so we never cut the user off on energy alone;
+        // this transition is observed for the future semantic+silence endpointing refinement.
+        // TODO(#81 step 4 follow-up): complement final-transcript endpointing with this silence signal once the
+        //                             streaming-STT contract lands (pin debounce so a hard-silence ends the turn
+        //                             faster without truncating slow speakers). Barge-in is the must-ship here.
+        this.deps.log("agent-vad-endpoint", { ...this.idFields(), rms: Math.round(this.vad.lastFrameRms) });
+      }
       stage = "stt";
       const pcm = concat(this.utterance);
       const stt = await this.deps.transcribe(pcm);
@@ -170,6 +195,10 @@ export class TurnTakingCore {
   private async runTurn(userText: string): Promise<void> {
     this.turnInFlight = true;
     this.aborted = false;
+    this.framesThisTurn = 0;
+    // The user's final utterance was just consumed → reset the VAD to silence so the FIRST sustained speech onset
+    // while the agent talks is detected cleanly as a fresh barge-in (not contaminated by the prior episode's run).
+    this.vad.reset();
     const startMs = this.deps.now();
     let stage = "llm";
     try {
@@ -231,15 +260,32 @@ export class TurnTakingCore {
   }
 
   /**
-   * STEP-4 SEAM (NOT built here): a VAD/interrupt controller calls this when it detects the user started
-   * speaking while the agent was talking → abort the in-flight LLM/TTS so the agent stops immediately
-   * (best-in-class barge-in, design §L2.1). v1 only sets the flag; the real VAD + sub-300ms abort is step 4.
+   * EXTERNAL barge-in seam: an out-of-band controller (e.g. a streaming-STT partial, a UI "stop", or a future
+   * semantic endpointer) can also force an interrupt. Same effect as the VAD-driven `bargeIn()`. Kept so the
+   * abort path has ONE owner regardless of the trigger source (design §L2.1: abort TTS + cancel LLM).
    */
   onUserSpeech(): void {
-    if (this.turnInFlight) {
-      this.aborted = true;
-      this.deps.log("agent-turn-interrupt", this.idFields());
-    }
+    this.bargeIn();
+  }
+
+  /**
+   * Fire a barge-in: abort the in-flight turn so the LLM stream + TTS publish loops break on their next `aborted`
+   * check and the agent goes silent. No-op when no turn is in flight (nothing to interrupt). Latency-instrumented:
+   * we LOG the frame count from turn-start → this abort so a LIVE run can later prove the <300ms target — we make
+   * NO latency claim here (no live run yet; proven-live-or-not-done). Idempotent within a turn (only the first
+   * onset logs/sets; the TTS/LLM loops already broke on the flag).
+   */
+  private bargeIn(): void {
+    if (!this.turnInFlight || this.aborted) return;
+    this.aborted = true;
+    this.deps.log("agent-turn-interrupt", {
+      ...this.idFields(),
+      // frames observed between turn-start and the detected onset — the wall-ms is the LIVE-run measurement.
+      framesToAbort: this.framesThisTurn,
+      onsetRms: Math.round(this.vad.lastFrameRms),
+      // TODO(#81 step 4 LIVE-spike): on the Jake-named edge deploy, derive wall-ms from frame source timestamps
+      //                              (FrameTiming) to PROVE detected-onset→silence < ~300ms end-to-end.
+    });
   }
 
   private idFields(): Record<string, unknown> {
@@ -268,7 +314,7 @@ function concat(chunks: Uint8Array[]): Uint8Array {
  * Doppler at deploy. INERT until provisioned: a missing cred fails its stage CLOSED (logged, turn abandoned),
  * it never crashes the DO. Extends AgentSessionEnv so the DO env is one shape.
  */
-export interface AgentTurnEnv extends AgentSessionEnv {
+export interface AgentTurnEnv extends AgentSessionEnv, VadEnv {
   /** WAVE gateway origin for the LLM proxy (var; not a secret). e.g. https://api.wave.online */
   WAVE_GATEWAY_BASE?: string;
   /** Internal service-to-service bearer for the gateway LLM proxy (secret; deploy-time, never logged). */
