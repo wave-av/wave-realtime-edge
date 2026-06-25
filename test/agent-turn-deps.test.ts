@@ -119,17 +119,89 @@ describe("buildTurnDeps — ElevenLabs TTS streaming", () => {
   });
 });
 
-describe("buildTurnDeps — STT provider", () => {
-  it("posts PCM and parses {isFinal,transcript}", async () => {
+describe("buildTurnDeps — STT via the WAVE transcribe spoke (gateway-fronted, WAV-wrapped batch)", () => {
+  it("WAV-wraps the PCM, posts to /v1/transcribe?engine=auto with the service Bearer, maps text->final", async () => {
     const fetchImpl = vi.fn(async () =>
-      new Response(JSON.stringify({ isFinal: true, transcript: "hi there" }), { status: 200 }),
+      new Response(JSON.stringify({ text: "hi there", durationSec: 1.2 }), { status: 200 }),
     );
-    const env: AgentTurnEnv = { VOICE_AGENT_STT_BASE: "https://stt.wave.online", VOICE_AGENT_STT_KEY: "stt-secret" };
-    const r = await buildTurnDeps(env, media, fetchImpl).transcribe(new Uint8Array([9]));
-    expect(r).toEqual({ isFinal: true, transcript: "hi there" });
+    const env: AgentTurnEnv = { VOICE_AGENT_STT_BASE: "https://api.wave.online/", VOICE_AGENT_STT_TOKEN: "stt-secret" };
+    const r = await buildTurnDeps(env, media, fetchImpl).transcribe(new Uint8Array([9, 9, 9, 9]));
+    expect(r).toEqual({ isFinal: true, transcript: "hi there" }); // batch result IS the final user turn
     const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toBe("https://stt.wave.online/v1/transcribe/stream");
-    expect(url).not.toContain("stt-secret");
-    expect((init as RequestInit).headers).toMatchObject({ authorization: "Bearer stt-secret" });
+    expect(url).toBe("https://api.wave.online/v1/transcribe?engine=auto");
+    expect(url).not.toContain("stt-secret"); // secret never in the URL
+    expect((init as RequestInit).headers).toMatchObject({
+      authorization: "Bearer stt-secret",
+      "content-type": "audio/wav",
+    });
+    // The body is a WAV container (44-byte RIFF header) wrapping the raw PCM, not headerless PCM.
+    const body = new Uint8Array((init as RequestInit).body as ArrayBuffer);
+    expect(String.fromCharCode(body[0], body[1], body[2], body[3])).toBe("RIFF");
+    expect(String.fromCharCode(body[8], body[9], body[10], body[11])).toBe("WAVE");
+    expect(body.length).toBe(44 + 4); // header + the 4 PCM bytes
+  });
+
+  it("falls back to WAVE_GATEWAY_BASE/TOKEN when the STT-specific names are unset (one gateway origin)", async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ text: "ok" }), { status: 200 }));
+    const env: AgentTurnEnv = { WAVE_GATEWAY_BASE: "https://api.wave.online", WAVE_GATEWAY_TOKEN: "gw-tok" };
+    const r = await buildTurnDeps(env, media, fetchImpl).transcribe(new Uint8Array([1]));
+    expect(r.isFinal).toBe(true);
+    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.wave.online/v1/transcribe?engine=auto");
+    expect((init as RequestInit).headers).toMatchObject({ authorization: "Bearer gw-tok" });
+  });
+
+  it("honors VOICE_AGENT_STT_ENGINE + VOICE_AGENT_STT_PATH overrides", async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ text: "x" }), { status: 200 }));
+    const env: AgentTurnEnv = {
+      VOICE_AGENT_STT_BASE: "https://api.wave.online",
+      VOICE_AGENT_STT_TOKEN: "t",
+      VOICE_AGENT_STT_ENGINE: "deepgram",
+      VOICE_AGENT_STT_PATH: "/v1/transcribe",
+    };
+    await buildTurnDeps(env, media, fetchImpl).transcribe(new Uint8Array([1]));
+    const url = (fetchImpl.mock.calls[0] as unknown as [string])[0];
+    expect(url).toBe("https://api.wave.online/v1/transcribe?engine=deepgram");
+  });
+
+  it("throws STT_UPSTREAM on a non-200", async () => {
+    const fetchImpl = vi.fn(async () => new Response("nope", { status: 502 }));
+    const env: AgentTurnEnv = { VOICE_AGENT_STT_BASE: "https://api.wave.online", VOICE_AGENT_STT_TOKEN: "t" };
+    await expect(buildTurnDeps(env, media, fetchImpl).transcribe(new Uint8Array([1]))).rejects.toMatchObject({
+      code: "STT_UPSTREAM",
+    });
+  });
+});
+
+describe("buildTurnDeps — voice_agent_minutes metering emit", () => {
+  const usage = { org: "org1", room: "room1", agentId: "a1", turnId: "t0", turnWallMs: 30_000 };
+
+  it("posts voice_agent_minutes to /v1/internal/usage with the service token (fractional minutes)", async () => {
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+    const env: AgentTurnEnv = { GATEWAY_BASE_URL: "https://api.wave.online", WAVE_SERVICE_TOKEN: "svc-tok" };
+    await buildTurnDeps(env, media, fetchImpl).emitMeter(usage);
+    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.wave.online/v1/internal/usage");
+    expect(url).not.toContain("svc-tok");
+    expect((init as RequestInit).headers).toMatchObject({ authorization: "Bearer svc-tok" });
+    const body = JSON.parse((init as RequestInit).body as string);
+    expect(body.org).toBe("org1");
+    expect(body.usage.meter).toBe("voice_agent_minutes");
+    expect(body.usage.meter_value).toBeCloseTo(0.5, 6); // 30s = 0.5 min, NOT truncated
+    expect(body.usage.event_id).toBe("room1:a1:t0:voice_agent_minutes"); // idempotent key
+  });
+
+  it("is INERT (no network) when the meter is unprovisioned", async () => {
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+    await buildTurnDeps({} as AgentTurnEnv, media, fetchImpl).emitMeter(usage);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("is FAIL-OPEN — a transport error does not throw out of emitMeter", async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error("network down");
+    });
+    const env: AgentTurnEnv = { GATEWAY_BASE_URL: "https://api.wave.online", WAVE_SERVICE_TOKEN: "t" };
+    await expect(buildTurnDeps(env, media, fetchImpl).emitMeter(usage)).resolves.toBeUndefined();
   });
 });

@@ -70,6 +70,7 @@ function mkDeps(
     complete,
     callTool,
     synthesize,
+    emitMeter: vi.fn(async () => {}),
     ...over,
   };
   return { deps, sent, logs, transcribe, complete, callTool, synthesize };
