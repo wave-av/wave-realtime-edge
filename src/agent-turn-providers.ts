@@ -64,6 +64,7 @@ export async function* streamGatewayLlm(
     body: JSON.stringify(body),
   });
   if (!res.ok || !res.body) {
+    await res.body?.cancel().catch(() => {}); // release the body — an un-drained Response deadlocks the DO's fetch pool
     throw new AgentSessionError("LLM_UPSTREAM", `gateway LLM returned ${res.status}`, 502);
   }
   yield* parseAnthropicStream(res.body);
@@ -143,7 +144,10 @@ export async function callGatewayTool(
     headers,
     body: JSON.stringify({ name, input }),
   });
-  if (!res.ok) throw new AgentSessionError("TOOL_UPSTREAM", `gateway tool-exec returned ${res.status}`, 502);
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {}); // release the body — an un-drained Response deadlocks the DO's fetch pool
+    throw new AgentSessionError("TOOL_UPSTREAM", `gateway tool-exec returned ${res.status}`, 502);
+  }
   // Accept either a JSON {result} envelope or a raw string body — stringify so the model always gets text.
   const text = await res.text();
   try {
@@ -176,13 +180,20 @@ export async function* streamElevenLabs(
     body: JSON.stringify({ text, model_id: "eleven_flash_v2_5" }),
   });
   if (!res.ok || !res.body) {
+    await res.body?.cancel().catch(() => {}); // release the body — an un-drained Response deadlocks the DO's fetch pool
     throw new AgentSessionError("TTS_UPSTREAM", `ElevenLabs returned ${res.status}`, 502);
   }
   const reader = res.body.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value && value.length > 0) yield value;
+  // try/finally so a consumer that breaks early (barge-in abort cancels the for-await) releases the underlying
+  // body via reader.cancel() — otherwise the abandoned TTS Response leaks and deadlocks the DO's fetch pool.
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.length > 0) yield value;
+    }
+  } finally {
+    reader.cancel().catch(() => {});
   }
 }
 
@@ -223,7 +234,10 @@ export async function transcribeViaProvider(
     headers,
     body: wav,
   });
-  if (!res.ok) throw new AgentSessionError("STT_UPSTREAM", `STT returned ${res.status}`, 502);
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {}); // release the body — an un-drained Response deadlocks the DO's fetch pool
+    throw new AgentSessionError("STT_UPSTREAM", `STT returned ${res.status}`, 502);
+  }
   // The transcribe spoke returns { text, durationSec, words?, ... }; batch ⇒ this result IS the final.
   const json = (await res.json().catch(() => ({}))) as { text?: unknown; transcript?: unknown };
   const text =
@@ -240,22 +254,29 @@ async function* sseEvents(body: ReadableStream<Uint8Array>): AsyncIterable<unkno
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    let nl: number;
-    while ((nl = buf.indexOf("\n")) >= 0) {
-      const line = buf.slice(0, nl).trim();
-      buf = buf.slice(nl + 1);
-      if (!line.startsWith("data:")) continue;
-      const data = line.slice(5).trim();
-      if (data.length === 0 || data === "[DONE]") continue;
-      try {
-        yield JSON.parse(data);
-      } catch {
-        /* skip a malformed event — never kill the stream */
+  // try/finally so a consumer that breaks early (barge-in abort cancels the for-await over this generator)
+  // releases the underlying body via reader.cancel() — an abandoned LLM Response otherwise leaks and
+  // deadlocks the DO's fetch pool ("a stalled HTTP response was canceled to prevent deadlock").
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (data.length === 0 || data === "[DONE]") continue;
+        try {
+          yield JSON.parse(data);
+        } catch {
+          /* skip a malformed event — never kill the stream */
+        }
       }
     }
+  } finally {
+    reader.cancel().catch(() => {});
   }
 }

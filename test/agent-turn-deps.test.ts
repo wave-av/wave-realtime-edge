@@ -210,6 +210,59 @@ describe("buildTurnDeps — voice_agent_minutes metering emit", () => {
   });
 });
 
+describe("buildTurnDeps — fetch body cleanup (DO fetch-pool deadlock guard)", () => {
+  // A ReadableStream whose cancel() is observable, so we can assert the body is released rather than abandoned
+  // (an un-drained / un-cancelled Response deadlocks the DO's concurrent-fetch pool — the #26 bug).
+  function spyStream(): { stream: ReadableStream<Uint8Array>; cancelled: () => boolean } {
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(c) { c.enqueue(new Uint8Array([1, 2, 3, 4])); }, // unbounded → never auto-closes; must be cancelled
+      cancel() { cancelled = true; },
+    });
+    return { stream, cancelled: () => cancelled };
+  }
+
+  it("cancels the response body on a non-OK STT error (does not leak the Response)", async () => {
+    const { stream, cancelled } = spyStream();
+    const fetchImpl = vi.fn(async () => new Response(stream, { status: 502 }));
+    const env: AgentTurnEnv = { VOICE_AGENT_STT_BASE: "https://api.wave.online", VOICE_AGENT_STT_TOKEN: "t" };
+    await expect(buildTurnDeps(env, media, fetchImpl).transcribe(new Uint8Array([1]))).rejects.toMatchObject({
+      code: "STT_UPSTREAM",
+    });
+    expect(cancelled()).toBe(true);
+  });
+
+  it("cancels the LLM stream when the consumer breaks early (barge-in abort)", async () => {
+    // Emit valid SSE text deltas UNBOUNDEDLY so the consumer actually yields events (and the stream never
+    // self-closes) — it must be cancelled on the early break, not abandoned.
+    const enc = new TextEncoder();
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(c) {
+        c.enqueue(enc.encode(`data: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: "x" } })}\n\n`));
+      },
+      cancel() { cancelled = true; },
+    });
+    const fetchImpl = vi.fn(async () => new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } }));
+    const env: AgentTurnEnv = { WAVE_GATEWAY_BASE: "https://api.wave.online", WAVE_GATEWAY_TOKEN: "t" };
+    // Take the first event, then break — simulates the turn aborting mid-stream on barge-in.
+    for await (const _evt of buildTurnDeps(env, media, fetchImpl).complete([{ role: "user", content: "q" }], [])) {
+      break;
+    }
+    expect(cancelled).toBe(true);
+  });
+
+  it("cancels the TTS stream when the consumer breaks early (barge-in abort)", async () => {
+    const { stream, cancelled } = spyStream();
+    const fetchImpl = vi.fn(async () => new Response(stream, { status: 200 }));
+    const env: AgentTurnEnv = { ELEVENLABS_API_KEY: "k", ELEVENLABS_VOICE_ID: "v" };
+    for await (const _chunk of buildTurnDeps(env, media, fetchImpl).synthesize("hello")) {
+      break; // abort after the first PCM chunk
+    }
+    expect(cancelled()).toBe(true);
+  });
+});
+
 describe("normalizeGatewayEnv — one convention provisions ALL gateway paths (config-no-silent-noop)", () => {
   it("fills BOTH name pairs from the voice-runtime names", () => {
     const r = normalizeGatewayEnv({ WAVE_GATEWAY_BASE: "https://api.wave.online", WAVE_GATEWAY_TOKEN: "tok" });
