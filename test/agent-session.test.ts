@@ -13,6 +13,7 @@ import {
 } from "../src/agent-session.js";
 import { encodeIngestFrame } from "../src/agent-ingest-adapter.js";
 import { decodePacket } from "../src/encoders/container-adapter.js";
+import { verifyRecorderToken } from "../src/encoders/recorder-auth.js";
 
 const SESSION = "sess_ABCdef12345678";
 
@@ -68,15 +69,19 @@ describe("AgentSessionCore.openAdapters — two adapters on one DO", () => {
     const { deps } = mkDeps();
     const core = new AgentSessionCore(deps);
     core.bind(goodCfg);
-    const { egress, ingest } = await core.openAdapters({ baseWss: "wss://rt.wave.online", egressToken: "tok" });
+    const { egress, ingest } = await core.openAdapters({ baseWss: "wss://rt.wave.online", egressToken: "egtok", ingestToken: "intok" });
     expect(egress.adapterId).toBe("eg_1");
     expect(ingest.adapterId).toBe("in_1");
     const egTracks = (deps.createEgress as ReturnType<typeof vi.fn>).mock.calls[0][0];
     const inTracks = (deps.createIngest as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(egTracks[0].endpoint).toContain("/v1/realtime/agents/egress/org1/room1/");
-    expect(egTracks[0].endpoint).toContain("?t=tok");
+    expect(egTracks[0].endpoint).toContain("?t=egtok");
     expect(egTracks[0].outputCodec).toBe("pcm");
     expect(inTracks[0].endpoint).toContain("/v1/realtime/agents/ingest/org1/room1/");
+    // Per-endpoint tokens: ingest carries its OWN token (bound to the agent track), NOT the egress token —
+    // the SFU dial-in 401s (→ "returned 503") if the token doesn't match the route's trackName segment.
+    expect(inTracks[0].endpoint).toContain("?t=intok");
+    expect(inTracks[0].endpoint).not.toContain("egtok");
     expect(inTracks[0].location).toBe("local");
   });
   it("requires bind first and a wss base", async () => {
@@ -170,5 +175,40 @@ describe("AgentSessionDO ingest WS wiring — the DO owns the publish socket", (
     const session = new AgentSessionDO(mkState(), {} as never);
     const res = await session.fetch(new Request("https://agent/ingest", { headers: { Upgrade: "websocket" } }));
     expect(res.status).toBe(501);
+  });
+
+  it("bind mints VALID per-endpoint capability tokens (the egress-503 fix: SFU dial-in must carry ?t=)", async () => {
+    // Capture the adapter-create POSTs the DO makes (createWebsocketAdapter/createIngestAdapter via __agentFetch)
+    // and prove each endpoint carries a token that verifyRecorderToken accepts for its OWN track. Before the fix
+    // the DO called openAdapters() with no token → SFU handshake 401 → CF "create websocket adapter returned 503".
+    const captured: { url: string; body: { tracks?: { endpoint?: string }[] } }[] = [];
+    const fakeFetch = async (url: string, init: RequestInit) => {
+      captured.push({ url, body: JSON.parse(init.body as string) });
+      return new Response(JSON.stringify({ adapterId: "x", tracks: [] }), { status: 200 });
+    };
+    const env = {
+      VOICE_AGENT_PROVIDER: "wave",
+      WAVE_INTERNAL_SECRET: "seal",
+      CF_CALLS_APP_ID: "0123456789abcdef0123456789abcdef",
+      CF_CALLS_APP_SECRET: "bearer",
+      __agentFetch: fakeFetch,
+    };
+    const session = new AgentSessionDO(mkState(), env as never);
+    await session.fetch(new Request("https://agent/bind", {
+      method: "POST",
+      body: JSON.stringify({ config: { roomId: "room1", org: "org1", agentId: "a1", participantSessionId: SESSION, participantTrackName: "mic" } }),
+    }));
+    const egCall = captured.find((c) => c.body.tracks?.[0]?.endpoint?.includes("/egress/"));
+    const inCall = captured.find((c) => c.body.tracks?.[0]?.endpoint?.includes("/ingest/"));
+    expect(egCall).toBeTruthy();
+    expect(inCall).toBeTruthy();
+    const egTok = new URL(egCall!.body.tracks![0].endpoint!).searchParams.get("t") ?? "";
+    const inTok = new URL(inCall!.body.tracks![0].endpoint!).searchParams.get("t") ?? "";
+    expect(egTok).not.toBe("");
+    expect(inTok).not.toBe("");
+    // Egress token authorizes the PARTICIPANT track; ingest token authorizes the AGENT track. Cross-checks fail.
+    expect(await verifyRecorderToken("seal", "org1", SESSION, "mic", egTok)).toBe(true);
+    expect(await verifyRecorderToken("seal", "org1", SESSION, "agent-a1", inTok)).toBe(true);
+    expect(await verifyRecorderToken("seal", "org1", SESSION, "agent-a1", egTok)).toBe(false);
   });
 });
