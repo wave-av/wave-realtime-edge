@@ -9,6 +9,7 @@ import { describe, it, expect, vi } from "vitest";
 import {
   TurnTakingCore,
   buildTurnSystemPrompt,
+  MAX_UTTERANCE_BYTES,
   type AgentTurnDeps,
   type TurnTakingConfig,
   type SttResult,
@@ -87,6 +88,35 @@ describe("buildTurnSystemPrompt", () => {
     expect(buildTurnSystemPrompt({ ...goodCfg, systemPrompt: "Custom." })).toBe("Custom.");
     const def = buildTurnSystemPrompt({ ...goodCfg, systemPrompt: undefined });
     expect(def.length).toBeGreaterThan(0);
+  });
+});
+
+describe("TurnTakingCore — bounded utterance buffer (DO OOM guard)", () => {
+  it("never lets the accumulated PCM exceed MAX_UTTERANCE_BYTES when audio never endpoints", async () => {
+    // STT that NEVER returns final (a continuous talker / partial-only STT) — the utterance would grow forever
+    // without the cap, blowing the DO isolate memory limit and resetting the turn mid-flight.
+    let maxPcmSeen = 0;
+    const transcribe = vi.fn(async (pcm: Uint8Array): Promise<SttResult> => {
+      maxPcmSeen = Math.max(maxPcmSeen, pcm.length);
+      return { isFinal: false, transcript: "..." };
+    });
+    const { deps } = mkDeps({ transcribe });
+    const core = new TurnTakingCore(deps, goodCfg);
+
+    // Frames are capped at 32 KB on the wire (MAX_PCM_MESSAGE_BYTES); feed enough to overflow the ~5.76 MB
+    // utterance cap several times over (no 0x00 terminator → STT never finalizes → buffer would grow forever).
+    const frameBytes = 32 * 1024;
+    const framesToOverflow = Math.ceil(MAX_UTTERANCE_BYTES / frameBytes) + 10;
+    const payload = new Uint8Array(frameBytes).fill(1); // non-zero, no terminator
+    for (let i = 0; i < framesToOverflow; i++) {
+      await core.onFrame(encodeIngestFrame(payload, { sequenceNumber: i + 1, timestamp: 4800 * (i + 1) }, "packet"));
+    }
+
+    expect(transcribe).toHaveBeenCalled();
+    // The buffer handed to STT is BOUNDED — eviction of oldest frames keeps it at/under the cap (the bug fix).
+    expect(maxPcmSeen).toBeLessThanOrEqual(MAX_UTTERANCE_BYTES);
+    // ...and it actually accumulated meaningfully (not trivially small) before the cap kicked in.
+    expect(maxPcmSeen).toBeGreaterThan(MAX_UTTERANCE_BYTES - frameBytes);
   });
 });
 
