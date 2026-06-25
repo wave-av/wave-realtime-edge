@@ -61,8 +61,10 @@ WHIP_INGEST_ENABLED = "1"
 # Absent/anything-but-"wave" → the /v1/realtime/agents/* dispatch + egress routes are skipped entirely
 # (voiceAgentEnabled(env)=false) and a request falls through to the honest 501 catch-all — UNCHANGED. Setting
 # VOICE_AGENT_PROVIDER="wave" arms the routes + the AgentSessionDO; that flip in any live env is a ◆ Jake-named
-# crossing (design §L3 build order step 8). Left UNSET here so this builder is provably inert on merge.
-# VOICE_AGENT_PROVIDER = "wave"   # ◆ uncomment only at the Jake-named cutover
+# crossing (design §L3 build order step 8).
+# ◆ ARMED 2026-06-25 (Jake-named GA cutover, #81): voice-agent routes + AgentSessionDO live. Routes only
+# activate on an explicit agent bind (POST /v1/realtime/agents/bind); live rooms are unaffected until bound.
+VOICE_AGENT_PROVIDER = "wave"
 
 # ── RT-P1.5 — pluggable recording encoders (design §6). DEFAULT DISARMED / DORMANT. ──
 # RT_RECORD arms recording at all; absent/"0" → selectEncoder() returns the inert DisarmedEncoder (begin →
