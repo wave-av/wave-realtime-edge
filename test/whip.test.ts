@@ -15,7 +15,7 @@ import {
 	type WhipDeps,
 	type WhipKv,
 } from "../src/whip.js";
-import { SfuError } from "../src/sfu.js";
+import { SfuError, type SessionDescription } from "../src/sfu.js";
 
 const ctx = { waitUntil: () => {} } as unknown as ExecutionContext;
 const OFFER_SDP = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n";
@@ -91,6 +91,30 @@ describe("handleWhip — POST /v1/whip/publish (happy path)", () => {
 		// resource record persisted under the whip: prefix for PATCH/DELETE
 		const kv = env.RT_MEETING_ORG as WhipKv & { store: Map<string, string> };
 		expect(kv.store.has("whip:res00000001")).toBe(true);
+	});
+
+	it("relays a NEWLINE-TERMINATED offer to the SFU (CF rejects a trimmed SDP 400; #100B)", async () => {
+		let seen: SessionDescription | undefined;
+		const { deps } = mockDeps({
+			sfu: () =>
+				({
+					newSession: async (offer?: SessionDescription) => {
+						seen = offer;
+						return { sessionId: "sess0001abcd", sessionDescription: { type: "answer", sdp: ANSWER_SDP } };
+					},
+					pushTracks: async () => ({ tracks: [] }),
+				}) as never,
+		});
+		await handleWhip(
+			whipReq("POST", "/v1/whip/publish", { "content-type": "application/sdp" }, OFFER_SDP),
+			whipEnv(),
+			"org_A",
+			deps,
+		);
+		expect(seen?.type).toBe("offer");
+		// The publisher's trailing CRLF (stripped by the v=0-guard trim) is re-terminated before relay.
+		expect(seen?.sdp.endsWith("\n")).toBe(true);
+		expect(seen?.sdp).toBe(OFFER_SDP.trim() + "\r\n");
 	});
 
 	it("415 when Content-Type is not application/sdp", async () => {

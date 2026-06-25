@@ -166,7 +166,11 @@ async function handlePublish(request: Request, env: WhipEnv, deps: WhipDeps, org
 	if (!sdp || !/^v=0(\r?\n|\r)/.test(sdp)) {
 		return jsonError("WHIP_UNPROCESSABLE_SDP", "request body is not a parseable SDP offer", 422);
 	}
-	const offer: SessionDescription = { type: "offer", sdp };
+	// CF Realtime's SDP parser REJECTS an offer that does not end in a newline (400
+	// invalid_session_description "Unable to parse SDP"). The .trim() above (needed for the v=0 guard)
+	// strips the publisher's trailing CRLF, so re-terminate the relayed offer. Verified live: trimmed →
+	// 400, trimmed + CRLF → 201 + answer. (#100B)
+	const offer: SessionDescription = { type: "offer", sdp: sdp + "\r\n" };
 
 	let sfu: SfuClient;
 	try {
