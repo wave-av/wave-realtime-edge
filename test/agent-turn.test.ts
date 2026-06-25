@@ -304,3 +304,28 @@ describe("TurnTakingCore — metering seams (honest counts, structured-logged)",
     expect((meter!.fields.assistantChars as number)).toBeGreaterThan(0);
   });
 });
+
+describe("TurnTakingCore — voice_agent_minutes emit (step 7)", () => {
+  it("calls emitMeter with the turn usage shape on a successful turn", async () => {
+    const { deps, emitMeter } = mkDeps();
+    const core = new TurnTakingCore(deps, goodCfg);
+    await core.onFrame(egressFrame([0x00])); // 0x00 → fake STT returns a final → a turn runs
+    expect(emitMeter).toHaveBeenCalledTimes(1);
+    const usage = emitMeter.mock.calls[0][0] as Record<string, unknown>;
+    expect(usage).toMatchObject({ org: "org1", room: "room1", agentId: "a1" });
+    expect(typeof usage.turnId).toBe("string");
+    expect(typeof usage.turnWallMs).toBe("number");
+    expect(usage.turnWallMs as number).toBeGreaterThanOrEqual(0);
+  });
+
+  it("is FAIL-SAFE: a thrown emitMeter is logged + swallowed, never breaks the turn", async () => {
+    const emitMeter = vi.fn(async () => {
+      throw new Error("meter boom");
+    });
+    const { deps, sent, logs } = mkDeps({ emitMeter });
+    const core = new TurnTakingCore(deps, goodCfg);
+    await expect(core.onFrame(egressFrame([0x00]))).resolves.toBeUndefined();
+    expect(sent.length).toBeGreaterThan(0); // the reply was still spoken (media unaffected)
+    expect(logs.some((l) => l.msg === "agent-turn-meter-error")).toBe(true);
+  });
+});
