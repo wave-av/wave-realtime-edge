@@ -173,12 +173,17 @@ export class TurnTakingCore {
     const startMs = this.deps.now();
     let stage = "llm";
     try {
-      this.messages.push({ role: "user", content: userText });
+      // Build the request history WITHOUT mutating committed state. The user + assistant turns are committed
+      // ATOMICALLY only after a successful, non-empty, non-aborted reply (below), so an aborted / empty / failed
+      // turn NEVER leaves a dangling user message — which would otherwise produce two consecutive user turns on
+      // the NEXT utterance and break the strict user/assistant alternation the gateway/Claude requires.
+      const userMsg: LlmMessage = { role: "user", content: userText };
+      const reqMessages = [...this.messages, userMsg];
 
-      // LLM (gateway/Claude) — stream the assistant text. Collected for history + fed to TTS. Pass a SNAPSHOT
-      // (not the live array) so a long stream can't observe a later mutation + so deps serialize a stable history.
+      // LLM (gateway/Claude) — stream the assistant text. Collected for history + fed to TTS. The request list is
+      // a fresh snapshot so a long stream can't observe a later mutation + deps serialize a stable history.
       let assistant = "";
-      for await (const delta of this.deps.complete(this.messages.slice())) {
+      for await (const delta of this.deps.complete(reqMessages)) {
         if (this.aborted) break; // step-4 barge-in seam: cancel the in-flight stream
         assistant += delta;
       }
@@ -188,7 +193,8 @@ export class TurnTakingCore {
         this.deps.log("agent-turn-empty-llm", this.idFields());
         return;
       }
-      this.messages.push({ role: "assistant", content: assistant });
+      // Commit BOTH turns atomically now that we have a real reply (history stays strictly alternating).
+      this.messages.push(userMsg, { role: "assistant", content: assistant });
 
       // TTS (ElevenLabs streaming pcm_48000) → ingest socket via the EXACT echoFrame send path.
       stage = "tts";
@@ -281,7 +287,7 @@ export interface AgentTurnEnv extends AgentSessionEnv {
 
 /** Default Claude model routed through the gateway. Sonnet = the sensible voice default (latency/cost); Opus is
  *  selectable via VOICE_AGENT_LLM_MODEL per the design's Opus/Sonnet choice. */
-export const DEFAULT_VOICE_LLM_MODEL = "claude-sonnet-4-5";
+export const DEFAULT_VOICE_LLM_MODEL = "claude-sonnet-4-6";
 /** ElevenLabs streaming output format — pcm_48000 = 16-bit LE PCM @ 48 kHz, exactly the ingest path's codec. */
 export const ELEVENLABS_OUTPUT_FORMAT = "pcm_48000";
 

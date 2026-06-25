@@ -120,6 +120,29 @@ describe("TurnTakingCore — one full turn", () => {
     expect(hist.filter((m) => m.role === "assistant").length).toBe(2);
   });
 
+  it("a failed turn leaves NO dangling user message — the next turn's history still alternates", async () => {
+    // First turn's LLM throws; second turn succeeds. The committed history (and the second request) must stay
+    // strictly alternating (no two consecutive user turns) — guards the atomic user+assistant commit.
+    let call = 0;
+    const complete = vi.fn(async function* (_messages: LlmMessage[]) {
+      call += 1;
+      if (call === 1) throw new Error("llm boom"); // turn 1 fails AFTER the user utterance was transcribed
+      yield "ok"; // turn 2 succeeds
+    });
+    const { deps } = mkDeps({ complete });
+    const core = new TurnTakingCore(deps, goodCfg);
+    await core.onFrame(egressFrame([1, 0x00], 1)); // turn 1 → LLM throws (swallowed)
+    await core.onFrame(egressFrame([2, 0x00], 2)); // turn 2 → succeeds
+    expect(complete).toHaveBeenCalledTimes(2);
+    const secondReq = (complete as ReturnType<typeof vi.fn>).mock.calls[1][0] as LlmMessage[];
+    // No two consecutive user roles anywhere in the second request.
+    for (let i = 1; i < secondReq.length; i++) {
+      expect(secondReq[i].role === "user" && secondReq[i - 1].role === "user").toBe(false);
+    }
+    // Committed history after the failed-then-good turn: exactly system + the ONE successful user/assistant pair.
+    expect(core.history().map((m) => m.role)).toEqual(["system", "user", "assistant"]);
+  });
+
   it("does not fire a turn on a partial (non-final) transcript", async () => {
     const { deps, complete, synthesize } = mkDeps();
     const core = new TurnTakingCore(deps, goodCfg);
