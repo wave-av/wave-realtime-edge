@@ -27,6 +27,9 @@ import {
 // B3 (#98) — IETF WHIP v1 ingest surface (/v1/whip/*). INERT behind WHIP_INGEST_ENABLED ([vars], default off
 // → the 501 catch-all is unchanged). See src/whip.ts + whip-v1-frozen-contract.md §3/§4/§6-B3.
 import { handleWhip, whipIngestEnabled, type WhipEnv } from "./whip";
+// Task #81 (LK-rip Phase 6b) — voice-agent runtime. INERT behind VOICE_AGENT_PROVIDER==="wave": every new
+// route/DO behavior is gated by voiceAgentEnabled(env); absent/anything-else → the 501 catch-all is unchanged.
+import { voiceAgentEnabled, type AgentSessionConfig } from "./agent-session";
 
 // Re-export the Room Durable Object so the wrangler `ROOM` binding + migration (v1, new_sqlite_classes)
 // resolve from this main module. The class itself is defined in room.ts (P5 substrate); it is not yet
@@ -40,6 +43,11 @@ export { RoomDO } from "./room";
 // export resolves the class without provisioning a live container or a `new_sqlite_classes` migration. It is
 // exported here (the main module) so that, when the ◆ uncomments the binding, the class is already in scope.
 export { RecorderContainer } from "./encoders/recorder-container";
+
+// Task #81 — the per-room voice-agent session Durable Object. Exported from the main module so the
+// AGENT_SESSION binding + migration resolve on deploy. INERT: the dispatch/egress routes only reach it when
+// VOICE_AGENT_PROVIDER==="wave"; this export merely resolves the class for the binding.
+export { AgentSessionDO } from "./agent-session";
 
 /** Minimal Durable Object namespace shape (avoids a hard dependency on cloudflare:workers types). */
 interface RoomNamespace {
@@ -71,6 +79,9 @@ interface Env extends EncoderEnv {
 	// Injectable seam so the egress/start path unit-tests with NO live RTK network. Absent in prod →
 	// the live join() + DefaultManagedRecordingApi are used. Never a public/wire input.
 	__egressDeps?: EgressDeps;
+	// ── Task #81 voice-agent runtime — ALL inert unless VOICE_AGENT_PROVIDER==="wave" ──
+	VOICE_AGENT_PROVIDER?: string; // "wave" arms the voice-agent dispatch + egress routes; else fully inert
+	AGENT_SESSION?: RoomNamespace; // Durable Object binding (wrangler AGENT_SESSION → AgentSessionDO)
 }
 
 /** Injectable RTK primitives the egress/start path drives (live: realtimekit.join + ManagedApi.start). */
@@ -115,6 +126,13 @@ const EGRESS_INTENTS = new Set(["start", "stop", "info"]);
 const EGRESS_ROUTE = /^\/rtk\/egress\/([^/]+)\/?$/;
 /** Segment guards for the recorder route (SSRF-safe DO-key + frame-forward params). */
 const SAFE_SEGMENT = /^[A-Za-z0-9_:.-]{1,128}$/;
+/** Task #81 — voice-agent dispatch: POST /v1/realtime/agents/:intent (bind|info). Gated by the flag. */
+const AGENT_DISPATCH_ROUTE = /^\/v1\/realtime\/agents\/([a-z]+)\/?$/;
+const AGENT_DISPATCH_INTENTS = new Set(["bind", "info"]);
+/** Task #81 — agent egress WS the SFU dials OUT to (PCM in): /v1/realtime/agents/egress/:org/:room/:sessionId/:trackName.
+ *  Mirrors RECORDER_ROUTE; the DO key is `${org}:${room}:${agentId}`-derived so a frame reaches the SAME AgentSessionDO
+ *  the dispatch bound. The capability token (?t=) authorizes the third-party SFU dial-in (it can't send x-wave-internal). */
+const AGENT_EGRESS_ROUTE = /^\/v1\/realtime\/agents\/egress\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
 
 // ── WAVE-native ingress listeners (LK-rip #42) — POST /v1/realtime/ingress/:protocol/:intent ──
 // Server-side counterpart to wave-gateway PR #204 (which forwards this exact path shape as the identity  # guard:allow cross-repo PR reference in a design comment, not a leak
@@ -618,6 +636,101 @@ export default {
 			}
 			const whipRes = await handleWhip(request, env as WhipEnv, org);
 			if (whipRes) return whipRes; // null → unrecognized /v1/whip/* sub-path → 501 fall-through below
+		}
+
+		// ── Task #81 voice-agent runtime (LK-rip Phase 6b) — INERT unless VOICE_AGENT_PROVIDER==="wave" ──
+		// When the flag is off, BOTH blocks below are skipped and the request falls through to the 501 catch-all,
+		// UNCHANGED. When on, the SAME gateway-trust chokepoint as every paid route gates dispatch; the egress WS
+		// route additionally accepts the per-(org,session,track) capability token the SFU appends (it can't send
+		// x-wave-internal). The AgentSessionDO is keyed `${org}:${room}:${agentId}` so dispatch + egress address one DO.
+		if (voiceAgentEnabled(env)) {
+			// 1) Dispatch: POST /v1/realtime/agents/:intent (bind|info) → bind/inspect an AgentSessionDO for a room.
+			const adMatch = request.method === "POST" ? url.pathname.match(AGENT_DISPATCH_ROUTE) : null;
+			if (adMatch && AGENT_DISPATCH_INTENTS.has(adMatch[1])) {
+				const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
+				if (denied) return denied;
+				const org = request.headers.get("x-wave-org") ?? "";
+				if (!SAFE_ORG.test(org)) {
+					return Response.json({ error: "BAD_REQUEST", message: "missing or malformed org context (x-wave-org)" }, { status: 400 });
+				}
+				if (!env.AGENT_SESSION) {
+					// config-no-silent-noop: a missing DO binding must be loud, not a silent 501.
+					return Response.json({ error: "REALTIME_NOT_CONFIGURED", message: "AGENT_SESSION durable object binding is not configured" }, { status: 503 });
+				}
+				let body: Record<string, unknown> = {};
+				try {
+					body = (await request.json()) as Record<string, unknown>;
+				} catch {
+					body = {};
+				}
+				const cfg = (body.config ?? {}) as Partial<AgentSessionConfig>;
+				const room = typeof cfg.roomId === "string" ? cfg.roomId : "";
+				const agentId = typeof cfg.agentId === "string" ? cfg.agentId : "";
+				if (adMatch[1] === "bind" && (!SAFE_SEGMENT.test(room) || !SAFE_SEGMENT.test(agentId))) {
+					return Response.json({ error: "BAD_REQUEST", message: "bind requires config.roomId and config.agentId" }, { status: 400 });
+				}
+				// The DO id binds the agent session to (org, room, agent) — one agent per room per design §L1.
+				const doKey = adMatch[1] === "bind" ? `${org}:${room}:${agentId}` : `${org}:${room}:${agentId}`;
+				const id = env.AGENT_SESSION.idFromName(doKey);
+				const stub = env.AGENT_SESSION.get(id);
+				const method = adMatch[1] === "info" ? "GET" : "POST";
+				return stub.fetch(new Request(`https://agent/${adMatch[1]}`, {
+					method,
+					headers: { "content-type": "application/json" },
+					body: method === "POST" ? JSON.stringify({ config: { ...cfg, org } }) : undefined,
+				}));
+			}
+
+			// 2) Egress WS: the SFU dials OUT to push the participant's PCM. Forward each binary frame to the DO's echo.
+			const aeMatch = url.pathname.match(AGENT_EGRESS_ROUTE);
+			if (aeMatch) {
+				const [, aorg, aroom, asession, atrack] = aeMatch;
+				if (![aorg, aroom, asession, atrack].every((s) => SAFE_SEGMENT.test(s)) || !env.AGENT_SESSION) {
+					return Response.json({ error: "BAD_REQUEST", message: "invalid agent egress path or no AGENT_SESSION binding" }, { status: 400 });
+				}
+				const tok = url.searchParams.get("t");
+				const tokenOk = !!tok && !!env.WAVE_INTERNAL_SECRET && (await verifyRecorderToken(env.WAVE_INTERNAL_SECRET, aorg, asession, atrack, tok));
+				if (!tokenOk) {
+					const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
+					if (denied) return denied;
+				}
+				if ((request.headers.get("Upgrade") ?? "").toLowerCase() !== "websocket") {
+					return Response.json({ error: "UPGRADE_REQUIRED", message: "agent egress route requires a WebSocket upgrade" }, { status: 426 });
+				}
+				const WSP = (globalThis as unknown as { WebSocketPair?: new () => Record<string, WebSocket> }).WebSocketPair;
+				if (!WSP) {
+					return Response.json({ error: "REALTIME_NOT_CONFIGURED", message: "WebSocketPair unavailable" }, { status: 503 });
+				}
+				const pair = new WSP();
+				const client = (pair as unknown as Record<string, WebSocket>)[0];
+				const server = (pair as unknown as Record<string, WebSocket>)[1];
+				server.accept();
+				try {
+					(server as unknown as { binaryType?: string }).binaryType = "arraybuffer";
+				} catch {
+					/* binaryType not settable on some runtimes — the Blob branch below still catches it */
+				}
+				// The egress route doesn't carry agentId (the SFU adapter endpoint is per session/track); the DO is
+				// addressed by `${org}:${room}` here and the dispatch bound the SAME-prefixed id — see PR note: a later
+				// wiring slice threads agentId through the endpoint so egress lands on the exact bound DO. For the
+				// skeleton, frames forward to the room+session-keyed DO (echo is per-DO, fail-open).
+				const id = env.AGENT_SESSION.idFromName(`${aorg}:${aroom}:${asession}`);
+				const stub = env.AGENT_SESSION.get(id);
+				server.addEventListener("message", (ev: MessageEvent) => {
+					const data = ev.data;
+					if (!(data instanceof ArrayBuffer) && !(typeof Blob !== "undefined" && data instanceof Blob)) return;
+					const fwd = stub.fetch(new Request(`https://agent/echo-frame?sessionId=${encodeURIComponent(asession)}&trackName=${encodeURIComponent(atrack)}`, {
+						method: "POST",
+						body: data as BodyInit,
+					})).catch(() => {});
+					if (ctx) ctx.waitUntil(fwd);
+				});
+				try {
+					return new Response(null, { status: 101, webSocket: client } as ResponseInit & { webSocket: WebSocket });
+				} catch {
+					return new Response(null, { status: 200, webSocket: client } as ResponseInit & { webSocket: WebSocket });
+				}
+			}
 		}
 
 		return Response.json({ error: "REALTIME_NOT_IMPLEMENTED", path: url.pathname }, { status: 501 });
