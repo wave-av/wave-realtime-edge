@@ -57,6 +57,8 @@ function mkDeps(over: Partial<AgentTurnDeps & AgentMediaDeps> = {}) {
     yield new Uint8Array([1, 2, 3, 4]);
     yield new Uint8Array([5, 6, 7, 8]);
   });
+  // Fake metering emit: records the usage shape; never hits the network.
+  const emitMeter = vi.fn(async (_usage: unknown) => {});
 
   const deps: AgentTurnDeps & AgentMediaDeps = {
     // media seam (unused create paths here — TurnTakingCore reuses AgentSessionCore for adapters elsewhere)
@@ -69,9 +71,10 @@ function mkDeps(over: Partial<AgentTurnDeps & AgentMediaDeps> = {}) {
     complete,
     callTool,
     synthesize,
+    emitMeter,
     ...over,
   };
-  return { deps, sent, logs, transcribe, complete, callTool, synthesize };
+  return { deps, sent, logs, transcribe, complete, callTool, synthesize, emitMeter };
 }
 
 /** Build an egress Packet frame carrying `pcm` (same wire the SFU pushes), via the verified encoder. */

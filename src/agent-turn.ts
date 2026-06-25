@@ -53,6 +53,12 @@ import {
   type ToolResult,
   type CompletionEvent,
 } from "./agent-tools.js";
+import {
+  emitVoiceTurnUsage,
+  type VoiceMeterEnv,
+  type VoiceTurnUsage,
+} from "./voice-meter.js";
+import { pcmToWav, WAV_MIME } from "./pcm-wav.js";
 
 // ── Public contracts (the injectable-deps seam) ──────────────────────────────────────────────────────────────
 
@@ -107,6 +113,13 @@ export interface AgentTurnDeps {
    * An async generator so audio streams out as it's synthesized. Fail-safe: a throw is caught (logged stage="tts").
    */
   synthesize(text: string): AsyncIterable<Uint8Array>;
+  /**
+   * Step-7 METERING: emit one completed turn's `voice_agent_minutes` usage to the gateway. Fire-and-forget +
+   * FAIL-OPEN — a metering error NEVER breaks the turn or drops media (the live impl swallows + logs). The core
+   * awaits it inside a try/catch so even a thrown emit can't propagate up the media path. Live impl in
+   * `buildTurnDeps` mirrors src/metering.ts (POST /v1/internal/usage, service token); tests pass a fake.
+   */
+  emitMeter(usage: VoiceTurnUsage): Promise<void>;
 }
 
 /** Config to run a turn-taking session for one room/participant (superset of the bind config + the persona). */
@@ -155,6 +168,8 @@ export class TurnTakingCore {
   private readonly vad: Vad;
   /** Frame counter (since the in-flight turn started) used to instrument barge-in detection→abort latency. */
   private framesThisTurn = 0;
+  /** Monotonic turn counter (since core construction) → a stable per-turn id for idempotent metering. */
+  private turnSeq = 0;
   /** Step-5 agent-least-privilege: the EXPLICIT tool definitions this agent may run (empty = text-only). */
   private readonly tools: ToolAllowlist;
   /** Step-5 hard cap on tool-call iterations within ONE turn — prevents an infinite (model→tool→model→…) loop. */
@@ -250,6 +265,7 @@ export class TurnTakingCore {
     this.turnInFlight = true;
     this.aborted = false;
     this.framesThisTurn = 0;
+    const turnId = `t${this.turnSeq++}`;
     // The user's final utterance was just consumed → reset the VAD to silence so the FIRST sustained speech onset
     // while the agent talks is detected cleanly as a fresh barge-in (not contaminated by the prior episode's run).
     this.vad.reset();
@@ -289,7 +305,7 @@ export class TurnTakingCore {
           stage = "tts";
           const pcmBytesOut = await this.speak(assistant);
           if (pcmBytesOut < 0) return; // aborted mid-TTS (already committed history is valid + alternating)
-          this.logMeter(userText, assistant, toolsUsed, pcmBytesOut, startMs);
+          await this.logMeter(userText, assistant, toolsUsed, pcmBytesOut, startMs, turnId);
           return;
         }
 
@@ -374,18 +390,45 @@ export class TurnTakingCore {
     return pcmBytesOut;
   }
 
-  /** Structured-log the honest per-turn counts we have (step-7 metering seam). NO fake meter emit. */
-  private logMeter(userText: string, assistant: string, toolsUsed: number, pcmBytesOut: number, startMs: number): void {
+  /**
+   * Structured-log the honest per-turn counts AND emit the real `voice_agent_minutes` usage to the gateway
+   * (step 7). The emit is FAIL-OPEN: it is awaited inside a try/catch so a metering error (or a thrown fake)
+   * is logged and swallowed — it NEVER breaks the turn or drops media. The live `emitMeter` (buildTurnDeps)
+   * mirrors src/metering.ts (POST /v1/internal/usage). turnWallMs drives the billable fractional minutes.
+   */
+  private async logMeter(
+    userText: string,
+    assistant: string,
+    toolsUsed: number,
+    pcmBytesOut: number,
+    startMs: number,
+    turnId: string,
+  ): Promise<void> {
+    const turnWallMs = this.deps.now() - startMs;
     this.deps.log("agent-turn-meter", {
       ...this.idFields(),
+      turnId,
       userChars: userText.length,
       assistantChars: assistant.length,
       toolsUsed,
       pcmBytesOut,
-      turnWallMs: this.deps.now() - startMs,
-      // TODO(#81 step 7): emit voice_agent_minutes + llm tokens + elevenlabs chars + tool calls to the gateway
-      //                   (mirror src/metering.ts emitParticipantUsage → POST /v1/internal/usage).
+      turnWallMs,
     });
+    try {
+      await this.deps.emitMeter({
+        org: this.config.org,
+        room: this.config.roomId,
+        agentId: this.config.agentId,
+        turnId,
+        turnWallMs,
+        llmChars: assistant.length,
+        ttsChars: assistant.length,
+        toolsUsed,
+      });
+    } catch (e) {
+      // Fail-open: a metering error must NEVER break the turn (media-safety). Logged, swallowed.
+      this.deps.log("agent-turn-meter-error", { ...this.idFields(), message: (e as Error)?.message ?? "unknown" });
+    }
   }
 
   /**
@@ -443,7 +486,7 @@ function concat(chunks: Uint8Array[]): Uint8Array {
  * Doppler at deploy. INERT until provisioned: a missing cred fails its stage CLOSED (logged, turn abandoned),
  * it never crashes the DO. Extends AgentSessionEnv so the DO env is one shape.
  */
-export interface AgentTurnEnv extends AgentSessionEnv, VadEnv {
+export interface AgentTurnEnv extends AgentSessionEnv, VadEnv, VoiceMeterEnv {
   /** WAVE gateway origin for the LLM proxy (var; not a secret). e.g. https://api.wave.online */
   WAVE_GATEWAY_BASE?: string;
   /** Internal service-to-service bearer for the gateway LLM proxy (secret; deploy-time, never logged). */
@@ -454,10 +497,17 @@ export interface AgentTurnEnv extends AgentSessionEnv, VadEnv {
   ELEVENLABS_API_KEY?: string;
   /** ElevenLabs voice id for the agent persona (var). */
   ELEVENLABS_VOICE_ID?: string;
-  /** Streaming STT provider base (var). The concrete provider is wired in the live builder. */
+  /**
+   * STT gateway base (var). The WAVE transcribe spoke is reached THROUGH the gateway (metering-governed).
+   * Defaults to WAVE_GATEWAY_BASE when unset (one gateway origin serves both LLM + STT). e.g. https://api.wave.online
+   */
   VOICE_AGENT_STT_BASE?: string;
-  /** Streaming STT provider key (secret; never logged). */
-  VOICE_AGENT_STT_KEY?: string;
+  /** STT gateway internal service Bearer (secret; never logged). Defaults to WAVE_GATEWAY_TOKEN when unset. */
+  VOICE_AGENT_STT_TOKEN?: string;
+  /** STT engine routed by the transcribe spoke (var): auto|whisper|deepgram|elevenlabs. Default "auto". */
+  VOICE_AGENT_STT_ENGINE?: string;
+  /** STT path on the gateway/spoke (var). Default /v1/transcribe (the transcribe spoke's batch endpoint). */
+  VOICE_AGENT_STT_PATH?: string;
   /**
    * Step-5 agent-least-privilege tool ALLOWLIST (var; JSON array of {name,description,input_schema}). The agent
    * advertises ONLY these to the model + refuses any unlisted tool. Unset/blank/garbage → NO tools (fail closed).
@@ -492,11 +542,13 @@ export function buildTurnDeps(
   return {
     ...media,
     async transcribe(pcm: Uint8Array): Promise<SttResult> {
-      if (!env.VOICE_AGENT_STT_BASE || !env.VOICE_AGENT_STT_KEY) {
-        // Fail CLOSED + loud — not provisioned yet (the #43 streaming-STT contract lands this step's finalize).
-        throw new AgentSessionError("STT_NOT_CONFIGURED", "streaming STT base/key not provisioned", 503);
+      const base = env.VOICE_AGENT_STT_BASE ?? env.WAVE_GATEWAY_BASE;
+      const token = env.VOICE_AGENT_STT_TOKEN ?? env.WAVE_GATEWAY_TOKEN;
+      if (!base || !token) {
+        // Fail CLOSED + loud — the WAVE transcribe spoke (gateway-fronted) is not provisioned. NEVER a fake.
+        throw new AgentSessionError("STT_NOT_CONFIGURED", "STT gateway base/token not provisioned", 503);
       }
-      return transcribeViaProvider(fetchImpl, env, pcm);
+      return transcribeViaProvider(fetchImpl, env, base, token, pcm);
     },
     async *complete(messages: LlmMessage[], tools: ToolDefinition[]): AsyncIterable<CompletionEvent> {
       if (!env.WAVE_GATEWAY_BASE || !env.WAVE_GATEWAY_TOKEN) {
@@ -517,6 +569,11 @@ export function buildTurnDeps(
         throw new AgentSessionError("TTS_NOT_CONFIGURED", "ElevenLabs key/voice not provisioned", 503);
       }
       yield* streamElevenLabs(fetchImpl, env, text);
+    },
+    async emitMeter(usage: VoiceTurnUsage): Promise<void> {
+      // Step-7 real usage emit (mirrors metering.ts). INERT until GATEWAY_BASE_URL + WAVE_SERVICE_TOKEN are
+      // provisioned; fail-OPEN so a metering error never breaks the turn (emitVoiceTurnUsage swallows + logs).
+      await emitVoiceTurnUsage(env, usage, fetchImpl as unknown as typeof fetch);
     },
   };
 }
@@ -671,32 +728,43 @@ async function* streamElevenLabs(
 }
 
 /**
- * Streaming STT via the configured provider. The concrete request shape is pinned alongside the #43 captions/STT
- * streaming spoke (TODO #81 step-3 finalize): this single round-trip variant posts the accumulated PCM and reads
- * one {isFinal,transcript} result. A truly STREAMING (per-partial) STT replaces this behind the SAME `transcribe`
- * seam with no change to TurnTakingCore. It is NOT a fake — it makes a real call when creds exist and fails
- * CLOSED (caller logs + abandons the turn) when the provider errors.
+ * STT via the WAVE transcribe spoke (gateway-fronted) — the PINNED contract (see /tmp/claude/handoff/
+ * voice-stt-contract.md). No TRUE streaming STT exists in WAVE today (verified: the transcribe + captions
+ * spokes are both BATCH — Whisper/Deepgram/Scribe, buffer-in → JSON-out), so the correct low-latency variant
+ * is a SHORT-BUFFER BATCH per utterance: the agent's egress PCM (16-bit LE / 48 kHz / stereo) is wrapped in a
+ * WAV container and POSTed to `{gateway}/v1/transcribe?engine=auto` with the internal service Bearer (the same
+ * server-to-server convention metering.ts uses). The spoke returns `{ text, durationSec, words?, ... }`; we map
+ * `text` → transcript and mark `isFinal:true` (one batch call == one final user turn; v1 endpointing is
+ * final-driven). A truly STREAMING (per-partial) STT replaces this behind the SAME `transcribe` seam with no
+ * change to TurnTakingCore (TODO #81 — gateway + transcribe-spoke streaming endpoint). NOT a fake: a real call
+ * when provisioned; fails CLOSED (caller logs + abandons the turn) on a provider error.
  */
 async function transcribeViaProvider(
   fetchImpl: FetchLike,
   env: AgentTurnEnv,
+  base: string,
+  token: string,
   pcm: Uint8Array,
 ): Promise<SttResult> {
-  const base = env.VOICE_AGENT_STT_BASE!.replace(/\/+$/, "");
-  const res = await fetchImpl(`${base}/v1/transcribe/stream`, {
+  const origin = base.replace(/\/+$/, "");
+  const rawPath = env.VOICE_AGENT_STT_PATH ?? "/v1/transcribe";
+  const path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+  const engine = env.VOICE_AGENT_STT_ENGINE ?? "auto";
+  const wav = pcmToWav(pcm); // 48k/16-bit/stereo PCM → WAV container (the spoke engines need a container)
+  const res = await fetchImpl(`${origin}${path}?engine=${encodeURIComponent(engine)}`, {
     method: "POST",
     headers: {
-      "content-type": "audio/pcm",
-      authorization: `Bearer ${env.VOICE_AGENT_STT_KEY}`, // STT key — never logged
+      "content-type": WAV_MIME,
+      authorization: `Bearer ${token}`, // gateway internal service token — never logged
     },
-    body: pcm,
+    body: wav,
   });
   if (!res.ok) throw new AgentSessionError("STT_UPSTREAM", `STT returned ${res.status}`, 502);
-  const json = (await res.json().catch(() => ({}))) as { isFinal?: unknown; transcript?: unknown };
-  return {
-    isFinal: json.isFinal === true,
-    transcript: typeof json.transcript === "string" ? json.transcript : "",
-  };
+  // The transcribe spoke returns { text, durationSec, words?, ... }; batch ⇒ this result IS the final.
+  const json = (await res.json().catch(() => ({}))) as { text?: unknown; transcript?: unknown };
+  const text =
+    typeof json.text === "string" ? json.text : typeof json.transcript === "string" ? json.transcript : "";
+  return { isFinal: true, transcript: text };
 }
 
 /**

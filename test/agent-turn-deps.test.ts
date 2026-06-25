@@ -124,7 +124,7 @@ describe("buildTurnDeps — STT provider", () => {
     const fetchImpl = vi.fn(async () =>
       new Response(JSON.stringify({ isFinal: true, transcript: "hi there" }), { status: 200 }),
     );
-    const env: AgentTurnEnv = { VOICE_AGENT_STT_BASE: "https://stt.wave.online", VOICE_AGENT_STT_KEY: "stt-secret" };
+    const env: AgentTurnEnv = { VOICE_AGENT_STT_BASE: "https://stt.wave.online", VOICE_AGENT_STT_TOKEN: "stt-secret" };
     const r = await buildTurnDeps(env, media, fetchImpl).transcribe(new Uint8Array([9]));
     expect(r).toEqual({ isFinal: true, transcript: "hi there" });
     const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
