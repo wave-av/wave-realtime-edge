@@ -4,6 +4,7 @@ import { describe, it, expect } from "vitest";
 import {
   selectEncoder,
   selectContainer,
+  negotiateCodec,
   CodecUnavailableError,
   UnknownCodecError,
 } from "../server/select.mjs";
@@ -106,5 +107,56 @@ describe("selectContainer — codec-aware muxer", () => {
     expect(selectContainer(null, "opus")).toBe("webm");
     expect(selectContainer(null, "aac")).toBe("mp4");
     expect(selectContainer(null, "flac")).toBe("mkv");
+  });
+});
+
+describe("negotiateCodec — scored fallback ladder (#86 P2)", () => {
+  it("top preference available → depth 0, score 1.0, nothing demoted", () => {
+    const n = negotiateCodec("video", ["av1", "vp9", "vp8"], SW_ONLY);
+    expect(n.codec).toBe("av1");
+    expect(n.encoder).toBe("libsvtav1");
+    expect(n.depth).toBe(0);
+    expect(n.score).toBe(1);
+    expect(n.demoted).toEqual([]);
+  });
+
+  it("top unavailable → scores DOWN to the first working rung (never hard-fails on top)", () => {
+    // no av1/vp9 encoder present → ladder demotes to vp8 (libvpx).
+    const n = negotiateCodec("video", ["av1", "vp9", "vp8"], NO_AV1);
+    expect(n.codec).toBe("vp8");
+    expect(n.encoder).toBe("libvpx");
+    expect(n.depth).toBe(2);
+    expect(n.demoted).toEqual(["av1", "vp9"]);
+    expect(n.score).toBeCloseTo(1 - 2 / 3); // 1 - depth/ladderLength
+  });
+
+  it("hardware preference still applies within the chosen rung", () => {
+    const n = negotiateCodec("video", ["h264"], HW);
+    expect(n.encoder).toBe("h264_nvenc");
+    expect(n.kind).toBe("hw");
+    expect(n.depth).toBe(0);
+  });
+
+  it("a single codec string is a one-rung ladder", () => {
+    const n = negotiateCodec("audio", "opus", SW_ONLY);
+    expect(n.codec).toBe("opus");
+    expect(n.score).toBe(1);
+  });
+
+  it("unknown codecs in the ladder are skipped, not fatal", () => {
+    const n = negotiateCodec("video", ["theora", "vp8"], SW_ONLY);
+    expect(n.codec).toBe("vp8");
+    expect(n.demoted).toEqual(["theora"]);
+  });
+
+  it("entire ladder unavailable → honest-fail (throws, never returns nothing)", () => {
+    const noVideo = new Set(["libopus", "aac"]); // audio encoders only
+    expect(() => negotiateCodec("video", ["av1", "vp9", "vp8", "h264"], noVideo)).toThrow(
+      CodecUnavailableError,
+    );
+  });
+
+  it("empty preference list → throws", () => {
+    expect(() => negotiateCodec("video", [], SW_ONLY)).toThrow(/empty preference list/);
   });
 });
