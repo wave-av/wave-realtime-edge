@@ -15,6 +15,7 @@ import {
   type WsAdapterTrack,
 } from "../../src/encoders/container-adapter.js";
 import { sniffWebm } from "../../src/recording-writer.js";
+import { R2Sink, LocalFsSink, FanoutSink, type LocalFileWriter } from "../../src/encoders/recording-sink.js";
 
 const APP_ID = "a".repeat(32); // 32-hex passes APPID guard
 const SESSION = "sess_ABC12345";
@@ -349,5 +350,82 @@ describe("RawSfuTap — PCM Packets → one canonical SKIP object", () => {
   it("the default encoder is the no-WASM PCM passthrough", () => {
     expect(new PassthroughPcmEncoder().codec).toBe("pcm");
     expect(Array.from(new PassthroughPcmEncoder().encode(Uint8Array.from([5, 6])))).toEqual([5, 6]);
+  });
+});
+
+// ── 4. RT-R10 (#72) Gap 1: RawSfuTap routes through an INJECTED RecordingSink ────────────────────────────
+// Proves the wiring that makes `selectSink` non-orphan: the tap no longer touches R2 directly — it writes to a
+// `RecordingSink`. With a FanoutSink([R2, local]) the SAME canonical bytes land in BOTH, and `tap.key`/finalize
+// report the PRIMARY (R2) result. Default (no `sink`) is byte-identical to the original direct path.
+class FakeLocalWriter implements LocalFileWriter {
+  chunks: Uint8Array[] = [];
+  closedPath: string | null = null;
+  async append(part: Uint8Array): Promise<void> {
+    this.chunks.push(part);
+  }
+  async close(): Promise<{ path: string; bytes: number } | null> {
+    const bytes = this.chunks.reduce((n, c) => n + c.length, 0);
+    if (bytes === 0) return null;
+    this.closedPath = `/rec/${SESSION}/recording.raw`;
+    return { path: this.closedPath, bytes };
+  }
+  async discard(): Promise<void> {
+    this.chunks = [];
+  }
+}
+
+function concatChunks(chunks: Uint8Array[]): Uint8Array {
+  const len = chunks.reduce((n, c) => n + c.length, 0);
+  const out = new Uint8Array(len);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.length;
+  }
+  return out;
+}
+
+describe("RawSfuTap — injected RecordingSink (Gap 1 wiring)", () => {
+  const session = { org: "org_x", sessionId: SESSION };
+  const target = (bucket: FakeBucket) => ({ bucket: bucket as unknown as R2Bucket, org: "org_x", sessionId: SESSION });
+
+  it("fans the SAME canonical bytes to BOTH the R2 sink and the local sink; key = the primary (R2) key", async () => {
+    const bucket = new FakeBucket();
+    const local = new FakeLocalWriter();
+    const sink = new FanoutSink([new R2Sink(bucket as unknown as R2Bucket, session), new LocalFsSink(local, session)]);
+    const tap = new RawSfuTap({ target: target(bucket), sink });
+    for (let i = 0; i < 5; i++) await tap.onFrame(packet(i, i * 20, [0x10, 0x20, 0x30, 0x40]));
+    const result = await tap.finalize();
+
+    // primary (R2): ONE canonical object, the billed result; the live key reflects the primary sink.
+    expect(bucket.created).toHaveLength(1);
+    expect(result!.key).toBe(`org_x/realtime-recordings/${SESSION}/recording.webm`);
+    expect(tap.key).toBe(result!.key);
+    // secondary (local): got the SAME bytes, byte-for-byte, and finalized a real path.
+    const r2Bytes = bucket.objectBytes();
+    const localBytes = concatChunks(local.chunks);
+    expect(localBytes.length).toBe(r2Bytes.length);
+    expect(Array.from(localBytes)).toEqual(Array.from(r2Bytes));
+    expect(local.closedPath).not.toBeNull();
+  });
+
+  it("with NO `sink` defaults to an R2Sink — byte-identical to the direct path (one canonical object)", async () => {
+    const bucket = new FakeBucket();
+    const tap = new RawSfuTap({ target: target(bucket) });
+    await tap.onFrame(packet(0, 0, [9, 9, 9]));
+    const result = await tap.finalize();
+    expect(bucket.created).toHaveLength(1);
+    expect(result!.key).toBe(`org_x/realtime-recordings/${SESSION}/recording.webm`);
+  });
+
+  it("no media → the injected sink finalizes NULL (no 0-byte object, no local file)", async () => {
+    const bucket = new FakeBucket();
+    const local = new FakeLocalWriter();
+    const sink = new FanoutSink([new R2Sink(bucket as unknown as R2Bucket, session), new LocalFsSink(local, session)]);
+    const tap = new RawSfuTap({ target: target(bucket), sink });
+    await tap.onFrame(packet(0, 0, [])); // keep-alive only
+    expect(await tap.finalize()).toBeNull();
+    expect(bucket.created).toHaveLength(0);
+    expect(local.closedPath).toBeNull();
   });
 });
