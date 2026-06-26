@@ -74,6 +74,13 @@ STREAM_BRIDGE_ENABLED = "0"
 # activate on an explicit agent bind (POST /v1/realtime/agents/bind); live rooms are unaffected until bound.
 VOICE_AGENT_PROVIDER = "wave"
 
+# ── #81 step-4 barge-in — TTS real-time send-ahead LEAD (ms). speak() paces the reply to the playout clock so
+# the agent the LISTENER hears is interruptible: turnInFlight spans playout (bargeIn fires mid-reply) and on
+# abort only ≤lead drains. Default in code is 150 (audio-safe); TUNED to 30 here from a live leg4 sweep
+# (2026-06-26): 150ms→~1100ms end-to-end barge stop, 40ms→~540ms, 20ms→~104-147ms; 30 keeps barge-in well under
+# the 300ms target with a small anti-underrun cushion above 20. 0 disables pacing (legacy bulk send).
+AGENT_TTS_LEAD_MS = "30"
+
 # ── RT-P1.5 — pluggable recording encoders (design §6). DEFAULT DISARMED / DORMANT. ──
 # RT_RECORD arms recording at all; absent/"0" → selectEncoder() returns the inert DisarmedEncoder (begin →
 # null), so the whole feature is a no-op (config-no-silent-noop: inert, not silently broken). Arming
