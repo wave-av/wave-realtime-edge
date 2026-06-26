@@ -1,0 +1,4 @@
+# Node-only harness deps (werift/opusscript) — NEVER part of the worker bundle.
+node_modules/
+# Generated run output (leg3 writes the decoded agent capture here for human listening).
+fixtures/leg3-agent-capture.wav
