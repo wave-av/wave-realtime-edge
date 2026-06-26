@@ -27,6 +27,18 @@ import {
 // B3 (#98) — IETF WHIP v1 ingest surface (/v1/whip/*). INERT behind WHIP_INGEST_ENABLED ([vars], default off
 // → the 501 catch-all is unchanged). See src/whip.ts + whip-v1-frozen-contract.md §3/§4/§6-B3.
 import { handleWhip, whipIngestEnabled, type WhipEnv } from "./whip";
+// B1 (#91-a) — CF Stream Live → SFU bridge CONTROL PLANE (POST /v1/stream/bridge/webhook). INERT behind
+// STREAM_BRIDGE_ENABLED ([vars], default off → 501 fall-through). Self-authenticating (CF Stream HMAC, NOT
+// gateway-fronted). Control-only — never touches media. See src/stream-bridge.ts + cf-stream-bridge-frozen-contract.
+import {
+	handleStreamBridge,
+	streamBridgeEnabled,
+	reconcileStreamPending,
+	STREAM_INPUT_ORG_PREFIX,
+	STREAM_PENDING_PREFIX,
+	STREAM_PENDING_TTL_SECONDS,
+	type StreamBridgeDeps,
+} from "./stream-bridge";
 // Task #81 (LK-rip Phase 6b) — voice-agent runtime. INERT behind VOICE_AGENT_PROVIDER==="wave": every new
 // route/DO behavior is gated by voiceAgentEnabled(env); absent/anything-else → the 501 catch-all is unchanged.
 import { voiceAgentEnabled, type AgentSessionConfig } from "./agent-session";
@@ -63,6 +75,11 @@ interface Env extends EncoderEnv {
 	// B3 (#98) WHIP v1 ingest flag ([vars], default off). Falsy/absent → the /v1/whip/* surface is inert and
 	// the 501 catch-all is unchanged. Truthy ("1"/"true") → the WHIP listener (src/whip.ts) handles /v1/whip/*.
 	WHIP_INGEST_ENABLED?: string | boolean;
+	// B1 (#91-a) CF Stream bridge flag ([vars], default off). Falsy/absent → POST /v1/stream/bridge/webhook is
+	// inert (501 fall-through). Truthy → the control-plane webhook (src/stream-bridge.ts) handles it.
+	STREAM_BRIDGE_ENABLED?: string | boolean;
+	WAVE_STREAM_WEBHOOK_SECRET?: string; // wrangler SECRET — CF Stream webhook signing secret (HMAC). Empty → every webhook 401s (fail-closed).
+	STREAM_BRIDGE?: DurableObjectNamespace; // B2 republisher container (whep-to-whip). COMMENTED in wrangler until ◆ go-live → absent → dispatch fails CLOSED.
 	TURN_KEY_ID?: string; // wrangler SECRET — the CF TURN key uid (32-hex). Out of the public repo; persists across deploys.
 	TURN_KEY_TOKEN?: string; // wrangler SECRET — the TURN key's api token. Never logged/returned; only ephemeral ICE creds are.
 	// ── P5 CF-Calls SFU control plane ──
@@ -220,6 +237,50 @@ function buildPullSink(env: Env): RecordingPullSink | null {
  * be a safe single path segment. The gateway stamps x-wave-org, but we still validate before minting a key/
  * billing prefix: alphanumerics + `_ : -` only (uuid-ish / pool-ish), no `/`, dot, or whitespace, ≤128 chars. */
 const SAFE_ORG = /^[A-Za-z0-9_:-]{1,128}$/;
+
+/**
+ * B1 (#91-a) — shared container dispatch for the CF Stream bridge, used by BOTH the webhook route and the cron
+ * reconcile. Reaches the republisher container (B2) by the deterministic `${org}:${uid}` DO id and POSTs a
+ * control /start (text body {room, uid}) — the container reads its own WHEP_SRC/WHIP_DST env. The binding is
+ * COMMENTED until ◆ go-live, so when absent a start THROWS (handler logs + cron-requeues), never silent.
+ */
+async function streamDispatchStart(env: Env, org: string, uid: string, room: string): Promise<void> {
+	if (!env.STREAM_BRIDGE) throw new Error("stream-bridge container binding absent (inert until ◆ go-live)");
+	const stub = env.STREAM_BRIDGE.get(env.STREAM_BRIDGE.idFromName(`${org}:${uid}`));
+	const res = await stub.fetch("https://stream-bridge/start", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ room, uid }),
+	});
+	if (!res.ok) throw new Error(`stream-bridge container /start → ${res.status}`);
+}
+
+/** Build the live StreamBridgeDeps: KV org-resolve + pending (RT_MEETING_ORG, prefixed); container start/stop;
+ * ctx.waitUntil (absent in tests → the handler awaits the dispatch). Control-only — no media seam exists. */
+function buildStreamBridgeDeps(env: Env, ctx?: ExecutionContext): StreamBridgeDeps {
+	const kv = env.RT_MEETING_ORG;
+	const log = (msg: string, fields: Record<string, unknown>) => console.log(JSON.stringify({ msg, ...fields }));
+	return {
+		resolveOrg: async (uid) => (kv ? kv.get(`${STREAM_INPUT_ORG_PREFIX}${uid}`) : null),
+		dispatchStart: (org, uid, room) => streamDispatchStart(env, org, uid, room),
+		dispatchStop: async (org, uid) => {
+			if (!env.STREAM_BRIDGE) return; // nothing bound → nothing to tear down
+			const stub = env.STREAM_BRIDGE.get(env.STREAM_BRIDGE.idFromName(`${org}:${uid}`));
+			await stub.fetch("https://stream-bridge/stop", { method: "POST" });
+		},
+		log,
+		markPending: async (uid, org) => {
+			if (kv)
+				await kv.put(`${STREAM_PENDING_PREFIX}${uid}`, JSON.stringify({ org, attempts: 0 }), {
+					expirationTtl: STREAM_PENDING_TTL_SECONDS,
+				});
+		},
+		clearPending: async (uid) => {
+			if (kv) await kv.delete(`${STREAM_PENDING_PREFIX}${uid}`);
+		},
+		waitUntil: ctx ? (p) => ctx.waitUntil(p) : undefined,
+	};
+}
 
 export default {
 	async fetch(request: Request, env: Env = {} as Env, ctx?: ExecutionContext): Promise<Response> {
@@ -643,6 +704,17 @@ export default {
 			if (whipRes) return whipRes; // null → unrecognized /v1/whip/* sub-path → 501 fall-through below
 		}
 
+		// ── B1 (#91-a) CF Stream Live → SFU bridge control plane — POST /v1/stream/bridge/webhook ──
+		// INERT behind STREAM_BRIDGE_ENABLED ([vars], default off): the block is skipped and the request falls
+		// through to the 501 catch-all, UNCHANGED. Unlike /v1/whip/* this is SELF-authenticating (CF Stream calls
+		// it directly, not via the gateway) — handleStreamBridge verifies its own HMAC over the raw body BEFORE
+		// parse (401 on a bad/absent/stale sig). Control-only: it resolves org from KV and dispatches the
+		// republisher CONTAINER's /start·/stop (text), never a media byte. The container binding stays absent
+		// until ◆ go-live, so dispatch fails CLOSED (logged + cron-requeued), never silently.
+		if (request.method === "POST" && url.pathname === "/v1/stream/bridge/webhook" && streamBridgeEnabled(env)) {
+			return handleStreamBridge(request, env.WAVE_STREAM_WEBHOOK_SECRET ?? "", buildStreamBridgeDeps(env, ctx));
+		}
+
 		// ── Task #81 voice-agent runtime (LK-rip Phase 6b) — INERT unless VOICE_AGENT_PROVIDER==="wave" ──
 		// When the flag is off, BOTH blocks below are skipped and the request falls through to the 501 catch-all,
 		// UNCHANGED. When on, the SAME gateway-trust chokepoint as every paid route gates dispatch; the egress WS
@@ -778,6 +850,18 @@ export default {
 		if (sink && env.RT_MEETING_ORG) {
 			ctx.waitUntil(
 				reconcilePending(env.RT_MEETING_ORG, sink, (msg, fields) => console.log(JSON.stringify({ msg, ...fields }))),
+			);
+		}
+		// B1 (#91-a) — CF Stream bridge lifecycle-poll backstop: re-dispatch any republisher a POST-ack /start
+		// failed on (CF Stream fires connected once + never re-delivers after our 200). INERT unless the flag is
+		// on AND the KV is bound. Best-effort; never throws out of scheduled().
+		if (streamBridgeEnabled(env) && env.RT_MEETING_ORG) {
+			ctx.waitUntil(
+				reconcileStreamPending(
+					env.RT_MEETING_ORG,
+					{ dispatchStart: (org, uid, room) => streamDispatchStart(env, org, uid, room) },
+					(msg, fields) => console.log(JSON.stringify({ msg, ...fields })),
+				),
 			);
 		}
 	},
