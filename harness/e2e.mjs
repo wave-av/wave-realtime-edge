@@ -48,12 +48,14 @@ async function bindAgent({ sessionId, trackName }) {
 async function main() {
   log("e2e-start", { org: ORG, room: ROOM, agentId: AGENT_ID, edge: EDGE_BASE });
 
-  // loops=3 → the phrase plays 4× (~10s), covering bind + egress setup, then STOPS. The trailing silence lets
-  // the agent's VAD endpoint the utterance and complete ONE clean turn (STT→LLM→TTS→publish) — continuous audio
-  // (loops=-1) never endpoints and every turn is interrupted before the agent speaks.
+  // #28 endpointed fixture: phrase.wav (~2.6s speech) + ~1.6s of low-level (-45dBFS) noise. The noise reads BELOW
+  // the VAD rms threshold (speech-end fires) yet is non-zero so Opus keeps emitting packets — frames keep flowing
+  // to the DO during the silence so the hangover actually trips (digital silence + DTX would stop packets and the
+  // VAD would never see the quiet frames). loops=-1 (continuous) keeps frames flowing the whole run; each loop is
+  // speech → silence → speech-end → ONE STT → turn → TTS publishes RTP before the next phrase can barge in.
   const pub = await createPublisher({
     sfuBase: SFU_BASE, appId: APP_ID, appSecret: APP_SECRET,
-    wavPath: join(HERE, "fixtures", "phrase.wav"), loops: 3, log,
+    wavPath: join(HERE, "fixtures", "phrase-endpointed.wav"), loops: -1, log,
   });
   log("publisher-created", { sessionId: pub.sessionId, trackName: pub.trackName });
 
