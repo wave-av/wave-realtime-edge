@@ -35,6 +35,22 @@ describe("createIngestAdapter", () => {
     expect((seen.body as { tracks: { location: string; inputCodec: string; mode: string }[] }).tracks[0]).toMatchObject({ location: "local", inputCodec: "pcm", mode: "buffer" });
   });
 
+  it("parses the PUBLISHED sessionId + adapterId from the SFU's tracks[0] response (#29 session mismatch)", async () => {
+    // CF returns the created track nested under tracks[0] and publishes it on its OWN sessionId (NOT the one we
+    // passed). Consumers must pull from THIS published session — surfacing it is the #29 fix.
+    const fetchImpl = async () =>
+      new Response(
+        JSON.stringify({ tracks: [{ adapterId: "ad_pub", trackName: "agent-a1", sessionId: "cf_session_xyz" }] }),
+        { status: 200 },
+      );
+    const r = await createIngestAdapter({ fetchImpl }, {
+      appId: APP, bearer: "b",
+      tracks: [{ location: "local", sessionId: SESSION, trackName: "agent-a1", endpoint: "wss://rt.wave.online/x", inputCodec: "pcm", mode: "buffer" }],
+    });
+    expect(r.adapterId).toBe("ad_pub");
+    expect(r.publishedSessionId).toBe("cf_session_xyz");
+  });
+
   it("rejects a bad app id, missing bearer, non-wss endpoint, bad session, empty tracks", async () => {
     const f = jsonFetch(200, {});
     await expect(createIngestAdapter({ fetchImpl: f }, { appId: "nope", bearer: "b", tracks: [{ location: "local", sessionId: SESSION, trackName: "t", endpoint: "wss://x/y", inputCodec: "pcm" }] })).rejects.toMatchObject({ code: "BAD_APP_ID" });

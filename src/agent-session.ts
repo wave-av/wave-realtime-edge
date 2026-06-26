@@ -203,6 +203,9 @@ export class AgentSessionCore {
     this.deps.log("agent-adapters-open", {
       org: c.org, room: c.roomId, agentId: c.agentId,
       egressAdapterId: this.egress.adapterId, ingestAdapterId: this.ingest.adapterId,
+      // The SESSION the agent track was actually published on (CF's own, NOT the participant's) — consumers pull
+      // agentTrackName from here. Logged so the mismatch is visible (#29). Falls back to participant if absent.
+      agentSessionId: this.ingest.publishedSessionId ?? c.participantSessionId,
     });
     return { egress: this.egress, ingest: this.ingest };
   }
@@ -403,7 +406,15 @@ export class AgentSessionDO {
         const { egress, ingest } = await this.core.openAdapters({ baseWss, egressToken, ingestToken });
         this.armTurnTaking(bound); // step 3: arm the turn core for this binding (replaces echo on frames)
         return Response.json(
-          { ok: true, bound, egressAdapterId: egress.adapterId, ingestAdapterId: ingest.adapterId },
+          {
+            ok: true,
+            bound,
+            egressAdapterId: egress.adapterId,
+            ingestAdapterId: ingest.adapterId,
+            // The session the agent track is published on (CF's own, returned by the ingest adapter) — a consumer
+            // (the room participant / harness) pulls `agentTrackName` from HERE, not participantSessionId (#29).
+            agentSessionId: ingest.publishedSessionId ?? bound.participantSessionId,
+          },
           { status: 200 },
         );
       }
