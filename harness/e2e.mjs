@@ -96,10 +96,14 @@ async function main() {
   let leg2 = "SKIP";
   if (result === "PASS") {
     const agentTrackName = bind.json.bound?.agentTrackName ?? `agent-${AGENT_ID}`;
+    // #29: CF's location:"local" ingest adapter publishes agent-<id> on its OWN session (returned by /bind as
+    // agentSessionId), NOT the participant's. Pull from there or we listen on the wrong session → 0 RTP.
+    const agentSessionId = bind.json.agentSessionId ?? pub.sessionId;
+    log("leg2-agent-session", { agentSessionId, participantSessionId: pub.sessionId });
     try {
       const sub = await createSubscriber({
         sfuBase: SFU_BASE, appId: APP_ID, appSecret: APP_SECRET,
-        remoteSessionId: pub.sessionId, agentTrackName, log,
+        remoteSessionId: agentSessionId, agentTrackName, log,
       });
       const subOk = await sub.connected();
       log("subscriber-connected", { ok: subOk });
