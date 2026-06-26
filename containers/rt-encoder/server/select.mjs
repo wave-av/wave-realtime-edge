@@ -97,6 +97,61 @@ export function selectEncoder(kind, codec, available, policy = {}) {
 }
 
 /**
+ * @typedef {Object} NegotiatedCodec
+ * @property {string} codec        the chosen codec (first in preference order with an available encoder).
+ * @property {string} encoder      the chosen ffmpeg encoder name.
+ * @property {"sw"|"hw"} kind      hardware or software.
+ * @property {string} accel        accel family ("none" for software).
+ * @property {string} container    the container this codec implies.
+ * @property {number} score        1.0 at the top preference, decreasing down the ladder (never 0 for a
+ *                                  codec that works): score = 1 - depth/preferences.length.
+ * @property {number} depth        0 = top preference chosen; N = the Nth fallback was needed.
+ * @property {string[]} demoted    codecs higher in the ladder that were unavailable (skipped, for logging).
+ */
+
+/**
+ * SCORED FALLBACK LADDER (#86 P2, scored-transport-fallback-ladder). Given an ORDERED preference list of
+ * dest codecs (best-first, e.g. ["av1","vp9","vp8","h264"]) and the host's available encoders, return the
+ * first codec we can actually encode — scoring DOWN each rung instead of hard-failing on the top choice.
+ *
+ * This is the EXPLICIT negotiation the ADR's honest-fail rule permits: selectEncoder still THROWS for a
+ * single named codec (no silent substitution), but the negotiator deliberately walks a DECLARED ladder
+ * and records the demotion (`depth`/`score`/`demoted`) so the caller can log/observe it. We honest-fail
+ * (throw) only when the ENTIRE ladder is unavailable — never silently produce nothing.
+ *
+ * @param {"video"|"audio"} kind   media kind.
+ * @param {string|string[]} preferences  ordered dest-codec preference (best first). A bare string = one rung.
+ * @param {Set<string>} available  encoder names available on this host.
+ * @param {SelectPolicy} [policy]
+ * @returns {NegotiatedCodec}
+ * @throws {CodecUnavailableError} when no codec in the ladder has an available encoder.
+ */
+export function negotiateCodec(kind, preferences, available, policy = {}) {
+  const ladder = (Array.isArray(preferences) ? preferences : [preferences])
+    .map((c) => String(c || "").toLowerCase())
+    .filter(Boolean);
+  if (!ladder.length) throw new Error("negotiateCodec: empty preference list");
+  const avail = available instanceof Set ? available : new Set(available || []);
+  const demoted = [];
+  for (let depth = 0; depth < ladder.length; depth++) {
+    const codec = ladder[depth];
+    try {
+      const sel = selectEncoder(kind, codec, avail, policy);
+      return { ...sel, score: 1 - depth / ladder.length, depth, demoted: [...demoted] };
+    } catch (err) {
+      // an unavailable OR unknown rung is simply skipped (it's not on offer); any other error propagates.
+      if (err instanceof CodecUnavailableError || err instanceof UnknownCodecError) {
+        demoted.push(codec);
+        continue;
+      }
+      throw err;
+    }
+  }
+  // The whole ladder is unavailable — honest-fail with the full chain in the message.
+  throw new CodecUnavailableError(ladder.join(" → "), demoted);
+}
+
+/**
  * Pick the muxer CONTAINER for a (videoCodec, audioCodec) pair (ADR §Mux constraint, codec-aware muxer):
  *   - VP8/VP9/AV1 (+ Opus/Vorbis)  → webm
  *   - H.264/H.265/ProRes (+ AAC)   → mp4
