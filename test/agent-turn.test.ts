@@ -83,6 +83,18 @@ function egressFrame(pcm: number[], seq = 1, ts = 4800): Uint8Array {
   return encodeIngestFrame(new Uint8Array(pcm), { sequenceNumber: seq, timestamp: ts }, "packet");
 }
 
+// #28 silence-gated endpointing: a turn fires only when the VAD declares speech-end (the user stopped). So a test
+// utterance is now LOUD frame(s) (speech onset) → a QUIET frame (silence hangover → speech-end → ONE batch STT).
+// VAD_FAST makes that deterministic: 1 loud frame = onset, 1 quiet frame = end.
+const VAD_FAST = { onsetFrames: 1, hangoverFrames: 1, rmsThreshold: 500 } as const;
+const LOUD = [0x10, 0x27, 0x10, 0x27]; // 16-bit LE ~10000 → RMS ≫ 500 (speech); no 0x00
+const END = [0, 0]; // quiet (RMS 0 → speech-end) AND carries the 0x00 the fake STT finalizes on
+/** Feed one full utterance (speech onset → silence) so #28 endpointing fires exactly one turn. */
+async function speak(core: TurnTakingCore, seq = 1): Promise<void> {
+  await core.onFrame(egressFrame(LOUD, seq)); // speech onset — accumulate, no turn yet
+  await core.onFrame(egressFrame(END, seq + 1)); // speech-end → ONE STT on the utterance → fire the turn
+}
+
 describe("buildTurnSystemPrompt", () => {
   it("uses the configured prompt and falls back to a sensible default", () => {
     expect(buildTurnSystemPrompt({ ...goodCfg, systemPrompt: "Custom." })).toBe("Custom.");
@@ -101,16 +113,20 @@ describe("TurnTakingCore — bounded utterance buffer (DO OOM guard)", () => {
       return { isFinal: false, transcript: "..." };
     });
     const { deps } = mkDeps({ transcribe });
-    const core = new TurnTakingCore(deps, goodCfg);
+    const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_FAST });
 
-    // Frames are capped at 32 KB on the wire (MAX_PCM_MESSAGE_BYTES); feed enough to overflow the ~5.76 MB
-    // utterance cap several times over (no 0x00 terminator → STT never finalizes → buffer would grow forever).
+    // Frames are capped at 32 KB on the wire (MAX_PCM_MESSAGE_BYTES); feed enough LOUD (speech) frames to overflow
+    // the ~5.76 MB utterance cap several times over — a long continuous talker who never pauses, so the buffer
+    // would grow forever without eviction. One trailing quiet frame then trips speech-end → the (bounded) buffer
+    // is handed to STT exactly once (#28), letting us observe its size.
     const frameBytes = 32 * 1024;
     const framesToOverflow = Math.ceil(MAX_UTTERANCE_BYTES / frameBytes) + 10;
-    const payload = new Uint8Array(frameBytes).fill(1); // non-zero, no terminator
+    const loudPayload = new Uint8Array(frameBytes).fill(0x40); // 0x4040 ≈ 16448 RMS ≫ 500 → speech, never endpoints
     for (let i = 0; i < framesToOverflow; i++) {
-      await core.onFrame(encodeIngestFrame(payload, { sequenceNumber: i + 1, timestamp: 4800 * (i + 1) }, "packet"));
+      await core.onFrame(encodeIngestFrame(loudPayload, { sequenceNumber: i + 1, timestamp: 4800 * (i + 1) }, "packet"));
     }
+    // Now go silent → speech-end → the ONE batch STT runs on the bounded utterance.
+    await core.onFrame(egressFrame(END, framesToOverflow + 1));
 
     expect(transcribe).toHaveBeenCalled();
     // The buffer handed to STT is BOUNDED — eviction of oldest frames keeps it at/under the cap (the bug fix).
@@ -123,12 +139,12 @@ describe("TurnTakingCore — bounded utterance buffer (DO OOM guard)", () => {
 describe("TurnTakingCore — one full turn", () => {
   it("PCM-in → final transcript → LLM(history) → assistant text → TTS → PCM-out the ingest socket", async () => {
     const { deps, sent, complete, transcribe, synthesize } = mkDeps();
-    const core = new TurnTakingCore(deps, goodCfg);
-    // partial frame (no terminator) — accrues, no turn yet
+    const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_FAST });
+    // loud frame (speech onset) — accrues, no turn yet (#28: STT waits for speech-end)
     await core.onFrame(egressFrame([10, 20], 1));
     expect(complete).not.toHaveBeenCalled();
     expect(sent.length).toBe(0);
-    // final frame (terminator 0x00) — fires the full turn
+    // quiet frame (silence → speech-end; carries 0x00 the fake STT finalizes on) — fires the full turn
     await core.onFrame(egressFrame([30, 0x00], 2));
     expect(transcribe).toHaveBeenCalled();
     expect(complete).toHaveBeenCalledTimes(1);
@@ -145,9 +161,9 @@ describe("TurnTakingCore — one full turn", () => {
 
   it("accumulates conversation history across turns (alternating user/assistant)", async () => {
     const { deps, complete } = mkDeps();
-    const core = new TurnTakingCore(deps, goodCfg);
-    await core.onFrame(egressFrame([1, 0x00], 1)); // turn 1
-    await core.onFrame(egressFrame([2, 0x00], 2)); // turn 2
+    const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_FAST });
+    await speak(core, 1); // turn 1
+    await speak(core, 3); // turn 2
     expect(complete).toHaveBeenCalledTimes(2);
     const secondTurnMsgs = (complete as ReturnType<typeof vi.fn>).mock.calls[1][0] as LlmMessage[];
     // system, user(t1), assistant(t1), user(t2)
@@ -168,9 +184,9 @@ describe("TurnTakingCore — one full turn", () => {
       yield { type: "text", text: "ok" } as const; // turn 2 succeeds
     });
     const { deps } = mkDeps({ complete });
-    const core = new TurnTakingCore(deps, goodCfg);
-    await core.onFrame(egressFrame([1, 0x00], 1)); // turn 1 → LLM throws (swallowed)
-    await core.onFrame(egressFrame([2, 0x00], 2)); // turn 2 → succeeds
+    const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_FAST });
+    await speak(core, 1); // turn 1 → LLM throws (swallowed)
+    await speak(core, 3); // turn 2 → succeeds
     expect(complete).toHaveBeenCalledTimes(2);
     const secondReq = (complete as ReturnType<typeof vi.fn>).mock.calls[1][0] as LlmMessage[];
     // No two consecutive user roles anywhere in the second request.
@@ -181,11 +197,13 @@ describe("TurnTakingCore — one full turn", () => {
     expect(core.history().map((m) => m.role)).toEqual(["system", "user", "assistant"]);
   });
 
-  it("does not fire a turn on a partial (non-final) transcript", async () => {
-    const { deps, complete, synthesize } = mkDeps();
-    const core = new TurnTakingCore(deps, goodCfg);
+  it("does not fire a turn while the user is still speaking (no speech-end yet)", async () => {
+    const { deps, complete, synthesize, transcribe } = mkDeps();
+    const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_FAST });
+    // Two LOUD frames = ongoing speech, never a silence hangover → #28 never runs STT, never fires a turn.
     await core.onFrame(egressFrame([1, 2], 1));
     await core.onFrame(egressFrame([3, 4], 2));
+    expect(transcribe).not.toHaveBeenCalled();
     expect(complete).not.toHaveBeenCalled();
     expect(synthesize).not.toHaveBeenCalled();
   });
@@ -197,7 +215,9 @@ describe("TurnTakingCore — barge-in (step 4 interrupt controller)", () => {
   const loud = () => egressFrame([0x10, 0x27, 0x10, 0x27, 0x10, 0x27], 9);
   // Quiet PCM (zero samples → RMS 0) = "silence" for the VAD.
   const quiet = () => egressFrame([0, 0, 0, 0], 9);
-  const startTurn = () => egressFrame([30, 0x00], 1); // quiet + 0x00 terminator → STT-final → starts a turn
+  // #28: a turn starts at speech-END, so first feed a LOUD onset, then this quiet+0x00 frame trips the hangover →
+  // speech-end → one STT (final) → runTurn. Callers do: `await core.onFrame(loud()); const turnP = core.onFrame(startTurn());`
+  const startTurn = () => egressFrame([30, 0x00], 1); // quiet + 0x00 → speech-end + STT-final → starts a turn
 
   it("user speech mid-turn aborts the in-flight TTS — agent goes silent, interrupt is logged", async () => {
     let releaseTts!: () => void;
@@ -211,7 +231,8 @@ describe("TurnTakingCore — barge-in (step 4 interrupt controller)", () => {
     // onsetFrames:1 → one loud frame is an onset; hangoverFrames:1 → one quiet frame is a speech-end. Deterministic.
     const core = new TurnTakingCore(deps, goodCfg, { vad: { onsetFrames: 1, hangoverFrames: 1, rmsThreshold: 500 } });
 
-    const turnP = core.onFrame(startTurn()); // do NOT await — parks at the TTS gate
+    await core.onFrame(loud()); // speech onset (#28: a turn fires at the following speech-end)
+    const turnP = core.onFrame(startTurn()); // speech-end → STT-final → runTurn; do NOT await — parks at the TTS gate
     await tick();
     expect(sent.length).toBe(1); // chunk 1 already out
     // A REAL barge-in (#27): the turn-start marks the VAD speaking, so the trailing audio of the just-finished
@@ -234,11 +255,12 @@ describe("TurnTakingCore — barge-in (step 4 interrupt controller)", () => {
       yield new Uint8Array([5, 6, 7, 8]);
     });
     const { deps, sent, logs } = mkDeps({ synthesize });
-    const core = new TurnTakingCore(deps, goodCfg, { vad: { onsetFrames: 1, rmsThreshold: 500 } });
+    const core = new TurnTakingCore(deps, goodCfg, { vad: { onsetFrames: 1, hangoverFrames: 1, rmsThreshold: 500 } });
 
-    const turnP = core.onFrame(startTurn());
+    await core.onFrame(loud()); // speech onset
+    const turnP = core.onFrame(startTurn()); // speech-end → runTurn (parks at TTS)
     await tick();
-    await core.onFrame(quiet()); // silence mid-turn → no onset → no barge-in
+    await core.onFrame(quiet()); // silence mid-turn → speech-end (not a fresh onset) → no barge-in
     releaseTts();
     await turnP;
 
@@ -257,14 +279,15 @@ describe("TurnTakingCore — barge-in (step 4 interrupt controller)", () => {
     const { deps, complete } = mkDeps({ synthesize });
     const core = new TurnTakingCore(deps, goodCfg, { vad: { onsetFrames: 1, hangoverFrames: 1, rmsThreshold: 500 } });
 
-    const turnP = core.onFrame(startTurn()); // turn 1 — LLM committed assistant, then parks in TTS
+    await core.onFrame(loud()); // speech onset
+    const turnP = core.onFrame(startTurn()); // turn 1 — speech-end → LLM commits assistant, then parks in TTS
     await tick();
     await core.onFrame(quiet()); // speech-end: the turn-1 utterance ended (arms a genuine barge-in)
     await core.onFrame(loud()); // fresh speech over the agent → barge-in turn 1
     releaseTts();
     await turnP;
 
-    await core.onFrame(egressFrame([31, 0x00], 2)); // turn 2 — a fresh utterance
+    await core.onFrame(egressFrame([31, 0x00], 4)); // turn 2 — silence after the barge speech → speech-end → fresh turn
     // History is strictly alternating: system + (turn1 user/assistant) + (turn2 user/assistant), no dangling users.
     expect(core.history().map((m) => m.role)).toEqual(["system", "user", "assistant", "user", "assistant"]);
     const secondReq = (complete as ReturnType<typeof vi.fn>).mock.calls[1][0] as LlmMessage[];
@@ -281,8 +304,8 @@ describe("TurnTakingCore — fail-safety (never throws up the media path)", () =
         throw new Error("stt boom");
       }),
     });
-    const core = new TurnTakingCore(deps, goodCfg);
-    await expect(core.onFrame(egressFrame([1, 0x00], 1))).resolves.toBeUndefined();
+    const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_FAST });
+    await expect(speak(core)).resolves.toBeUndefined();
     expect(complete).not.toHaveBeenCalled();
     expect(logs.some((l) => l.msg === "agent-turn-error" && l.fields.stage === "stt")).toBe(true);
   });
@@ -295,8 +318,8 @@ describe("TurnTakingCore — fail-safety (never throws up the media path)", () =
         yield { type: "text", text: "" } as const;
       }),
     });
-    const core = new TurnTakingCore(deps, goodCfg);
-    await expect(core.onFrame(egressFrame([1, 0x00], 1))).resolves.toBeUndefined();
+    const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_FAST });
+    await expect(speak(core)).resolves.toBeUndefined();
     expect(synthesize).not.toHaveBeenCalled();
     expect(sent.length).toBe(0);
     expect(logs.some((l) => l.msg === "agent-turn-error" && l.fields.stage === "llm")).toBe(true);
@@ -310,8 +333,8 @@ describe("TurnTakingCore — fail-safety (never throws up the media path)", () =
         yield new Uint8Array();
       }),
     });
-    const core = new TurnTakingCore(deps, goodCfg);
-    await expect(core.onFrame(egressFrame([1, 0x00], 1))).resolves.toBeUndefined();
+    const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_FAST });
+    await expect(speak(core)).resolves.toBeUndefined();
     expect(sent.length).toBe(0);
     expect(logs.some((l) => l.msg === "agent-turn-error" && l.fields.stage === "tts")).toBe(true);
   });
@@ -329,8 +352,8 @@ describe("TurnTakingCore — fail-safety (never throws up the media path)", () =
 describe("TurnTakingCore — metering seams (honest counts, structured-logged)", () => {
   it("logs voice_agent + llm + tts counts for a completed turn", async () => {
     const { deps, logs } = mkDeps();
-    const core = new TurnTakingCore(deps, goodCfg);
-    await core.onFrame(egressFrame([1, 0x00], 1));
+    const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_FAST });
+    await speak(core);
     const meter = logs.find((l) => l.msg === "agent-turn-meter");
     expect(meter).toBeTruthy();
     expect(meter!.fields).toMatchObject({ org: "org1", room: "room1", agentId: "a1" });
@@ -342,8 +365,8 @@ describe("TurnTakingCore — metering seams (honest counts, structured-logged)",
 describe("TurnTakingCore — voice_agent_minutes emit (step 7)", () => {
   it("calls emitMeter with the turn usage shape on a successful turn", async () => {
     const { deps, emitMeter } = mkDeps();
-    const core = new TurnTakingCore(deps, goodCfg);
-    await core.onFrame(egressFrame([0x00])); // 0x00 → fake STT returns a final → a turn runs
+    const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_FAST });
+    await speak(core); // speech onset → silence → speech-end → STT final → a turn runs
     expect(emitMeter).toHaveBeenCalledTimes(1);
     const usage = emitMeter.mock.calls[0][0] as Record<string, unknown>;
     expect(usage).toMatchObject({ org: "org1", room: "room1", agentId: "a1" });
@@ -357,8 +380,8 @@ describe("TurnTakingCore — voice_agent_minutes emit (step 7)", () => {
       throw new Error("meter boom");
     });
     const { deps, sent, logs } = mkDeps({ emitMeter });
-    const core = new TurnTakingCore(deps, goodCfg);
-    await expect(core.onFrame(egressFrame([0x00]))).resolves.toBeUndefined();
+    const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_FAST });
+    await expect(speak(core)).resolves.toBeUndefined();
     expect(sent.length).toBeGreaterThan(0); // the reply was still spoken (media unaffected)
     expect(logs.some((l) => l.msg === "agent-turn-meter-error")).toBe(true);
   });
