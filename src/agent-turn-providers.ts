@@ -159,9 +159,11 @@ export async function callGatewayTool(
 }
 
 /**
- * Stream ElevenLabs TTS → pcm_48000 chunks (16-bit LE @ 48 kHz, zero transcode for the ingest path). Key is
- * server-side ONLY (xi-api-key header), never logged, never returned. The HTTP streaming endpoint returns the
- * raw PCM body in chunks; we yield each chunk straight to the caller for just-in-time publish (tight barge-in).
+ * Stream ElevenLabs TTS → pcm_48000 chunks (16-bit LE @ 48 kHz, **MONO** — ElevenLabs `pcm_48000` is single-
+ * channel). Key is server-side ONLY (xi-api-key header), never logged, never returned. The HTTP streaming
+ * endpoint returns the raw PCM body in chunks; we yield each chunk straight to the caller for just-in-time
+ * publish (tight barge-in). NOTE: the CF Realtime buffer-mode ingest path wants 48 kHz/16-bit/**STEREO
+ * interleaved** — wrap this with `upmixMonoToStereo16LE` before sending (see synthesize in agent-turn.ts).
  */
 export async function* streamElevenLabs(
   fetchImpl: FetchLike,
@@ -194,6 +196,51 @@ export async function* streamElevenLabs(
     }
   } finally {
     reader.cancel().catch(() => {});
+  }
+}
+
+/**
+ * Upmix a streaming MONO 16-bit-LE PCM stream into STEREO interleaved (L=R) — the format CF Realtime buffer-mode
+ * ingest requires (48 kHz / 16-bit / stereo). Each mono sample (2 bytes) becomes 4 bytes: [lo, hi, lo, hi].
+ *
+ * STATEFUL across chunks: a streamed chunk can split a 16-bit sample on an odd byte boundary, so we CARRY the
+ * dangling low byte into the next chunk rather than dropping or misaligning it (a single dropped byte would shift
+ * every subsequent sample's endianness → white noise). At most one byte is ever carried. A final dangling byte at
+ * stream end (no pair) is silently dropped — it is at most 1 byte of half a sample at end-of-utterance, inaudible.
+ */
+export async function* upmixMonoToStereo16LE(
+  mono: AsyncIterable<Uint8Array>,
+): AsyncIterable<Uint8Array> {
+  let carry: number | null = null; // pending low byte of a sample split across a chunk boundary
+  for await (const chunk of mono) {
+    if (chunk.length === 0) continue;
+    const total = (carry === null ? 0 : 1) + chunk.length;
+    const samples = total >> 1; // complete 16-bit samples we can emit now
+    if (samples === 0) {
+      carry = chunk[0]!; // a lone byte with no carry → hold it for the next chunk
+      continue;
+    }
+    const out = new Uint8Array(samples * 4);
+    let i = 0;
+    let o = 0;
+    for (let s = 0; s < samples; s++) {
+      let lo: number;
+      let hi: number;
+      if (carry !== null) {
+        lo = carry;
+        carry = null;
+        hi = chunk[i++]!;
+      } else {
+        lo = chunk[i++]!;
+        hi = chunk[i++]!;
+      }
+      out[o++] = lo; // L
+      out[o++] = hi;
+      out[o++] = lo; // R
+      out[o++] = hi;
+    }
+    if (i < chunk.length) carry = chunk[i]!; // odd trailing byte → carry into the next chunk
+    yield out;
   }
 }
 

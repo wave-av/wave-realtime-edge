@@ -62,6 +62,7 @@ import {
   streamGatewayLlm,
   callGatewayTool,
   streamElevenLabs,
+  upmixMonoToStereo16LE,
   transcribeViaProvider,
   type FetchLike,
 } from "./agent-turn-providers.js";
@@ -633,7 +634,9 @@ export function buildTurnDeps(
       if (!env.ELEVENLABS_API_KEY || !env.ELEVENLABS_VOICE_ID) {
         throw new AgentSessionError("TTS_NOT_CONFIGURED", "ElevenLabs key/voice not provisioned", 503);
       }
-      yield* streamElevenLabs(fetchImpl, env, text);
+      // ElevenLabs pcm_48000 is MONO; CF Realtime buffer-mode ingest wants 48 kHz/16-bit/STEREO interleaved.
+      // Upmix (L=R) before publish or the agent's voice plays as endianness-shifted noise. (#30)
+      yield* upmixMonoToStereo16LE(streamElevenLabs(fetchImpl, env, text));
     },
     async emitMeter(usage: VoiceTurnUsage): Promise<void> {
       // Step-7 real usage emit (mirrors metering.ts). INERT until the gateway base + service token are
