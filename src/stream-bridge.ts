@@ -318,3 +318,92 @@ export async function reconcileStreamPending(
     }
   } while (cursor);
 }
+
+// ── Live runtime wiring (kept HERE so worker.ts only DELEGATES — never builds deps inline; file-size budget). ──
+
+/** The worker Env subset the live wiring needs: the flag/secret + the container binding + the KV. */
+export interface StreamBridgeRuntimeEnv {
+  STREAM_BRIDGE_ENABLED?: string | boolean;
+  WAVE_STREAM_WEBHOOK_SECRET?: string;
+  STREAM_BRIDGE?: DurableObjectNamespace; // B2 republisher container — COMMENTED until ◆ go-live → absent → fail-closed
+  RT_MEETING_ORG?: KVNamespace; // reused KV (stream-input-org: + stream-bridge-pending: prefixes)
+}
+
+/** Minimal waitUntil-carrier (ExecutionContext satisfies it) so this module needs no worker-runtime import. */
+interface WaitUntilCtx {
+  waitUntil(p: Promise<unknown>): void;
+}
+
+/**
+ * Live container dispatch: reach the republisher container (B2) by the deterministic `${org}:${uid}` DO id and
+ * POST a control /start (text {room, uid}). Binding COMMENTED until ◆ go-live → absent → THROWS (handler logs +
+ * cron-requeues), never silent. Shared by the webhook route and the cron reconcile.
+ */
+export async function liveStreamDispatchStart(
+  env: StreamBridgeRuntimeEnv,
+  org: string,
+  uid: string,
+  room: string,
+): Promise<void> {
+  if (!env.STREAM_BRIDGE) throw new Error("stream-bridge container binding absent (inert until ◆ go-live)");
+  const stub = env.STREAM_BRIDGE.get(env.STREAM_BRIDGE.idFromName(`${org}:${uid}`));
+  const res = await stub.fetch("https://stream-bridge/start", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ room, uid }),
+  });
+  if (!res.ok) throw new Error(`stream-bridge container /start → ${res.status}`);
+}
+
+/** Build the live StreamBridgeDeps (KV org-resolve + pending; container start/stop; ctx.waitUntil). */
+export function liveStreamBridgeDeps(env: StreamBridgeRuntimeEnv, ctx?: WaitUntilCtx): StreamBridgeDeps {
+  const kv = env.RT_MEETING_ORG;
+  const log = (msg: string, fields: Record<string, unknown>) => console.log(JSON.stringify({ msg, ...fields }));
+  return {
+    resolveOrg: async (uid) => (kv ? kv.get(`${STREAM_INPUT_ORG_PREFIX}${uid}`) : null),
+    dispatchStart: (org, uid, room) => liveStreamDispatchStart(env, org, uid, room),
+    dispatchStop: async (org, uid) => {
+      if (!env.STREAM_BRIDGE) return; // nothing bound → nothing to tear down
+      const stub = env.STREAM_BRIDGE.get(env.STREAM_BRIDGE.idFromName(`${org}:${uid}`));
+      await stub.fetch("https://stream-bridge/stop", { method: "POST" });
+    },
+    log,
+    markPending: async (uid, org) => {
+      if (kv)
+        await kv.put(`${STREAM_PENDING_PREFIX}${uid}`, JSON.stringify({ org, attempts: 0 }), {
+          expirationTtl: STREAM_PENDING_TTL_SECONDS,
+        });
+    },
+    clearPending: async (uid) => {
+      if (kv) await kv.delete(`${STREAM_PENDING_PREFIX}${uid}`);
+    },
+    waitUntil: ctx ? (p) => ctx.waitUntil(p) : undefined,
+  };
+}
+
+/**
+ * Route delegate for worker.ts: if this is the (enabled) CF Stream bridge webhook, handle it and return the
+ * Response; otherwise return null so the worker falls through (501 catch-all when inert). One call site, zero
+ * deps-building in worker.ts.
+ */
+export async function maybeHandleStreamBridge(
+  request: Request,
+  env: StreamBridgeRuntimeEnv,
+  ctx?: WaitUntilCtx,
+): Promise<Response | null> {
+  if (request.method !== "POST" || !streamBridgeEnabled(env)) return null;
+  if (new URL(request.url).pathname !== "/v1/stream/bridge/webhook") return null;
+  return handleStreamBridge(request, env.WAVE_STREAM_WEBHOOK_SECRET ?? "", liveStreamBridgeDeps(env, ctx));
+}
+
+/** Cron delegate for worker.ts scheduled(): re-dispatch any pending republisher (INERT unless enabled + KV). */
+export function scheduledStreamReconcile(env: StreamBridgeRuntimeEnv, ctx: WaitUntilCtx): void {
+  if (!streamBridgeEnabled(env) || !env.RT_MEETING_ORG) return;
+  ctx.waitUntil(
+    reconcileStreamPending(
+      env.RT_MEETING_ORG,
+      { dispatchStart: (org, uid, room) => liveStreamDispatchStart(env, org, uid, room) },
+      (msg, fields) => console.log(JSON.stringify({ msg, ...fields })),
+    ),
+  );
+}
