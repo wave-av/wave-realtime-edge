@@ -208,13 +208,16 @@ describe("TurnTakingCore — barge-in (step 4 interrupt controller)", () => {
       yield new Uint8Array([5, 6, 7, 8]); // chunk 2 must be SUPPRESSED once aborted
     });
     const { deps, sent, logs } = mkDeps({ synthesize });
-    // onsetFrames:1 → a single loud frame fires the barge-in (keeps the test deterministic).
-    const core = new TurnTakingCore(deps, goodCfg, { vad: { onsetFrames: 1, rmsThreshold: 500 } });
+    // onsetFrames:1 → one loud frame is an onset; hangoverFrames:1 → one quiet frame is a speech-end. Deterministic.
+    const core = new TurnTakingCore(deps, goodCfg, { vad: { onsetFrames: 1, hangoverFrames: 1, rmsThreshold: 500 } });
 
     const turnP = core.onFrame(startTurn()); // do NOT await — parks at the TTS gate
     await tick();
     expect(sent.length).toBe(1); // chunk 1 already out
-    await core.onFrame(loud()); // barge-in while the agent is talking → abort
+    // A REAL barge-in (#27): the turn-start marks the VAD speaking, so the trailing audio of the just-finished
+    // utterance can NOT self-interrupt. The user must go SILENT (speech-end) then speak AGAIN over the agent.
+    await core.onFrame(quiet()); // speech-end — the utterance that started this turn fully ended
+    await core.onFrame(loud()); // fresh speech onset over the talking agent → barge-in → abort
     releaseTts();
     await turnP;
 
@@ -252,11 +255,12 @@ describe("TurnTakingCore — barge-in (step 4 interrupt controller)", () => {
       yield new Uint8Array([5, 6, 7, 8]);
     });
     const { deps, complete } = mkDeps({ synthesize });
-    const core = new TurnTakingCore(deps, goodCfg, { vad: { onsetFrames: 1, rmsThreshold: 500 } });
+    const core = new TurnTakingCore(deps, goodCfg, { vad: { onsetFrames: 1, hangoverFrames: 1, rmsThreshold: 500 } });
 
     const turnP = core.onFrame(startTurn()); // turn 1 — LLM committed assistant, then parks in TTS
     await tick();
-    await core.onFrame(loud()); // barge-in turn 1
+    await core.onFrame(quiet()); // speech-end: the turn-1 utterance ended (arms a genuine barge-in)
+    await core.onFrame(loud()); // fresh speech over the agent → barge-in turn 1
     releaseTts();
     await turnP;
 

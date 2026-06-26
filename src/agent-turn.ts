@@ -284,9 +284,13 @@ export class TurnTakingCore {
     this.aborted = false;
     this.framesThisTurn = 0;
     const turnId = `t${this.turnSeq++}`;
-    // The user's final utterance was just consumed → reset the VAD to silence so the FIRST sustained speech onset
-    // while the agent talks is detected cleanly as a fresh barge-in (not contaminated by the prior episode's run).
-    this.vad.reset();
+    // The user's final utterance was just consumed. MARK the VAD as speaking (NOT reset-to-silence): the audio that
+    // produced this turn's transcript is often still arriving (network/jitter-buffer lag, the utterance tail), and a
+    // reset-to-silence would re-onset on that same-utterance audio and FALSE-barge-in the agent before it utters a
+    // word. Holding "speaking" makes the trailing audio steady-speech (no event); a REAL barge-in must be a fresh
+    // speech-start, which the VAD only emits after a silence (speech-end) — the user genuinely stops, then speaks
+    // over the agent. (#27: this self-barge-in was why agent-turn-interrupt fired on every live turn → 0 RTP out.)
+    this.vad.markSpeaking();
     const startMs = this.deps.now();
     let stage = "llm";
     try {

@@ -174,6 +174,8 @@ describe("TurnTakingCore — barge-in during a tool call", () => {
   const tick = () => new Promise<void>((r) => setTimeout(r, 0));
   const loud = () =>
     encodeIngestFrame(new Uint8Array([0x10, 0x27, 0x10, 0x27, 0x10, 0x27]), { sequenceNumber: 9, timestamp: 0 }, "packet");
+  // Quiet PCM (zeros → RMS 0) = silence; one quiet frame is a speech-end at hangoverFrames:1.
+  const quiet = () => encodeIngestFrame(new Uint8Array([0, 0, 0, 0]), { sequenceNumber: 8, timestamp: 0 }, "packet");
 
   it("user speech while a tool is executing aborts the turn — no further LLM call, no TTS, clean history", async () => {
     let releaseTool!: () => void;
@@ -182,11 +184,17 @@ describe("TurnTakingCore — barge-in during a tool call", () => {
       [[tool("tu_b", "lookup", {})], [text("too late")]],
       { callTool: vi.fn(async () => { await toolGate; return "slow"; }) },
     );
-    const core = new TurnTakingCore(deps, cfg, { tools: allowlist, vad: { onsetFrames: 1, rmsThreshold: 500 } });
+    const core = new TurnTakingCore(deps, cfg, {
+      tools: allowlist,
+      vad: { onsetFrames: 1, hangoverFrames: 1, rmsThreshold: 500 },
+    });
 
     const turnP = core.onFrame(fire()); // parks awaiting the slow tool
     await tick();
-    await core.onFrame(loud()); // barge-in DURING tool execution
+    // Real barge-in (#27): the turn-start marks the VAD speaking, so a genuine interrupt needs a silence then fresh
+    // speech — the user goes quiet (speech-end) then talks over the agent while the tool is still running.
+    await core.onFrame(quiet()); // speech-end — the prior utterance ended
+    await core.onFrame(loud()); // fresh speech onset DURING tool execution → barge-in
     releaseTool();
     await turnP;
 

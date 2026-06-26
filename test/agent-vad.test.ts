@@ -100,6 +100,17 @@ describe("Vad — a full speech episode + reset", () => {
     expect(vad.isSpeaking).toBe(false);
     expect(vad.lastFrameRms).toBe(0);
   });
+
+  it("markSpeaking holds the SPEECH state so trailing loud audio is steady (no false onset) until a real silence", () => {
+    // #27 barge-in fix: after the turn controller marks the VAD speaking, the SAME-utterance trailing audio must
+    // NOT emit a fresh speech-start (which would self-barge-in the agent). A genuine barge-in needs silence first.
+    const vad = new Vad({ onsetFrames: 1, hangoverFrames: 1 });
+    vad.markSpeaking();
+    expect(vad.isSpeaking).toBe(true);
+    expect(vad.feed(LOUD)).toBe("none"); // trailing same-utterance speech = steady, NOT a new onset
+    expect(vad.feed(QUIET)).toBe("speech-end"); // the user finally stops
+    expect(vad.feed(LOUD)).toBe("speech-start"); // a fresh onset over the agent = a REAL barge-in
+  });
 });
 
 describe("vadConfigFromEnv", () => {

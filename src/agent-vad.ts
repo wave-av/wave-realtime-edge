@@ -150,6 +150,21 @@ export class Vad {
     this.quietRun = 0;
     this.lastRms = 0;
   }
+
+  /**
+   * Force the detector into the SPEECH state (speaking, clean run counters). The turn controller calls this when
+   * it KNOWS the user just spoke (an STT-final consumed the utterance and a turn is starting): the audio that
+   * produced that transcript is often STILL arriving (network/jitter-buffer lag, the utterance tail), and a
+   * reset-to-silence would re-onset on that SAME-utterance audio and fire a FALSE barge-in before the agent utters
+   * a word. Holding "speaking" makes the trailing audio steady-speech (no event); a genuine barge-in must then be a
+   * fresh speech-start, which the state machine only emits AFTER a silence (speech-end) — i.e. the user actually
+   * stops, then speaks over the agent. Idempotent. (#27 root cause: agent-turn-interrupt fired on every live turn.)
+   */
+  markSpeaking(): void {
+    this.speaking = true;
+    this.loudRun = 0;
+    this.quietRun = 0;
+  }
 }
 
 function clampPositive(v: number | undefined, fallback: number): number {
