@@ -64,6 +64,14 @@ export interface CreateIngestAdapterParams {
 
 export interface CreateIngestAdapterResult {
   adapterId?: string;
+  /**
+   * The SFU session the published track ACTUALLY lives on. CF's `location:"local"` adapter does NOT publish on the
+   * sessionId we pass — it creates (and returns) its OWN session for the new track. Consumers (the participant /
+   * the harness subscriber) MUST pull `trackName` from THIS session, not the participant's, or they get 0 RTP.
+   * (#29: this session mismatch was the real last-mile blocker — the agent published fine, we listened on the
+   * wrong session.) Parsed from the create response `tracks[0].sessionId`.
+   */
+  publishedSessionId?: string;
   raw: unknown;
 }
 
@@ -111,12 +119,15 @@ export async function createIngestAdapter(
     throw new SfuAdapterError("UPSTREAM", `create ingest adapter returned ${res.status}`, 502);
   }
   const obj = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
-  const id = obj.adapterId ?? obj.id;
+  // CF nests the created track under `tracks[0]` ({adapterId, trackName, endpoint, sessionId}); the top-level
+  // adapterId/id is absent. Read both the adapter id AND the SESSION CF published the track on from there.
+  const t0 = Array.isArray(obj.tracks) ? (obj.tracks[0] as Record<string, unknown> | undefined) : undefined;
+  const id = obj.adapterId ?? obj.id ?? t0?.adapterId;
+  const publishedSessionId = typeof t0?.sessionId === "string" ? t0.sessionId : undefined;
   // Observability (#29): surface the SFU's ingest-adapter response so a live run can see what CF returned (status,
-  // adapterId, any connection/error hint) — the create being `ok` did NOT prove the SFU would dial our endpoint.
-  // Bounded + never includes the bearer (it's not in the response). NOT a secret.
-  console.log(JSON.stringify({ msg: "agent-ingest-adapter-created", status: res.status, adapterId: id ?? null, raw: JSON.stringify(json).slice(0, 600) }));
-  return { adapterId: id != null ? String(id) : undefined, raw: json };
+  // adapterId, the published sessionId). Bounded + never includes the bearer (it's not in the response). NOT a secret.
+  console.log(JSON.stringify({ msg: "agent-ingest-adapter-created", status: res.status, adapterId: id ?? null, publishedSessionId: publishedSessionId ?? null, raw: JSON.stringify(json).slice(0, 600) }));
+  return { adapterId: id != null ? String(id) : undefined, publishedSessionId, raw: json };
 }
 
 // ── Send-side framing ────────────────────────────────────────────────────────────────────────────────────

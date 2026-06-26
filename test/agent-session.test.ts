@@ -24,7 +24,7 @@ function mkDeps(over: Partial<AgentMediaDeps> = {}) {
   const sock: IngestSocket = { send: (d) => sent.push(new Uint8Array(d as ArrayBuffer)), close: () => {} };
   const deps: AgentMediaDeps = {
     createEgress: vi.fn(async (tracks) => ({ adapterId: "eg_1", raw: { tracks } })),
-    createIngest: vi.fn(async (tracks) => ({ adapterId: "in_1", raw: { tracks } })),
+    createIngest: vi.fn(async (tracks) => ({ adapterId: "in_1", publishedSessionId: "cf_pub_sess", raw: { tracks } })),
     ingestSocket: () => sock,
     now: () => t++,
     log: (msg, fields) => logs.push({ msg, fields }),
@@ -86,6 +86,8 @@ describe("AgentSessionCore.openAdapters — two adapters on one DO", () => {
     expect(inTracks[0].inputCodec).toBe("pcm");
     // #29: mode:"buffer" is REQUIRED for the SFU to dial our endpoint + publish RTP from our PCM (was omitted → 0 RTP).
     expect(inTracks[0].mode).toBe("buffer");
+    // #29: the published session the SFU returned is surfaced (consumers pull agent-a1 from HERE, not participant).
+    expect(ingest.publishedSessionId).toBe("cf_pub_sess");
   });
   it("requires bind first and a wss base", async () => {
     const { deps } = mkDeps();
