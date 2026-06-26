@@ -18,10 +18,10 @@ import {
   type StreamBridgeDeps,
 } from "../src/stream-bridge.js";
 
-const SECRET = "whsec_test_3f9a2b1c";
+const TEST_KEY = "rt-stream-bridge-test-key";
 
 /** Sign `${time}.${body}` exactly as CF Stream's webhook does → the `Webhook-Signature` header value. */
-async function signHeader(body: string, time: number, secret = SECRET): Promise<string> {
+async function signHeader(body: string, time: number, secret = TEST_KEY): Promise<string> {
   const key = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(secret),
@@ -118,24 +118,24 @@ describe("verifyStreamSignature — fail-closed HMAC", () => {
 
   it("valid signature within window → true", async () => {
     const header = await signHeader(body, time);
-    expect(await verifyStreamSignature(new TextEncoder().encode(body), header, SECRET, now)).toBe(true);
+    expect(await verifyStreamSignature(new TextEncoder().encode(body), header, TEST_KEY, now)).toBe(true);
   });
 
   it("tampered body → false", async () => {
     const header = await signHeader(body, time);
     const tampered = new TextEncoder().encode(body + " ");
-    expect(await verifyStreamSignature(tampered, header, SECRET, now)).toBe(false);
+    expect(await verifyStreamSignature(tampered, header, TEST_KEY, now)).toBe(false);
   });
 
   it("wrong secret → false", async () => {
-    const header = await signHeader(body, time, "whsec_other");
-    expect(await verifyStreamSignature(new TextEncoder().encode(body), header, SECRET, now)).toBe(false);
+    const header = await signHeader(body, time, "other-test-key");
+    expect(await verifyStreamSignature(new TextEncoder().encode(body), header, TEST_KEY, now)).toBe(false);
   });
 
   it("stale timestamp (> tolerance) → false (replay guard)", async () => {
     const staleTime = time - 60 * 60; // 1h old
     const header = await signHeader(body, staleTime);
-    expect(await verifyStreamSignature(new TextEncoder().encode(body), header, SECRET, now)).toBe(false);
+    expect(await verifyStreamSignature(new TextEncoder().encode(body), header, TEST_KEY, now)).toBe(false);
   });
 
   it("empty secret → false (never trust unconfigured)", async () => {
@@ -144,7 +144,7 @@ describe("verifyStreamSignature — fail-closed HMAC", () => {
   });
 
   it("missing header → false", async () => {
-    expect(await verifyStreamSignature(new TextEncoder().encode(body), null, SECRET, now)).toBe(false);
+    expect(await verifyStreamSignature(new TextEncoder().encode(body), null, TEST_KEY, now)).toBe(false);
   });
 });
 
@@ -175,7 +175,7 @@ describe("handleStreamBridge — verify-before-parse, fail-closed admission, con
   it("bad/absent signature → 401 BEFORE any dispatch", async () => {
     const deps = fakeDeps({ vid1: "org_a" });
     const body = JSON.stringify({ notificationName: "live_input.connected", input_id: "vid1" });
-    const res = await handleStreamBridge(req(body, "time=1,sig1=bad"), SECRET, deps, now);
+    const res = await handleStreamBridge(req(body, "time=1,sig1=bad"), TEST_KEY, deps, now);
     expect(res.status).toBe(401);
     expect(deps.starts).toHaveLength(0); // nothing acted on
   });
@@ -183,7 +183,7 @@ describe("handleStreamBridge — verify-before-parse, fail-closed admission, con
   it("valid connected + org → dispatchStart into the DETERMINISTIC room, 200", async () => {
     const deps = fakeDeps({ vid1: "org_a" });
     const body = JSON.stringify({ notificationName: "live_input.connected", input_id: "vid1" });
-    const res = await handleStreamBridge(req(body, await signHeader(body, time)), SECRET, deps, now);
+    const res = await handleStreamBridge(req(body, await signHeader(body, time)), TEST_KEY, deps, now);
     expect(res.status).toBe(200);
     expect(deps.starts).toEqual([{ org: "org_a", uid: "vid1", room: "cfstream:vid1" }]);
     expect(deps.cleared).toContain("vid1"); // cleared its pending on success
@@ -192,7 +192,7 @@ describe("handleStreamBridge — verify-before-parse, fail-closed admission, con
   it("connected + org MISS → fail-closed skip: NO dispatch, skipped:no-org, 200", async () => {
     const deps = fakeDeps({}); // no org for the uid
     const body = JSON.stringify({ notificationName: "live_input.connected", input_id: "orphan" });
-    const res = await handleStreamBridge(req(body, await signHeader(body, time)), SECRET, deps, now);
+    const res = await handleStreamBridge(req(body, await signHeader(body, time)), TEST_KEY, deps, now);
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ skipped: "no-org" });
     expect(deps.starts).toHaveLength(0); // NEVER admits media for an un-attributed input
@@ -201,7 +201,7 @@ describe("handleStreamBridge — verify-before-parse, fail-closed admission, con
   it("disconnected + org → dispatchStop, 200", async () => {
     const deps = fakeDeps({ vid1: "org_a" });
     const body = JSON.stringify({ eventType: "live_input.disconnected", input_id: "vid1" });
-    const res = await handleStreamBridge(req(body, await signHeader(body, time)), SECRET, deps, now);
+    const res = await handleStreamBridge(req(body, await signHeader(body, time)), TEST_KEY, deps, now);
     expect(res.status).toBe(200);
     expect(deps.stops).toEqual([{ org: "org_a", uid: "vid1" }]);
   });
@@ -212,7 +212,7 @@ describe("handleStreamBridge — verify-before-parse, fail-closed admission, con
       throw new Error("container cold");
     });
     const body = JSON.stringify({ notificationName: "live_input.connected", input_id: "vid1" });
-    const res = await handleStreamBridge(req(body, await signHeader(body, time)), SECRET, deps, now);
+    const res = await handleStreamBridge(req(body, await signHeader(body, time)), TEST_KEY, deps, now);
     expect(res.status).toBe(200); // fail-open behind the signed ack
     expect(deps.pending).toEqual([{ uid: "vid1", org: "org_a" }]);
   });
@@ -220,7 +220,7 @@ describe("handleStreamBridge — verify-before-parse, fail-closed admission, con
   it("control-only: dispatch args are TEXT (uid/org/room) — never a media stream", async () => {
     const deps = fakeDeps({ vid1: "org_a" });
     const body = JSON.stringify({ notificationName: "live_input.connected", input_id: "vid1" });
-    await handleStreamBridge(req(body, await signHeader(body, time)), SECRET, deps, now);
+    await handleStreamBridge(req(body, await signHeader(body, time)), TEST_KEY, deps, now);
     for (const s of deps.starts) {
       expect(typeof s.org).toBe("string");
       expect(typeof s.uid).toBe("string");
