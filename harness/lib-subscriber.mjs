@@ -64,10 +64,14 @@ export async function createSubscriber({ sfuBase, appId, appSecret, remoteSessio
 
   // Pull the agent's track as a REMOTE track. CF may require an immediate renegotiation (it returns an offer
   // we must answer) when adding a remote track that changes the transport's m-lines.
+  // Pull WITHOUT a mid: passing our pre-created recvonly mid makes CF reuse that m-line and answer
+  // requiresImmediateRenegotiation:false — and werift then never wires the receiver, so 0 RTP arrives (proven by
+  // the loopback probe: even a known-good track yielded 0 RTP with mid). The canonical CF Calls pull omits mid so
+  // CF returns an OFFER (requiresImmediateRenegotiation:true) that we answer → werift creates the receiver → RTP.
   const tres = await fetch(`${sfuBase}/apps/${appId}/sessions/${sessionId}/tracks/new`, {
     method: "POST",
     headers: { Authorization: `Bearer ${appSecret}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ tracks: [{ location: "remote", sessionId: remoteSessionId, trackName: agentTrackName, mid: transceiver.mid }] }),
+    body: JSON.stringify({ tracks: [{ location: "remote", sessionId: remoteSessionId, trackName: agentTrackName }] }),
   });
   if (!tres.ok) throw new Error(`subscriber tracks/new ${tres.status}: ${(await tres.text()).slice(0, 300)}`);
   const tjson = await tres.json();
