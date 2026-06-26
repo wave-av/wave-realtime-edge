@@ -24,7 +24,8 @@
  */
 import { WebmMuxer, type MuxerOptions } from "../muxer/webm.js";
 import { vp8KeyframeDimensions } from "./ivf.js";
-import { RealtimeRecorder, type RecordingResult } from "../recording-writer.js";
+import { type RecordingResult } from "../recording-writer.js";
+import { R2Sink, type RecordingSink } from "./recording-sink.js";
 
 // CF app ids are long hex; SFU session ids are opaque url-safe tokens. Guard before interpolating (SSRF-safe).
 const APPID = /^[0-9a-f]{32,}$/i;
@@ -278,7 +279,15 @@ export interface RawSfuTapTarget {
 }
 
 export interface RawSfuTapOptions {
+  /** Identity + default cloud bucket. The default sink (R2Sink) is built from this when `sink` is omitted. */
   target: RawSfuTapTarget;
+  /**
+   * RT-R10 (#72) recording SINK seam: WHERE the finalized bytes land. Omitted → a plain `R2Sink` over
+   * `target.bucket` (byte-identical to the original direct-RealtimeRecorder path). Provide `selectSink(env,…)`
+   * to enable localfs/fanout on a self-host runtime (the Worker has no fs, so it always resolves to R2Sink).
+   * The sink owns the lazy multipart begin + the SKIP/single-writer invariant; this tap never touches R2 directly.
+   */
+  sink?: RecordingSink;
   /** Encode seam; default PassthroughPcmEncoder (no WASM). */
   encoder?: AudioEncoder;
   /**
@@ -324,7 +333,7 @@ export class RawSfuTap {
   private readonly muxer: WebmMuxer;
   private readonly tsToMs: (ts: number) => number;
   private readonly flushBytes: number;
-  private recorder: RealtimeRecorder | null = null;
+  private readonly sink: RecordingSink;
   private firstTs: number | null = null;
   private finalized = false;
   /**
@@ -344,11 +353,14 @@ export class RawSfuTap {
     this.muxer = new WebmMuxer({ ...opts.muxerOptions, audioCodec: this.encoder.codec });
     this.tsToMs = opts.tsToMs ?? ((t) => t);
     this.flushBytes = opts.flushBytes ?? 1024 * 1024;
+    // Default to a plain R2Sink over the target bucket — byte-identical to the original direct-RealtimeRecorder
+    // path. A caller (container.ts) passes `selectSink(env,…)` to enable localfs/fanout on a self-host runtime.
+    this.sink = opts.sink ?? new R2Sink(opts.target.bucket, { org: opts.target.org, sessionId: opts.target.sessionId });
   }
 
-  /** The canonical R2 key once the recorder has begun (null before the first byte). */
+  /** The canonical key once the sink has begun (null before the first byte). */
   get key(): string | null {
-    return this.recorder?.key ?? null;
+    return this.sink.key;
   }
 
   /**
@@ -419,31 +431,27 @@ export class RawSfuTap {
 
   /** Flush + finalize the one canonical recording. Idempotent; returns null when nothing was recorded. */
   async finalize(): Promise<RecordingResult | null> {
-    if (this.finalized) return this.recorder ? this.recorder.finalize() : null;
+    if (this.finalized) return this.sink.finalize();
     // Drain any in-flight async video encodes FIRST (before marking finalized) so every enqueued VP8 frame is
     // muxed before the muxer is closed. The queue is fail-open, so this never throws.
     await this.videoQueue;
     this.finalized = true;
     this.muxer.finish();
     await this.flush();
-    if (!this.recorder) return null; // never any media → no object
-    return this.recorder.finalize();
+    // The sink returns null when no bytes were ever written (never a 0-byte object) — the SKIP invariant.
+    return this.sink.finalize();
   }
 
   /** Best-effort abort (error / no bytes). Never throws. */
   async abort(): Promise<void> {
     this.finalized = true;
-    await this.recorder?.safeAbort();
+    await this.sink.abort();
   }
 
-  /** Drain the muxer and stream into the recorder, beginning it lazily with the first bytes. */
+  /** Drain the muxer and stream into the sink, which lazily begins the canonical object on the first bytes. */
   private async flush(): Promise<void> {
     const bytes = this.muxer.drain();
     if (bytes.length === 0) return;
-    if (!this.recorder) {
-      this.recorder = await RealtimeRecorder.begin(this.target.bucket, this.target.org, this.target.sessionId, bytes);
-    } else {
-      await this.recorder.append(bytes);
-    }
+    await this.sink.write(bytes);
   }
 }

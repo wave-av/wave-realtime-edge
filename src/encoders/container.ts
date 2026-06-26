@@ -29,6 +29,7 @@ import {
 } from "./container-adapter.js";
 import { mintRecorderToken } from "./recorder-auth.js";
 import { selectRecorderTarget, type RecorderTarget, type RecorderTargetEnv } from "./recorder-target.js";
+import { selectSink, type RecordingSinkEnv } from "./recording-sink.js";
 import { parseIvf } from "./ivf.js";
 
 const HEX32 = /^[0-9a-f]{32}$/i;
@@ -176,6 +177,13 @@ export class ContainerHandle implements EncoderHandle {
     const bucket = this.env.RT_RECORDINGS;
     if (!bucket) return; // defense in depth (containerRecordingConfigured already gated)
     const target = { bucket, org: this.session.org, sessionId: this.session.sessionId };
+    // RT-R10 (#72): pick WHERE the bytes land. Default RECORDER_SINK='r2' → R2Sink (today's behavior). In the
+    // Worker there is no localWriterFor, so localfs/fanout degrade to R2 (inert); a self-host runtime injects a
+    // real writer to fan a local copy. selectSink owns the SKIP/single-writer invariant.
+    const sink = selectSink(this.env as unknown as RecordingSinkEnv, {
+      org: this.session.org,
+      sessionId: this.session.sessionId,
+    });
     let tap: RawSfuTap;
     let outputCodec: "pcm" | "jpeg";
     if (kind === "video") {
@@ -185,12 +193,13 @@ export class ContainerHandle implements EncoderHandle {
       outputCodec = "jpeg";
       tap = new RawSfuTap({
         target,
+        sink,
         outputCodec,
         asyncVideoEncoder: ContainerHandle.videoEncoderFromTarget(recorderTarget),
       });
     } else {
       outputCodec = "pcm";
-      tap = new RawSfuTap({ target });
+      tap = new RawSfuTap({ target, sink });
     }
     this.taps.set(trackName, tap);
     // Build the recorder endpoint (+ optional signed capability token). The path carries :room so the SFU's frames

@@ -35,6 +35,12 @@ export type RecordingPart = Uint8Array;
 export interface RecordingSink {
   /** Which sink this is (log/correlation). */
   readonly kind: "r2" | "localfs" | "fanout";
+  /**
+   * The canonical key of this sink's object, available MID-RECORDING (null before the first byte). For R2 this is
+   * the multipart object key as soon as the recorder begins; for localfs it is the file path (known at finalize);
+   * for fanout it is the PRIMARY sink's key. Lets the orchestration read the canonical key while bytes still flow.
+   */
+  readonly key: string | null;
   write(part: RecordingPart): Promise<void>;
   finalize(): Promise<RecordingResult | null>;
   /** Best-effort abort (no bytes / error). Never throws. */
@@ -69,6 +75,11 @@ export class R2Sink implements RecordingSink {
     private readonly bucket: R2Bucket,
     private readonly session: SinkSession,
   ) {}
+
+  /** The canonical R2 key once the recorder has begun (null before the first byte). */
+  get key(): string | null {
+    return this.recorder?.key ?? null;
+  }
 
   async write(part: RecordingPart): Promise<void> {
     if (part.length === 0) return;
@@ -120,6 +131,11 @@ export class LocalFsSink implements RecordingSink {
     private readonly session: SinkSession,
   ) {}
 
+  /** The local file path once finalized (null before close — the writer owns the path until then). */
+  get key(): string | null {
+    return this.finalized?.key ?? null;
+  }
+
   async write(part: RecordingPart): Promise<void> {
     if (part.length === 0) return;
     await this.writer.append(part);
@@ -152,6 +168,11 @@ export class FanoutSink implements RecordingSink {
   readonly kind = "fanout" as const;
   constructor(private readonly sinks: RecordingSink[]) {
     if (sinks.length === 0) throw new Error("FanoutSink needs at least one sink");
+  }
+
+  /** The PRIMARY sink's canonical key (the others are exact replicas). */
+  get key(): string | null {
+    return this.sinks[0].key;
   }
 
   async write(part: RecordingPart): Promise<void> {
