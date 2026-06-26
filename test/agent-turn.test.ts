@@ -10,6 +10,8 @@ import {
   TurnTakingCore,
   buildTurnSystemPrompt,
   MAX_UTTERANCE_BYTES,
+  DEFAULT_TTS_LEAD_MS,
+  ttsLeadMsFromEnv,
   type AgentTurnDeps,
   type TurnTakingConfig,
   type SttResult,
@@ -294,6 +296,98 @@ describe("TurnTakingCore — barge-in (step 4 interrupt controller)", () => {
     for (let i = 1; i < secondReq.length; i++) {
       expect(secondReq[i].role === "user" && secondReq[i - 1].role === "user").toBe(false);
     }
+  });
+});
+
+describe("ttsLeadMsFromEnv", () => {
+  it("defaults when unset / non-numeric / negative; parses string + number", () => {
+    expect(ttsLeadMsFromEnv({})).toBe(DEFAULT_TTS_LEAD_MS);
+    expect(ttsLeadMsFromEnv({ AGENT_TTS_LEAD_MS: "abc" })).toBe(DEFAULT_TTS_LEAD_MS);
+    expect(ttsLeadMsFromEnv({ AGENT_TTS_LEAD_MS: -5 })).toBe(DEFAULT_TTS_LEAD_MS);
+    expect(ttsLeadMsFromEnv({ AGENT_TTS_LEAD_MS: "200" })).toBe(200);
+    expect(ttsLeadMsFromEnv({ AGENT_TTS_LEAD_MS: 0 })).toBe(0); // explicit 0 disables pacing (legacy bulk send)
+    expect(ttsLeadMsFromEnv({ AGENT_TTS_LEAD_MS: 120 })).toBe(120);
+  });
+});
+
+// Step-4 keystone: real-time TTS pacing makes the agent's PLAYOUT interruptible. Without it the whole reply is
+// dumped to the SFU buffer and the turn ends before the listener hears it (barge-in during playout = no-op, proven
+// live 2026-06-26). These tests prove (a) the send throttles when ahead of the playout clock, (b) it never blocks
+// when behind (no underrun), and (c) a barge DURING a pacing wait cuts the rest of the reply.
+describe("TurnTakingCore — TTS real-time pacing (interruptible playout)", () => {
+  const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+  const loud = () => egressFrame([0x10, 0x27, 0x10, 0x27, 0x10, 0x27], 9);
+  const quiet = () => egressFrame([0, 0, 0, 0], 9);
+  const startTurn = () => egressFrame([30, 0x00], 1);
+  const VAD_1 = { onsetFrames: 1, hangoverFrames: 1, rmsThreshold: 500 } as const;
+  // 400ms of 48kHz/16-bit/STEREO PCM (192 B/ms) → chunkPcm splits into 3 ≤32KB chunks (~170/170/60ms).
+  const bigReply = () => new Uint8Array(192 * 400);
+
+  it("throttles the send when AHEAD of the playout clock (delay called with positive ms), all audio still delivered", async () => {
+    const delay = vi.fn(async (_ms: number) => {});
+    const synthesize = vi.fn(async function* (_t: string) { yield bigReply(); });
+    const { deps, sent } = mkDeps({ synthesize, delay, now: () => 0 }); // clock frozen → always "ahead"
+    const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_1, ttsLeadMs: 150 });
+
+    await core.onFrame(loud());
+    await core.onFrame(startTurn());
+
+    expect(delay).toHaveBeenCalled();
+    expect(delay.mock.calls.some((c) => (c[0] as number) > 0)).toBe(true); // waited for the buffer to drain to lead
+    expect(sent.length).toBe(3); // every chunk eventually published (pacing throttles, never drops)
+  });
+
+  it("does NOT delay when BEHIND the clock (no underrun risk)", async () => {
+    let n = 0;
+    const delay = vi.fn(async (_ms: number) => {});
+    const synthesize = vi.fn(async function* (_t: string) { yield bigReply(); });
+    // now() jumps 10s per call → elapsed always dwarfs sentMs → never ahead → never sleep.
+    const { deps, sent } = mkDeps({ synthesize, delay, now: () => (n += 10_000) });
+    const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_1, ttsLeadMs: 150 });
+
+    await core.onFrame(loud());
+    await core.onFrame(startTurn());
+
+    expect(delay).not.toHaveBeenCalled();
+    expect(sent.length).toBe(3);
+  });
+
+  it("ttsLeadMs:0 disables pacing entirely (legacy bulk send — no delay)", async () => {
+    const delay = vi.fn(async (_ms: number) => {});
+    const synthesize = vi.fn(async function* (_t: string) { yield bigReply(); });
+    const { deps, sent } = mkDeps({ synthesize, delay, now: () => 0 });
+    const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_1, ttsLeadMs: 0 });
+
+    await core.onFrame(loud());
+    await core.onFrame(startTurn());
+
+    expect(delay).not.toHaveBeenCalled();
+    expect(sent.length).toBe(3);
+  });
+
+  it("a barge-in DURING a pacing wait cuts the rest of the reply (the live gap, fixed)", async () => {
+    let releaseDelay!: () => void;
+    const delayGate = new Promise<void>((r) => (releaseDelay = r));
+    let calls = 0;
+    // First pacing wait holds the turn open (simulating real-time playout); subsequent waits resolve instantly.
+    const delay = vi.fn(async (_ms: number) => { if (++calls === 1) await delayGate; });
+    const synthesize = vi.fn(async function* (_t: string) { yield bigReply(); });
+    const { deps, sent, logs } = mkDeps({ synthesize, delay, now: () => 0 });
+    const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_1, ttsLeadMs: 150 });
+
+    await core.onFrame(loud());
+    const turnP = core.onFrame(startTurn()); // enters speak → sends chunk 1 → PARKS in the pacing wait
+    await tick();
+    const sentBeforeBarge = sent.length;
+    expect(sentBeforeBarge).toBeGreaterThanOrEqual(1);
+
+    await core.onFrame(quiet()); // speech-end (the turn-start utterance ended → arms a real barge-in)
+    await core.onFrame(loud()); // fresh speech over the talking agent → barge-in → abort
+    releaseDelay();
+    await turnP;
+
+    expect(logs.some((l) => l.msg === "agent-turn-interrupt")).toBe(true);
+    expect(sent.length).toBe(sentBeforeBarge); // no further chunks after the barge — playout was interrupted
   });
 });
 

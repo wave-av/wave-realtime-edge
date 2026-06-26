@@ -148,6 +148,25 @@ export const DEFAULT_SYSTEM_PROMPT =
 export const DEFAULT_MAX_TOOL_ITERATIONS = 5;
 
 /**
+ * Step-4 barge-in: the TTS send-ahead LEAD (ms). `speak()` paces chunks to the real playout clock, never letting
+ * the SFU buffer get more than this far ahead. This is the keystone that makes barge-in interrupt the agent the
+ * LISTENER actually hears: with a shallow buffer, (a) `turnInFlight` spans the whole PLAYOUT (so a VAD speech-start
+ * during the reply fires `bargeIn()`, not just during generation), and (b) on abort only ≤lead of already-sent
+ * audio drains → the agent goes silent within ~lead + jitter. 0 disables pacing (legacy bulk send). 150ms keeps a
+ * safe anti-underrun cushion while leaving headroom under the 300ms target; env-overridable (AGENT_TTS_LEAD_MS).
+ */
+export const DEFAULT_TTS_LEAD_MS = 150;
+
+/** pcm_48000 STEREO interleaved (the synthesize() output): 48 kHz · 2 ch · 2 bytes = 192 bytes per millisecond. */
+const TTS_BYTES_PER_MS = (48_000 * 2 * 2) / 1000;
+
+/** Resolve the TTS pacing lead from env (AGENT_TTS_LEAD_MS), clamped to ≥0; falls back to the default. Pure. */
+export function ttsLeadMsFromEnv(env: { AGENT_TTS_LEAD_MS?: string | number }): number {
+  const raw = typeof env.AGENT_TTS_LEAD_MS === "string" ? Number(env.AGENT_TTS_LEAD_MS) : env.AGENT_TTS_LEAD_MS;
+  return Number.isFinite(raw) && (raw as number) >= 0 ? Math.floor(raw as number) : DEFAULT_TTS_LEAD_MS;
+}
+
+/**
  * Hard cap on the accumulated-utterance PCM buffer (bounded-backpressure). The buffer holds participant PCM
  * since the last FINAL transcript; without a cap it grows for the WHOLE session when audio never endpoints (a
  * continuous talker, partial-only STT, or a long in-flight turn) and resets the DO isolate at the 128 MB cap —
@@ -193,6 +212,8 @@ export class TurnTakingCore {
   private readonly tools: ToolAllowlist;
   /** Step-5 hard cap on tool-call iterations within ONE turn — prevents an infinite (model→tool→model→…) loop. */
   private readonly maxToolIterations: number;
+  /** Step-4 barge-in: TTS send-ahead lead (ms). `speak()` paces to this so playout is interruptible (see speak). */
+  private readonly ttsLeadMs: number;
 
   constructor(
     deps: AgentTurnDeps & AgentMediaDeps,
@@ -204,6 +225,8 @@ export class TurnTakingCore {
       tools?: ToolAllowlist;
       /** Step-5: hard max-iterations cap for the agentic tool loop (default DEFAULT_MAX_TOOL_ITERATIONS). */
       maxToolIterations?: number;
+      /** Step-4: TTS send-ahead lead (ms) for real-time pacing → interruptible playout (default DEFAULT_TTS_LEAD_MS). */
+      ttsLeadMs?: number;
     },
   ) {
     this.deps = deps;
@@ -211,6 +234,7 @@ export class TurnTakingCore {
     this.framing = opts?.framing ?? "packet";
     this.messages = [{ role: "system", content: buildTurnSystemPrompt(config) }];
     this.vad = new Vad(opts?.vad);
+    this.ttsLeadMs = typeof opts?.ttsLeadMs === "number" && opts.ttsLeadMs >= 0 ? Math.floor(opts.ttsLeadMs) : DEFAULT_TTS_LEAD_MS;
     this.tools = opts?.tools ?? new ToolAllowlist([]);
     this.maxToolIterations =
       typeof opts?.maxToolIterations === "number" && opts.maxToolIterations >= 1
@@ -401,16 +425,35 @@ export class TurnTakingCore {
     // sink) → every frame below is dropped and the agent track stays silent (0 RTP). Surfaced so a live run sees
     // THIS rather than only an absent meter. (The fix is the ingest adapter `mode:"buffer"`; this proves the seam.)
     if (!sock) this.deps.log("agent-speak-no-ingest", { ...this.idFields(), chars: text.length });
+    // Step-4 barge-in keystone — REAL-TIME PACING. We throttle the send to the real playout clock so the SFU
+    // buffer never gets more than `ttsLeadMs` ahead. Without this the whole reply is dumped to the buffer and the
+    // turn completes (turnInFlight=false) BEFORE the listener even hears it → a barge during playout is a no-op
+    // (proven: 0 agent-turn-interrupt; the meter preceded the first agent RTP). With a shallow buffer, turnInFlight
+    // spans the playout (bargeIn fires mid-reply) and on abort only ≤lead drains → the agent falls silent fast.
+    // We sleep ONLY when AHEAD of the clock (never when behind → no underrun risk). lead=0 → legacy bulk send.
+    const delay = this.deps.delay ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    let playoutStartMs = 0;
+    let sentMs = 0;
     for await (const pcm of this.deps.synthesize(text)) {
       if (this.aborted) return -1; // barge-in: stop publishing the now-stale reply mid-stream
       if (!sock || pcm.length === 0) continue;
       for (const chunk of chunkPcm(pcm)) {
+        if (this.aborted) return -1; // barge-in between chunks → go silent immediately (don't send more)
+        if (playoutStartMs === 0) playoutStartMs = this.deps.now();
+        if (this.ttsLeadMs > 0) {
+          const aheadMs = sentMs - (this.deps.now() - playoutStartMs);
+          if (aheadMs > this.ttsLeadMs) {
+            await delay(aheadMs - this.ttsLeadMs); // let the buffer drain back down to the lead
+            if (this.aborted) return -1; // barge-in DURING the pacing wait → stop before sending the next chunk
+          }
+        }
         const seq = this.outSeq++;
         // timestamp 0: a real source timeline lands with the live ingest wiring slice; the contract field is
         // present + monotonic-by-seq. (proven-live-or-not-done: not claiming a real media timeline yet.)
         const wire = encodeIngestFrame(chunk, { sequenceNumber: seq, timestamp: 0 }, this.framing);
         sock.send(wire);
         pcmBytesOut += chunk.length;
+        sentMs += chunk.length / TTS_BYTES_PER_MS;
       }
     }
     return pcmBytesOut;

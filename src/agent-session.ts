@@ -47,7 +47,7 @@ import {
   type IngestFraming,
   type CreateIngestAdapterResult,
 } from "./agent-ingest-adapter.js";
-import { TurnTakingCore, buildTurnDeps, toolAllowlistFromEnv, type AgentTurnEnv } from "./agent-turn.js";
+import { TurnTakingCore, buildTurnDeps, toolAllowlistFromEnv, ttsLeadMsFromEnv, type AgentTurnEnv } from "./agent-turn.js";
 import { vadConfigFromEnv } from "./agent-vad.js";
 import { mintRecorderToken } from "./encoders/recorder-auth.js";
 
@@ -94,6 +94,8 @@ export interface AgentMediaDeps {
   ingestSocket(): IngestSocket | null;
   /** Wall clock (ms). Injectable so timing instrumentation is deterministic in tests. */
   now(): number;
+  /** Sleep `ms`. Injectable so TTS real-time pacing (barge-in) is deterministic in tests. Optional → setTimeout. */
+  delay?(ms: number): Promise<void>;
   /** Structured log sink (JSON line). Injectable so tests can assert on emitted instrumentation. */
   log(msg: string, fields: Record<string, unknown>): void;
 }
@@ -285,6 +287,8 @@ export interface AgentSessionEnv {
   AGENT_PUBLIC_WSS?: string; // our public wss base the SFU dials back to (default rt.wave.online)
   /** Send-side ingest framing override; "packet" (default, modeled) | "raw" (the live spike may select). */
   AGENT_INGEST_FRAMING?: IngestFraming;
+  /** Step-4 barge-in: TTS send-ahead lead (ms) for real-time pacing → interruptible playout (default 150). */
+  AGENT_TTS_LEAD_MS?: string | number;
   /** Step-3: the agent persona / system prompt for turn-taking (var; default in buildTurnSystemPrompt). */
   VOICE_AGENT_SYSTEM_PROMPT?: string;
   /** test-only: injected adapter-create fetch (defaults to global fetch). Never a wire input. */
@@ -449,6 +453,7 @@ export class AgentSessionDO {
       this.turn = new TurnTakingCore(deps, { ...bound, systemPrompt: this.env.VOICE_AGENT_SYSTEM_PROMPT }, {
         framing: this.env.AGENT_INGEST_FRAMING,
         vad: vadConfigFromEnv(this.env), // step 4: barge-in VAD thresholds (env-overridable, sensible defaults)
+        ttsLeadMs: ttsLeadMsFromEnv(this.env), // step 4: real-time TTS pacing → interruptible playout (barge-in)
         tools, // step 5: only these tools are advertised to the model + executable (others refused)
       });
       media.log("agent-turn-armed", { org: bound.org, room: bound.roomId, agentId: bound.agentId });
@@ -468,6 +473,7 @@ export class AgentSessionDO {
       createIngest: (tracks) => createIngestAdapter({ fetchImpl }, { appId, bearer, tracks }),
       ingestSocket: () => this.ingest,
       now: () => Date.now(),
+      delay: (ms) => new Promise<void>((r) => setTimeout(r, ms)),
       log: (msg, fields) => console.log(JSON.stringify({ msg, ...fields })),
     };
   }
