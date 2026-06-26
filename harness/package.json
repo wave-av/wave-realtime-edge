@@ -1,0 +1,14 @@
+{
+  "name": "wave-realtime-edge-harness",
+  "private": true,
+  "type": "module",
+  "description": "Real-media e2e harness for the voice-agent runtime (#81). ISOLATED from the worker bundle — werift (Node WebRTC) + opusscript are Node-only deps that must NEVER enter the Cloudflare Worker. Runs against the LIVE CF Realtime SFU + rt.wave.online; creds via Doppler wave/prd.",
+  "scripts": {
+    "leg3": "node leg3.mjs",
+    "leg4:bargein": "node leg4-bargein.mjs"
+  },
+  "dependencies": {
+    "opusscript": "^0.0.8",
+    "werift": "0.23.0"
+  }
+}
