@@ -20,14 +20,37 @@ export const DEFAULT_FFMPEG_ARGS = Object.freeze({
   pcm: ["-hide_banner", "-loglevel", "error", "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "-", "-c:a", "libopus", "-f", "ogg", "-"],
 });
 
-/** Source-codec → fixed input-format args (the `-f <demux> [params] -i -` prefix). Allowlist; no input. */
+// Source-codec → fixed input-format args (the `-f <demux> [params] -i -` prefix). ALLOWLIST; the demuxer
+// name is a constant keyed by source codec, never raw request input — so there is no arg injection.
+//
+// Two source classes (#86 capability negotiation — "any flavor each end", the SOURCE leg):
+//   • RAW frame sources (jpeg/pcm) — what the SFU Worker POSTs (decoded frames). These have a DEFAULT
+//     transcode (see DEFAULT_FFMPEG_ARGS) and are byte-unchanged from the original hardcoded path.
+//   • ENCODED elementary sources (h264/vp8/vp9/av1/opus/aac) — an already-compressed stream from an
+//     ingest leg (#91) or a peer publishing a codec our dest doesn't speak. ffmpeg DECODES these and
+//     re-ENCODES to the requested target. They have NO default — a target codec is REQUIRED (cross-codec
+//     negotiation is the whole point; we never silently re-emit the source codec). The chosen elementary
+//     demuxers mirror the proven matrix: H.264 Annex-B (`h264`), VP8/VP9/AV1 in IVF, Opus/AAC in Ogg/ADTS.
 const SOURCE_INPUT_ARGS = Object.freeze({
+  // raw frame sources (SFU transport)
   jpeg: ["-f", "mjpeg", "-i", "-"],
   pcm: ["-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "-"],
+  // encoded elementary video sources
+  h264: ["-f", "h264", "-i", "-"],
+  vp8: ["-f", "ivf", "-i", "-"],
+  vp9: ["-f", "ivf", "-i", "-"],
+  av1: ["-f", "ivf", "-i", "-"],
+  // encoded elementary audio sources
+  opus: ["-f", "ogg", "-i", "-"],
+  aac: ["-f", "aac", "-i", "-"],
 });
 
-/** Whether a source codec is a video frame source (jpeg) vs an audio source (pcm). */
-const SOURCE_MEDIA = Object.freeze({ jpeg: "video", pcm: "audio" });
+/** Source-codec → media kind. video frame (jpeg) / encoded video vs audio (pcm) / encoded audio. */
+const SOURCE_MEDIA = Object.freeze({
+  jpeg: "video", pcm: "audio",
+  h264: "video", vp8: "video", vp9: "video", av1: "video",
+  opus: "audio", aac: "audio",
+});
 
 /**
  * The output muxer flag for a given codec container. The DEFAULT path uses the codec's NATURAL streaming
@@ -67,21 +90,36 @@ function outputArgs(container, media) {
  *   registry container.
  *
  * @param {Object} p
- * @param {string} p.sourceCodec            "jpeg" | "pcm".
- * @param {string|null} [p.targetCodec]     requested output codec (e.g. "vp9","h264","aac"); null=default.
+ * @param {string} p.sourceCodec            raw frame source ("jpeg"|"pcm") OR encoded elementary source
+ *                                          ("h264"|"vp8"|"vp9"|"av1"|"opus"|"aac").
+ * @param {string|null} [p.targetCodec]     requested output codec (e.g. "vp9","h264","aac"). For raw
+ *                                          sources, null = the byte-unchanged default. For ENCODED
+ *                                          sources a target is REQUIRED (cross-codec negotiation) — a
+ *                                          missing target throws, never silently re-emits the source.
  * @param {Set<string>} [p.available]       host encoder set (from capability); only used when targeting.
  * @param {import("./select.mjs").SelectPolicy} [p.policy]
  * @returns {{ args: string[], source: string, target: string, encoder: string, kind: string, accel: string, container: string }}
- * @throws {Error} unknown source; UnknownCodecError/CodecUnavailableError from selectEncoder.
+ * @throws {Error} unknown source; encoded-source-without-target; UnknownCodecError/CodecUnavailableError.
  */
 export function buildCommand({ sourceCodec, targetCodec = null, available = new Set(), policy = {} }) {
   const src = String(sourceCodec || "").toLowerCase();
   const inputArgs = SOURCE_INPUT_ARGS[src];
-  if (!inputArgs) throw new Error(`unsupported source codec: ${src} (expected jpeg|pcm)`);
+  if (!inputArgs) {
+    throw new Error(
+      `unsupported source codec: ${src} (expected jpeg|pcm|h264|vp8|vp9|av1|opus|aac)`,
+    );
+  }
   const media = SOURCE_MEDIA[src];
 
-  // DEFAULT path — byte-unchanged from the original hardcoded FFMPEG_ARGS.
+  // DEFAULT path — byte-unchanged from the original hardcoded FFMPEG_ARGS. Only the RAW frame sources
+  // (jpeg/pcm) have a default; an ENCODED source with no target has no honest default (we will not
+  // silently re-emit the same codec), so config-no-silent-noop: reject loudly.
   if (!targetCodec) {
+    if (!DEFAULT_FFMPEG_ARGS[src]) {
+      throw new Error(
+        `encoded source codec "${src}" requires an explicit target codec (no default transcode)`,
+      );
+    }
     const defaultCodec = media === "video" ? "vp8" : "opus";
     const defaultEncoder = media === "video" ? "libvpx" : "libopus";
     return {

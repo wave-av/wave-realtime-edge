@@ -73,6 +73,13 @@ describe("buildCommand — explicit target codec", () => {
   });
 
   it("unsupported SOURCE codec → throws", () => {
-    expect(() => buildCommand({ sourceCodec: "h264" })).toThrow(/unsupported source codec/);
+    // theora is not in the source allowlist (jpeg|pcm raw, or h264|vp8|vp9|av1|opus|aac encoded).
+    expect(() => buildCommand({ sourceCodec: "theora" })).toThrow(/unsupported source codec/);
+  });
+
+  it("ENCODED source (h264) with NO target → throws (never re-emits source codec)", () => {
+    // #86: h264 is now a valid ENCODED source, but cross-codec negotiation requires an explicit target —
+    // there is no honest default (we won't silently re-encode h264→h264).
+    expect(() => buildCommand({ sourceCodec: "h264" })).toThrow(/requires an explicit target codec/);
   });
 });
