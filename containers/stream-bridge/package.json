@@ -1,0 +1,19 @@
+{
+  "name": "wave-stream-bridge-container",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "#91 B2 — whep-to-whip republisher container: pulls a CF Stream live_input's WHEP and republishes it through the WAVE gateway WHIP path into the SFU (passthrough, no transcode). werift WebRTC + @wave-av/whip-publish.",
+  "main": "server/index.mjs",
+  "scripts": {
+    "start": "node server/index.mjs",
+    "test": "vitest run --config vitest.config.mjs"
+  },
+  "dependencies": {
+    "@wave-av/whip-publish": "^0.2.0",
+    "werift": "^0.23.0"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.8"
+  }
+}

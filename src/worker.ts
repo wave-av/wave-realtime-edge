@@ -46,6 +46,7 @@ export { RoomDO } from "./room";
 // export resolves the class without provisioning a live container or a `new_sqlite_classes` migration. It is
 // exported here (the main module) so that, when the ◆ uncomments the binding, the class is already in scope.
 export { RecorderContainer } from "./encoders/recorder-container";
+export { StreamBridgeContainer } from "./stream-bridge-container"; // #91 B2 — inert (binding COMMENTED until ◆)
 
 // Task #81 — the per-room voice-agent session Durable Object. Exported from the main module so the
 // AGENT_SESSION binding + migration resolve on deploy. INERT: the dispatch/egress routes only reach it when
