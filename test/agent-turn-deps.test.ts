@@ -10,6 +10,7 @@ import {
   type AgentTurnEnv,
   type LlmMessage,
 } from "../src/agent-turn.js";
+import { upmixMonoToStereo16LE } from "../src/agent-turn-providers.js";
 import type { AgentMediaDeps } from "../src/agent-session.js";
 
 const media: AgentMediaDeps = {
@@ -32,6 +33,42 @@ async function collect<T>(it: AsyncIterable<T>): Promise<T[]> {
   for await (const v of it) out.push(v);
   return out;
 }
+
+async function* fromChunks(chunks: number[][]): AsyncIterable<Uint8Array> {
+  for (const c of chunks) yield new Uint8Array(c);
+}
+
+describe("upmixMonoToStereo16LE — mono pcm_48000 → stereo interleaved (#30)", () => {
+  it("duplicates each 16-bit LE sample into L=R within a chunk", async () => {
+    const out = await collect(upmixMonoToStereo16LE(fromChunks([[0x10, 0x20, 0x30, 0x40]])));
+    // two mono samples (0x2010, 0x4030) → [lo,hi,lo,hi] each
+    expect(out.map((c) => Array.from(c))).toEqual([[0x10, 0x20, 0x10, 0x20, 0x30, 0x40, 0x30, 0x40]]);
+  });
+
+  it("carries an odd trailing byte across a chunk boundary (no sample dropped or misaligned)", async () => {
+    // sample bytes [0xAA,0xBB] are split: 0xAA ends chunk1, 0xBB starts chunk2.
+    const out = await collect(upmixMonoToStereo16LE(fromChunks([[0xaa], [0xbb, 0xcc, 0xdd]])));
+    const flat = out.flatMap((c) => Array.from(c));
+    // sample1 = 0xBBAA → L,R ; sample2 = 0xDDCC → L,R
+    expect(flat).toEqual([0xaa, 0xbb, 0xaa, 0xbb, 0xcc, 0xdd, 0xcc, 0xdd]);
+  });
+
+  it("handles a lone-byte chunk by holding it until the next chunk completes the sample", async () => {
+    const out = await collect(upmixMonoToStereo16LE(fromChunks([[0x01], [0x02]])));
+    expect(out.flatMap((c) => Array.from(c))).toEqual([0x01, 0x02, 0x01, 0x02]);
+  });
+
+  it("skips empty chunks and drops a dangling final half-sample (inaudible end-of-utterance byte)", async () => {
+    const out = await collect(upmixMonoToStereo16LE(fromChunks([[], [0x05, 0x06, 0x07], []])));
+    // one full sample 0x0605; 0x07 has no pair at stream end → dropped
+    expect(out.flatMap((c) => Array.from(c))).toEqual([0x05, 0x06, 0x05, 0x06]);
+  });
+
+  it("output byte length is always a multiple of 4 (stereo frame aligned)", async () => {
+    const out = await collect(upmixMonoToStereo16LE(fromChunks([[1, 2, 3], [4, 5], [6, 7, 8, 9]])));
+    for (const c of out) expect(c.length % 4).toBe(0);
+  });
+});
 
 describe("buildTurnDeps — env gating (fail CLOSED, never a fake)", () => {
   it("throws *_NOT_CONFIGURED when creds are unset", async () => {
@@ -104,7 +141,9 @@ describe("buildTurnDeps — ElevenLabs TTS streaming", () => {
     const fetchImpl = vi.fn(async () => new Response(stream, { status: 200 }));
     const env: AgentTurnEnv = { ELEVENLABS_API_KEY: "xi-secret", ELEVENLABS_VOICE_ID: "voice123" };
     const out = await collect(buildTurnDeps(env, media, fetchImpl).synthesize("hello"));
-    expect(out.map((c) => Array.from(c))).toEqual([[1, 2], [3, 4]]);
+    // synthesize upmixes the MONO pcm_48000 to STEREO interleaved (L=R) for the CF ingest path (#30):
+    // [1,2] (one mono sample) → [1,2,1,2]; [3,4] → [3,4,3,4].
+    expect(out.map((c) => Array.from(c))).toEqual([[1, 2, 1, 2], [3, 4, 3, 4]]);
     const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toContain("/text-to-speech/voice123/stream");
     expect(url).toContain(`output_format=${ELEVENLABS_OUTPUT_FORMAT}`);
