@@ -10,7 +10,10 @@ import {
 	handleWhip,
 	buildWhipMeterLine,
 	whipIngestEnabled,
+	resolveWhipMeter,
 	METER_WHIP_INGEST_MINUTES,
+	METER_STREAM_BRIDGE_MINUTES,
+	WHIP_METER_OVERRIDE_HEADER,
 	type WhipEnv,
 	type WhipDeps,
 	type WhipKv,
@@ -225,6 +228,58 @@ describe("buildWhipMeterLine — ceil-minutes, idempotent on resourceId", () => 
 	});
 	it("event_id is the resourceId", () => {
 		expect(buildWhipMeterLine("res-xyz", 0, 1).event_id).toBe("res-xyz");
+	});
+	it("bills the override meter when one is supplied", () => {
+		expect(buildWhipMeterLine("r1", 0, 1, METER_STREAM_BRIDGE_MINUTES).meter).toBe(METER_STREAM_BRIDGE_MINUTES);
+	});
+});
+
+// ── #91 B2 stream-bridge SKU attribution (distinct meter, gateway-sealed override, allowset-validated) ──
+describe("resolveWhipMeter — allowset gate (validate-before-sink)", () => {
+	it("honors the allowed bridge override", () => {
+		expect(resolveWhipMeter(METER_STREAM_BRIDGE_MINUTES)).toBe(METER_STREAM_BRIDGE_MINUTES);
+	});
+	it("defaults to WHIP-ingest for absent/empty/unknown overrides", () => {
+		expect(resolveWhipMeter(null)).toBe(METER_WHIP_INGEST_MINUTES);
+		expect(resolveWhipMeter(undefined)).toBe(METER_WHIP_INGEST_MINUTES);
+		expect(resolveWhipMeter("")).toBe(METER_WHIP_INGEST_MINUTES);
+		expect(resolveWhipMeter("wave_free_lunch")).toBe(METER_WHIP_INGEST_MINUTES); // not in allowset → rejected
+	});
+});
+
+describe("handleWhip — bridge SKU teardown billing via the sealed override header", () => {
+	it("publish with x-wave-meter-override=bridge → teardown bills wave_stream_bridge_minutes", async () => {
+		const { deps: pubDeps } = mockDeps({ now: () => 1_000_000 });
+		const { deps: delDeps, meterCalls } = mockDeps({ now: () => 1_000_000 + 90_000 });
+		const env = whipEnv({ GATEWAY_BASE_URL: "https://api.wave.online", WAVE_SERVICE_TOKEN: "svc-token" });
+		await handleWhip(
+			whipReq("POST", "/v1/whip/publish", { "content-type": "application/sdp", [WHIP_METER_OVERRIDE_HEADER]: METER_STREAM_BRIDGE_MINUTES }, OFFER_SDP),
+			env,
+			"org_bridge",
+			pubDeps,
+		);
+		const res = await handleWhip(whipReq("DELETE", "/v1/whip/resource/res00000001"), env, "org_bridge", delDeps);
+		expect(res!.status).toBe(204);
+		expect(meterCalls.length).toBe(1);
+		const body = meterCalls[0].body as { usage: { meter: string; meter_value: number } };
+		expect(body.usage.meter).toBe(METER_STREAM_BRIDGE_MINUTES);
+		expect(body.usage.meter_value).toBe(2);
+	});
+
+	it("a spoofed/unknown override is rejected → teardown bills the default WHIP-ingest meter", async () => {
+		const { deps: pubDeps } = mockDeps({ now: () => 1_000_000 });
+		const { deps: delDeps, meterCalls } = mockDeps({ now: () => 1_000_000 + 90_000 });
+		const env = whipEnv({ GATEWAY_BASE_URL: "https://api.wave.online", WAVE_SERVICE_TOKEN: "svc-token" });
+		await handleWhip(
+			whipReq("POST", "/v1/whip/publish", { "content-type": "application/sdp", [WHIP_METER_OVERRIDE_HEADER]: "wave_free_lunch" }, OFFER_SDP),
+			env,
+			"org_A",
+			pubDeps,
+		);
+		const res = await handleWhip(whipReq("DELETE", "/v1/whip/resource/res00000001"), env, "org_A", delDeps);
+		expect(res!.status).toBe(204);
+		const body = meterCalls[0].body as { usage: { meter: string } };
+		expect(body.usage.meter).toBe(METER_WHIP_INGEST_MINUTES);
 	});
 });
 

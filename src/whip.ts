@@ -31,6 +31,24 @@ import {
 /** WHIP ingest meter — dedicated SKU per the frozen contract §4 (priced to STRIPE_PRICE_WHIP_INGEST_MIN). */
 export const METER_WHIP_INGEST_MINUTES = "wave_whip_ingest_minutes";
 
+/**
+ * #91 B2 stream-bridge SKU — a CF-Stream→SFU bridge publish bills a DISTINCT meter (4-layer COGS; frozen
+ * contract §4 / orphan-COGS-blocks-GA), NOT the bare WHIP-ingest SKU. The gateway directs it via the SEALED
+ * `x-wave-meter-override` header (stamped server-side ONLY for a `stream-bridge:write` key; forward() strips
+ * any client copy). The edge honors that override but ONLY against this allowset (validate-before-sink) — an
+ * unknown/malformed value can NEVER be billed; it falls back to the default WHIP-ingest meter.
+ */
+export const METER_STREAM_BRIDGE_MINUTES = "wave_stream_bridge_minutes";
+const WHIP_METER_OVERRIDE_ALLOW: ReadonlySet<string> = new Set([METER_STREAM_BRIDGE_MINUTES]);
+export const WHIP_METER_OVERRIDE_HEADER = "x-wave-meter-override";
+
+/** Resolve the session's billing meter from the gateway-sealed override: the named bridge SKU when present
+ *  AND allowed, else the default wave_whip_ingest_minutes. Pure — the security boundary (the override is
+ *  gateway-sealed, never client-supplied) is upstream; this is the defense-in-depth allowset check. */
+export function resolveWhipMeter(override: string | null | undefined): string {
+	return override && WHIP_METER_OVERRIDE_ALLOW.has(override) ? override : METER_WHIP_INGEST_MINUTES;
+}
+
 /** WHIP resource ids are opaque url-safe tokens we mint; guard before path interpolation / KV keys. */
 const RESOURCE_ID = /^[0-9a-zA-Z_-]{8,128}$/;
 /** KV key prefix for the resourceId → session record (reuses the RT_MEETING_ORG namespace). */
@@ -58,6 +76,9 @@ interface WhipResource {
 	sessionId: string;
 	org: string;
 	startedAt: number; // epoch ms — start of the publish session, for the teardown meter
+	// #91 B2: the resolved billing meter, captured (gateway-sealed, allowset-validated) at publish so the
+	// teardown bills the right SKU regardless of how it fires (client DELETE or cron). Absent ⇒ default WHIP.
+	meter?: string;
 }
 
 /** Injectable seams so every path unit-tests with NO live network (mirrors the repo's __egressDeps pattern). */
@@ -97,10 +118,15 @@ function jsonError(code: string, message: string, status: number): Response {
  * Build the one teardown meter line for a WHIP publish session. PURE (no I/O) so the accounting is
  * unit-testable. Duration is ceil-minutes (a started publish bills ≥1 min); idempotency = resourceId (§4).
  */
-export function buildWhipMeterLine(resourceId: string, startedAt: number, endedAt: number): MeterLine {
+export function buildWhipMeterLine(
+	resourceId: string,
+	startedAt: number,
+	endedAt: number,
+	meter: string = METER_WHIP_INGEST_MINUTES,
+): MeterLine {
 	const ms = endedAt - startedAt;
 	const minutes = ms > 0 ? Math.ceil(ms / 60_000) : 0;
-	return { meter: METER_WHIP_INGEST_MINUTES, meter_value: minutes, event_id: resourceId };
+	return { meter, meter_value: minutes, event_id: resourceId };
 }
 
 /**
@@ -140,7 +166,12 @@ async function loadResource(kv: WhipKv | undefined, resourceId: string): Promise
 	try {
 		const r = JSON.parse(raw) as Partial<WhipResource>;
 		if (typeof r.sessionId === "string" && typeof r.org === "string" && typeof r.startedAt === "number") {
-			return { sessionId: r.sessionId, org: r.org, startedAt: r.startedAt };
+			return {
+				sessionId: r.sessionId,
+				org: r.org,
+				startedAt: r.startedAt,
+				meter: typeof r.meter === "string" ? r.meter : undefined,
+			};
 		}
 	} catch {
 		/* corrupt record → treat as absent */
@@ -199,7 +230,10 @@ async function handlePublish(request: Request, env: WhipEnv, deps: WhipDeps, org
 		// Persist the resourceId → session record so PATCH(trickle)/DELETE(teardown) can address this session.
 		// Fail-open on the KV write: a persistence blip must not fail an otherwise-good publish (the resource
 		// is still live in the SFU; teardown GCs on idle). Loud, never silent.
-		const record: WhipResource = { sessionId: session.sessionId, org, startedAt: deps.now() };
+		// #91 B2: resolve the billing meter from the gateway-SEALED override header (allowset-validated) and
+		// persist it, so the teardown bills the right SKU (bridge vs bare WHIP) however it later fires.
+		const meter = resolveWhipMeter(request.headers.get(WHIP_METER_OVERRIDE_HEADER));
+		const record: WhipResource = { sessionId: session.sessionId, org, startedAt: deps.now(), meter };
 		try {
 			await env.RT_MEETING_ORG?.put(`${WHIP_KV_PREFIX}${resourceId}`, JSON.stringify(record), {
 				expirationTtl: WHIP_KV_TTL_SECONDS,
@@ -264,7 +298,7 @@ async function handleDelete(env: WhipEnv, deps: WhipDeps, resourceId: string): P
 
 	// Emit the duration meter for the publish session FIRST (fail-open) — before we drop the record, so the
 	// idempotency key (resourceId) and the org/startedAt are still in hand. A meter failure never blocks teardown.
-	const line = buildWhipMeterLine(resourceId, resource.startedAt, deps.now());
+	const line = buildWhipMeterLine(resourceId, resource.startedAt, deps.now(), resolveWhipMeter(resource.meter));
 	await emitWhipTeardownMeter(env, resource.org, line, deps.fetch);
 
 	// Best-effort: clear the resource record. CF Realtime sessions GC on idle, so there is no explicit
