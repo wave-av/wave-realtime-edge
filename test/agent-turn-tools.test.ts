@@ -76,8 +76,17 @@ function mkDeps(
   return { deps, sent, logs, transcribe, complete, callTool, synthesize };
 }
 
-/** A final egress frame (0x00 → STT final) that fires a turn. */
-const fire = () => encodeIngestFrame(new Uint8Array([1, 0x00]), { sequenceNumber: 1, timestamp: 0 }, "packet");
+// #28 silence-gated endpointing: a turn fires at speech-END. VAD_FAST makes it deterministic (1 loud = onset,
+// 1 quiet = end). The fake STT here ignores PCM content (always returns final "go"), so a turn just needs a
+// speech onset followed by a silence hangover.
+const VAD_FAST = { onsetFrames: 1, hangoverFrames: 1, rmsThreshold: 500 } as const;
+const SPEECH = () => encodeIngestFrame(new Uint8Array([0x10, 0x27, 0x10, 0x27]), { sequenceNumber: 1, timestamp: 0 }, "packet"); // loud
+const SILENCE = () => encodeIngestFrame(new Uint8Array([0, 0]), { sequenceNumber: 2, timestamp: 0 }, "packet"); // quiet → speech-end
+/** Feed one full utterance (speech onset → silence → speech-end → ONE STT → fire a turn). */
+async function fire(core: TurnTakingCore): Promise<void> {
+  await core.onFrame(SPEECH());
+  await core.onFrame(SILENCE());
+}
 
 const text = (s: string): CompletionEvent => ({ type: "text", text: s });
 const tool = (id: string, name: string, input: unknown): CompletionEvent => ({ type: "tool_use", id, name, input });
@@ -88,8 +97,8 @@ describe("TurnTakingCore — one tool call (full agentic round-trip)", () => {
       [tool("tu_1", "lookup", { q: "weather" })], // call 1: model requests a tool
       [text("It is sunny.")], // call 2: model speaks the answer
     ]);
-    const core = new TurnTakingCore(deps, cfg, { tools: allowlist });
-    await core.onFrame(fire());
+    const core = new TurnTakingCore(deps, cfg, { tools: allowlist, vad: VAD_FAST });
+    await fire(core);
 
     expect(callTool).toHaveBeenCalledWith("lookup", { q: "weather" });
     expect(complete).toHaveBeenCalledTimes(2);
@@ -117,8 +126,8 @@ describe("TurnTakingCore — agent-least-privilege", () => {
       [tool("tu_x", "delete_account", { id: 1 })], // model requests a tool NOT on the allowlist
       [text("done")],
     ]);
-    const core = new TurnTakingCore(deps, cfg, { tools: allowlist }); // only `lookup` is allowed
-    await core.onFrame(fire());
+    const core = new TurnTakingCore(deps, cfg, { tools: allowlist, vad: VAD_FAST }); // only `lookup` is allowed
+    await fire(core);
 
     expect(callTool).not.toHaveBeenCalled(); // the unlisted tool was NEVER executed
     expect(logs.some((l) => l.msg === "agent-tool-refused" && l.fields.tool === "delete_account")).toBe(true);
@@ -133,8 +142,8 @@ describe("TurnTakingCore — bounded loop (anti-runaway)", () => {
   it("stops at the max-iterations cap when the model keeps requesting tools forever", async () => {
     // EVERY LLM call requests a tool → without a cap this loops forever. cap=3 → at most 3 tool executions.
     const { deps, callTool, logs, sent } = mkDeps([[tool("t", "lookup", {})]]); // script repeats (last entry)
-    const core = new TurnTakingCore(deps, cfg, { tools: allowlist, maxToolIterations: 3 });
-    await core.onFrame(fire());
+    const core = new TurnTakingCore(deps, cfg, { tools: allowlist, maxToolIterations: 3, vad: VAD_FAST });
+    await fire(core);
     expect(callTool).toHaveBeenCalledTimes(3); // exactly the cap — never unbounded
     expect(logs.some((l) => l.msg === "agent-turn-tool-cap")).toBe(true);
     expect(sent.length).toBe(0); // no final text → nothing spoken (clean abandon, no commit)
@@ -148,8 +157,8 @@ describe("TurnTakingCore — fail-safety during tool calls", () => {
       [[tool("tu_e", "lookup", { q: "x" })], [text("recovered")]],
       { callTool: vi.fn(async () => { throw new Error("tool boom"); }) },
     );
-    const core = new TurnTakingCore(deps, cfg, { tools: allowlist });
-    await expect(core.onFrame(fire())).resolves.toBeUndefined(); // never throws up the media path
+    const core = new TurnTakingCore(deps, cfg, { tools: allowlist, vad: VAD_FAST });
+    await expect(fire(core)).resolves.toBeUndefined(); // never throws up the media path
     expect(logs.some((l) => l.msg === "agent-tool-error" && l.fields.tool === "lookup")).toBe(true);
     const req2 = (deps.complete as ReturnType<typeof vi.fn>).mock.calls[1][0] as LlmMessage[];
     const tr = (req2[3].content as Array<Record<string, unknown>>)[0];
@@ -160,8 +169,8 @@ describe("TurnTakingCore — fail-safety during tool calls", () => {
     // NB: use a benign sentinel (NOT a secret-named key/value) so the no-secrets-in-git enforcer doesn't flag the
     // fixture — the test still proves the raw input VALUE never reaches the logs (which is the redaction contract).
     const { deps, logs } = mkDeps([[tool("tu_s", "lookup", { q: "RAW-INPUT-MUST-NOT-APPEAR" })], [text("ok")]]);
-    const core = new TurnTakingCore(deps, cfg, { tools: allowlist });
-    await core.onFrame(fire());
+    const core = new TurnTakingCore(deps, cfg, { tools: allowlist, vad: VAD_FAST });
+    await fire(core);
     const serialized = JSON.stringify(logs);
     expect(serialized).not.toContain("RAW-INPUT-MUST-NOT-APPEAR"); // the VALUE is never logged
     const callLog = logs.find((l) => l.msg === "agent-tool-call");
@@ -189,11 +198,12 @@ describe("TurnTakingCore — barge-in during a tool call", () => {
       vad: { onsetFrames: 1, hangoverFrames: 1, rmsThreshold: 500 },
     });
 
-    const turnP = core.onFrame(fire()); // parks awaiting the slow tool
+    await core.onFrame(loud()); // speech onset (#28: the turn fires at the following speech-end)
+    const turnP = core.onFrame(quiet()); // speech-end → STT-final → runTurn parks awaiting the slow tool
     await tick();
     // Real barge-in (#27): the turn-start marks the VAD speaking, so a genuine interrupt needs a silence then fresh
     // speech — the user goes quiet (speech-end) then talks over the agent while the tool is still running.
-    await core.onFrame(quiet()); // speech-end — the prior utterance ended
+    await core.onFrame(quiet()); // speech-end (in-flight) — the prior utterance ended
     await core.onFrame(loud()); // fresh speech onset DURING tool execution → barge-in
     releaseTool();
     await turnP;
@@ -208,8 +218,8 @@ describe("TurnTakingCore — barge-in during a tool call", () => {
 describe("TurnTakingCore — text-only regression with the new union", () => {
   it("a plain text turn (no tools) still speaks and commits one user/assistant pair", async () => {
     const { deps, sent, callTool } = mkDeps([[text("hello there")]]);
-    const core = new TurnTakingCore(deps, cfg, { tools: allowlist });
-    await core.onFrame(fire());
+    const core = new TurnTakingCore(deps, cfg, { tools: allowlist, vad: VAD_FAST });
+    await fire(core);
     expect(callTool).not.toHaveBeenCalled();
     expect(sent.length).toBe(1);
     expect(core.history().map((m) => m.role)).toEqual(["system", "user", "assistant"]);

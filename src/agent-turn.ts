@@ -244,22 +244,21 @@ export class TurnTakingCore {
         if (vadEvent === "speech-start") this.bargeIn();
         return; // while a turn is in flight we never start STT — accumulate + (maybe) interrupt
       }
-      if (vadEvent === "speech-end") {
-        // VAD endpointing SEAM (design §L2.2): a real silence-hangover ended the user's speech. v1 endpointing
-        // stays final-transcript-driven below (STT decides the turn) so we never cut the user off on energy alone;
-        // this transition is observed for the future semantic+silence endpointing refinement.
-        // TODO(#81 step 4 follow-up): complement final-transcript endpointing with this silence signal once the
-        //                             streaming-STT contract lands (pin debounce so a hard-silence ends the turn
-        //                             faster without truncating slow speakers). Barge-in is the must-ship here.
-        this.deps.log("agent-vad-endpoint", { ...this.idFields(), rms: Math.round(this.vad.lastFrameRms) });
-      }
+      // SILENCE-GATED ENDPOINTING (design §L2.2): run STT + fire a turn ONLY when the VAD declares the user has
+      // FINISHED speaking (speech-end = a real silence hangover). The prior version polled STT on EVERY decoded
+      // frame, each re-transcribing the whole growing buffer — at ~50 frames/s that serialized the DO into
+      // `loadShed` (a ~700ms batch STT POST per frame) AND fired turns on fragmented buffers (often empty → no
+      // turn). Now we accumulate while the user talks and run exactly ONE batch STT per utterance, after silence.
+      // Frames keep advancing the VAD above; nothing else happens until the hangover trips speech-end.
+      if (vadEvent !== "speech-end") return; // still speaking, or steady silence → accumulate only
+      this.deps.log("agent-vad-endpoint", { ...this.idFields(), rms: Math.round(this.vad.lastFrameRms) });
       stage = "stt";
       const pcm = concat(this.utterance);
+      this.resetUtterance(); // the utterance ended at speech-end — consume it regardless of the STT outcome
       const stt = await this.deps.transcribe(pcm);
-      if (!stt.isFinal) return; // partial — keep accumulating (v1 endpointing is final-driven)
+      if (!stt.isFinal) return; // a future STREAMING STT may emit partials behind this same seam; v1 batch ⇒ final
       const userText = stt.transcript.trim();
-      this.resetUtterance(); // consume the utterance now that it's final
-      if (userText.length === 0) return; // final-but-empty (silence) → no turn
+      if (userText.length === 0) return; // silence / nothing recognized → no turn
       await this.runTurn(userText);
     } catch (e) {
       this.deps.log("agent-turn-error", { stage, message: (e as Error)?.message ?? "unknown" });
