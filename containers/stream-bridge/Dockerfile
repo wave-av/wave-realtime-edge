@@ -21,6 +21,11 @@ RUN --mount=type=secret,id=github_token \
 
 COPY server ./server
 
+# Drop privileges: run as the non-root `node` user (uid 1000, built into the node image). /app + node_modules
+# were installed as root and are world-readable; the runtime only READS them. An attacker who controls the
+# process never has root in the container.
+USER node
+
 ENV PORT=8080
 EXPOSE 8080
 
