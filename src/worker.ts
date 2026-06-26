@@ -27,6 +27,9 @@ import {
 // B3 (#98) — IETF WHIP v1 ingest surface (/v1/whip/*). INERT behind WHIP_INGEST_ENABLED ([vars], default off
 // → the 501 catch-all is unchanged). See src/whip.ts + whip-v1-frozen-contract.md §3/§4/§6-B3.
 import { handleWhip, whipIngestEnabled, type WhipEnv } from "./whip";
+// B1 (#91-a) — CF Stream Live → SFU bridge CONTROL PLANE. INERT behind STREAM_BRIDGE_ENABLED. worker.ts only
+// DELEGATES; all matching/auth/dispatch lives in src/stream-bridge.ts (+ cf-stream-bridge-frozen-contract).
+import { maybeHandleStreamBridge, scheduledStreamReconcile } from "./stream-bridge";
 // Task #81 (LK-rip Phase 6b) — voice-agent runtime. INERT behind VOICE_AGENT_PROVIDER==="wave": every new
 // route/DO behavior is gated by voiceAgentEnabled(env); absent/anything-else → the 501 catch-all is unchanged.
 import { voiceAgentEnabled, type AgentSessionConfig } from "./agent-session";
@@ -63,6 +66,11 @@ interface Env extends EncoderEnv {
 	// B3 (#98) WHIP v1 ingest flag ([vars], default off). Falsy/absent → the /v1/whip/* surface is inert and
 	// the 501 catch-all is unchanged. Truthy ("1"/"true") → the WHIP listener (src/whip.ts) handles /v1/whip/*.
 	WHIP_INGEST_ENABLED?: string | boolean;
+	// B1 (#91-a) CF Stream bridge flag ([vars], default off). Falsy/absent → POST /v1/stream/bridge/webhook is
+	// inert (501 fall-through). Truthy → the control-plane webhook (src/stream-bridge.ts) handles it.
+	STREAM_BRIDGE_ENABLED?: string | boolean;
+	WAVE_STREAM_WEBHOOK_SECRET?: string; // wrangler SECRET — CF Stream webhook signing secret (HMAC). Empty → every webhook 401s (fail-closed).
+	STREAM_BRIDGE?: DurableObjectNamespace; // B2 republisher container (whep-to-whip). COMMENTED in wrangler until ◆ go-live → absent → dispatch fails CLOSED.
 	TURN_KEY_ID?: string; // wrangler SECRET — the CF TURN key uid (32-hex). Out of the public repo; persists across deploys.
 	TURN_KEY_TOKEN?: string; // wrangler SECRET — the TURN key's api token. Never logged/returned; only ephemeral ICE creds are.
 	// ── P5 CF-Calls SFU control plane ──
@@ -643,6 +651,11 @@ export default {
 			if (whipRes) return whipRes; // null → unrecognized /v1/whip/* sub-path → 501 fall-through below
 		}
 
+		// ── B1 (#91-a) CF Stream Live → SFU bridge — POST /v1/stream/bridge/webhook. INERT behind
+		// STREAM_BRIDGE_ENABLED (null → falls through to the 501 catch-all). Self-auth (CF HMAC), control-only. ──
+		const sbRes = await maybeHandleStreamBridge(request, env, ctx);
+		if (sbRes) return sbRes;
+
 		// ── Task #81 voice-agent runtime (LK-rip Phase 6b) — INERT unless VOICE_AGENT_PROVIDER==="wave" ──
 		// When the flag is off, BOTH blocks below are skipped and the request falls through to the 501 catch-all,
 		// UNCHANGED. When on, the SAME gateway-trust chokepoint as every paid route gates dispatch; the egress WS
@@ -780,5 +793,7 @@ export default {
 				reconcilePending(env.RT_MEETING_ORG, sink, (msg, fields) => console.log(JSON.stringify({ msg, ...fields }))),
 			);
 		}
+		// B1 (#91-a) — CF Stream bridge lifecycle-poll backstop (INERT unless enabled + KV bound). Best-effort.
+		scheduledStreamReconcile(env, ctx);
 	},
 };

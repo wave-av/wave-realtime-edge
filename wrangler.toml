@@ -57,6 +57,14 @@ GATEWAY_BASE_URL = "https://api.wave.online"
 # enabling customers stays a deliberate per-key scope-grant — flipping this exposes nothing broken to customers.
 WHIP_INGEST_ENABLED = "1"
 
+# ── B1 (#91-a) — CF Stream Live → SFU bridge control plane (POST /v1/stream/bridge/webhook). DEFAULT OFF. ──
+# STREAM_BRIDGE_ENABLED gates the self-authenticating CF Stream webhook receiver (src/stream-bridge.ts). Absent/
+# "0" → the route falls through to the honest 501 catch-all, UNCHANGED — the whole bridge is inert. The webhook
+# is HMAC-verified against WAVE_STREAM_WEBHOOK_SECRET (a wrangler SECRET — `wrangler secret put`, set at ◆
+# go-live when the CF Stream webhook subscription is created). The republisher container (B2) binding below
+# stays COMMENTED until ◆ go-live, so even ARMED-without-binding a /start fails CLOSED (logged + cron-requeued).
+STREAM_BRIDGE_ENABLED = "0"
+
 # ── Task #81 (LK-rip Phase 6b) — Voice-Agent runtime provider flag. DEFAULT OFF / FULLY INERT. ──
 # Absent/anything-but-"wave" → the /v1/realtime/agents/* dispatch + egress routes are skipped entirely
 # (voiceAgentEnabled(env)=false) and a request falls through to the honest 501 catch-all — UNCHANGED. Setting
@@ -139,6 +147,26 @@ class_name = "RecorderContainer"
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["RecorderContainer"]
+
+# ── B1/B2 (#91) — CF Stream → SFU bridge republisher container (StreamBridgeContainer, MODE=whep-to-whip). ──
+# COMMENTED until the ◆ go-live (cf-stream-bridge-frozen-contract §7.5). The container class + image
+# (containers/stream-bridge/) are B2's deliverable and do NOT exist yet — uncommenting before B2 lands would
+# break the build (no Dockerfile). With the binding absent, worker.ts streamDispatchStart() throws
+# "binding absent" so the bridge stays fully inert even if STREAM_BRIDGE_ENABLED were flipped (fail-closed).
+# At ◆ go-live: land B2, uncomment these three blocks (container + DO binding STREAM_BRIDGE + migration v4),
+# build the image, deploy.
+# [[containers]]
+# class_name = "StreamBridgeContainer"
+# image = "./containers/stream-bridge/Dockerfile"
+# max_instances = 5
+#
+# [[durable_objects.bindings]]
+# name = "STREAM_BRIDGE"
+# class_name = "StreamBridgeContainer"
+#
+# [[migrations]]
+# tag = "v4"
+# new_sqlite_classes = ["StreamBridgeContainer"]
 
 # ── Task #81 (LK-rip Phase 6b) — Voice-Agent Session Durable Object (agent-session.ts AgentSessionDO) ──
 # One DO instance per room/agent-session (design §L1). Holds the two CF Realtime WS media-transport adapters
