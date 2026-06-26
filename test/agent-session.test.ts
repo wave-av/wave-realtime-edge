@@ -83,6 +83,9 @@ describe("AgentSessionCore.openAdapters — two adapters on one DO", () => {
     expect(inTracks[0].endpoint).toContain("?t=intok");
     expect(inTracks[0].endpoint).not.toContain("egtok");
     expect(inTracks[0].location).toBe("local");
+    expect(inTracks[0].inputCodec).toBe("pcm");
+    // #29: mode:"buffer" is REQUIRED for the SFU to dial our endpoint + publish RTP from our PCM (was omitted → 0 RTP).
+    expect(inTracks[0].mode).toBe("buffer");
   });
   it("requires bind first and a wss base", async () => {
     const { deps } = mkDeps();

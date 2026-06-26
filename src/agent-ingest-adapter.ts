@@ -44,6 +44,14 @@ export interface IngestAdapterTrack {
   /** wss:// the SFU connects to receive OUR PCM (symmetric with the egress `endpoint`). */
   endpoint: string;
   inputCodec: "pcm";
+  /**
+   * CF Realtime WebSocket-adapter mode for a local (publish) track. "buffer" = the SFU reads PROTOBUF frames whose
+   * `payload` field carries chunks of 48k/16-bit/stereo PCM (exactly what encodeIngestFrame emits) — REQUIRED for
+   * the SFU to actually establish the pull and publish RTP from our endpoint. Documented at
+   * developers.cloudflare.com/realtime/sfu/media-transport-adapters/websocket-adapter (#81 #29 — its absence was
+   * why the SFU created the adapter but never dialed our /ingest endpoint → 0 RTP on the agent track).
+   */
+  mode?: "buffer";
 }
 
 export interface CreateIngestAdapterParams {
@@ -104,6 +112,10 @@ export async function createIngestAdapter(
   }
   const obj = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
   const id = obj.adapterId ?? obj.id;
+  // Observability (#29): surface the SFU's ingest-adapter response so a live run can see what CF returned (status,
+  // adapterId, any connection/error hint) — the create being `ok` did NOT prove the SFU would dial our endpoint.
+  // Bounded + never includes the bearer (it's not in the response). NOT a secret.
+  console.log(JSON.stringify({ msg: "agent-ingest-adapter-created", status: res.status, adapterId: id ?? null, raw: JSON.stringify(json).slice(0, 600) }));
   return { adapterId: id != null ? String(id) : undefined, raw: json };
 }
 
