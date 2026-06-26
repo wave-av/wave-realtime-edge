@@ -198,7 +198,7 @@ export class AgentSessionCore {
       { location: "remote", sessionId: c.participantSessionId, trackName: c.participantTrackName, endpoint: egressEndpoint, outputCodec: "pcm" },
     ]);
     this.ingest = await this.deps.createIngest([
-      { location: "local", sessionId: c.participantSessionId, trackName: c.agentTrackName!, endpoint: ingestEndpoint, inputCodec: "pcm" },
+      { location: "local", sessionId: c.participantSessionId, trackName: c.agentTrackName!, endpoint: ingestEndpoint, inputCodec: "pcm", mode: "buffer" },
     ]);
     this.deps.log("agent-adapters-open", {
       org: c.org, room: c.roomId, agentId: c.agentId,

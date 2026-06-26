@@ -27,11 +27,12 @@ describe("createIngestAdapter", () => {
     };
     const r = await createIngestAdapter({ fetchImpl }, {
       appId: APP, bearer: "b",
-      tracks: [{ location: "local", sessionId: SESSION, trackName: "agent-a", endpoint: "wss://rt.wave.online/x", inputCodec: "pcm" }],
+      tracks: [{ location: "local", sessionId: SESSION, trackName: "agent-a", endpoint: "wss://rt.wave.online/x", inputCodec: "pcm", mode: "buffer" }],
     });
     expect(r.adapterId).toBe("ad_1");
     expect(seen.url).toContain(`/apps/${APP}/adapters/websocket/new`);
-    expect((seen.body as { tracks: { location: string; inputCodec: string }[] }).tracks[0]).toMatchObject({ location: "local", inputCodec: "pcm" });
+    // #29: the SFU needs mode:"buffer" on a local track to actually dial our endpoint + publish RTP from our PCM.
+    expect((seen.body as { tracks: { location: string; inputCodec: string; mode: string }[] }).tracks[0]).toMatchObject({ location: "local", inputCodec: "pcm", mode: "buffer" });
   });
 
   it("rejects a bad app id, missing bearer, non-wss endpoint, bad session, empty tracks", async () => {

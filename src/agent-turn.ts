@@ -396,6 +396,10 @@ export class TurnTakingCore {
   private async speak(text: string): Promise<number> {
     let pcmBytesOut = 0;
     const sock = this.deps.ingestSocket();
+    // Observability (#29): the agent has a reply to speak but the SFU never dialed our /ingest endpoint (no live
+    // sink) → every frame below is dropped and the agent track stays silent (0 RTP). Surfaced so a live run sees
+    // THIS rather than only an absent meter. (The fix is the ingest adapter `mode:"buffer"`; this proves the seam.)
+    if (!sock) this.deps.log("agent-speak-no-ingest", { ...this.idFields(), chars: text.length });
     for await (const pcm of this.deps.synthesize(text)) {
       if (this.aborted) return -1; // barge-in: stop publishing the now-stale reply mid-stream
       if (!sock || pcm.length === 0) continue;
