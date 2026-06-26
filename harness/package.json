@@ -7,6 +7,7 @@
     "spike:signaling": "node spike-signaling.mjs"
   },
   "dependencies": {
+    "opusscript": "^0.0.8",
     "werift": "0.23.0"
   }
 }

@@ -17,3 +17,6 @@ node_modules/
 # voice-agent e2e harness (Node-only werift; never in the worker bundle)
 harness/node_modules/
 harness/fixtures/*.aiff
+
+# #30 Leg-3 captured agent audio (output artifact, not source)
+harness/fixtures/leg3-agent-capture.wav
