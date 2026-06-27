@@ -173,10 +173,9 @@ max_instances = 5
 [[durable_objects.bindings]]
 name = "STREAM_BRIDGE"
 class_name = "StreamBridgeContainer"
-
-[[migrations]]
-tag = "v4"
-new_sqlite_classes = ["StreamBridgeContainer"]
+# NOTE: the StreamBridgeContainer [[migrations]] block (tag v4) lives at the END of this file, AFTER v3 —
+# wrangler applies migrations in ARRAY ORDER after the last-applied tag (live = v3), so v4 MUST be last or it
+# is silently never applied (deploy then fails: "class not configured to implement Durable Objects" [10061]).
 
 # ── Task #81 (LK-rip Phase 6b) — Voice-Agent Session Durable Object (agent-session.ts AgentSessionDO) ──
 # One DO instance per room/agent-session (design §L1). Holds the two CF Realtime WS media-transport adapters
@@ -193,6 +192,13 @@ class_name = "AgentSessionDO"
 [[migrations]]
 tag = "v3"
 new_sqlite_classes = ["AgentSessionDO"]
+
+# ── #91 B2 — StreamBridgeContainer DO migration. MUST be the LAST/highest migration tag so wrangler applies
+# it as the delta after the live v3 tag (migrations are applied in array order). Its [[containers]] +
+# [[durable_objects.bindings]] are declared above (binding order is irrelevant; only migration tag order is).
+[[migrations]]
+tag = "v4"
+new_sqlite_classes = ["StreamBridgeContainer"]
 
 [[unsafe.bindings]]
 type = "plain_text"
