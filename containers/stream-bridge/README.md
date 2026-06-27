@@ -43,10 +43,31 @@ v0.2.0 used verbatim: `pull()` (WHEP-in) → `adaptTrack` (werift relay-track, R
 
 ## Status
 
-**INERT.** The `[[containers]] StreamBridgeContainer` binding in `wrangler.toml` is COMMENTED. The orchestration
-is unit-proven (`test/relay.test.mjs`); the live WHEP→WHIP **RTP forwarding** is proven at ◆ go-live (§7.6:
-real RTMPS push → an SFU track id — a bare WHIP 201 is not proof). Go-live is a Jake-named crossing: image
-build + bridge `wk_` key mint + CF Stream webhook secret + `STREAM_BRIDGE_ENABLED=1`.
+**ARMED (#48 go-live, Jake-named 2026-06-27).** The `[[containers]] StreamBridgeContainer` binding in
+`wrangler.toml` is live; `STREAM_BRIDGE_ENABLED="1"`; the bridge `wk_` key (`WHIP_KEY`) + CF Stream webhook
+secret are provisioned to the worker. The live WHEP→WHIP **RTP forwarding** receipt (§7.6: real RTMPS push →
+an SFU track id — a bare WHIP 201 is not proof) is the remaining proof, gated on the per-input KV seed
+(`stream-input-org:<uid>` in `RT_MEETING_ORG`) — the bridge fail-closes on KV miss, so it's inert until seeded.
+
+## Rebuilding the image
+
+The `image` in `wrangler.toml` is a **pre-pushed CF-managed-registry ref**, NOT the local Dockerfile path —
+`wrangler deploy`/`wrangler containers build` cannot pass the BuildKit secret this image needs for the
+org-internal `@wave-av/whip-publish` (GitHub Packages), and this repo is PUBLIC so the private dep must never
+be vendored in-tree. Build ONCE locally and push; deploy just references the ref (no build, no token in CI):
+
+```sh
+# from repo root, with Docker running + a gh token that has read:packages on the wave-av org
+TAG="wave-stream-bridge:v4-$(git rev-parse --short HEAD)"
+# NOTE: containers/stream-bridge/.npmrc pins min-release-age=7 (supply-chain guard). If the pinned
+# @wave-av/whip-publish version is <7d old, relax that line in the WORKING COPY for this build only
+# (restore with `git checkout` before committing — the committed guard must stay intact).
+GITHUB_TOKEN="$(gh auth token)" docker buildx build \
+  --secret id=github_token,env=GITHUB_TOKEN --platform linux/amd64 \
+  -t "$TAG" --load containers/stream-bridge
+doppler run --project wave --config prd -- wrangler containers push "$TAG"   # → prints registry.cloudflare.com/<acct>/...
+# then update [[containers]] image in wrangler.toml to the printed ref and deploy.
+```
 
 ## Test
 
