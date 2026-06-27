@@ -165,9 +165,18 @@ new_sqlite_classes = ["RecorderContainer"]
 # deploy pipeline builds/pushes the image. With STREAM_BRIDGE_ENABLED="1" the B1 webhook receiver dispatches
 # /start to this container; until the bridge wk_ key (WHIP_KEY) + CF Stream webhook secret are provisioned the
 # dispatch still fails CLOSED (stream-bridge.ts: binding-present but no key → handled, logged + cron-requeued).
+#
+# IMAGE = a PRE-PUSHED CF-managed-registry ref, NOT the local Dockerfile path. Why: the image installs the
+# org-internal @wave-av/whip-publish from GitHub Packages, which needs a BuildKit build secret (Dockerfile
+# `--mount=type=secret,id=github_token`). `wrangler deploy`/`wrangler containers build` CANNOT pass BuildKit
+# secrets (no --secret flag), and this repo is PUBLIC so the private dep must never be vendored in-tree. So the
+# image is built ONCE locally (`docker buildx build --secret id=github_token …`) and pushed
+# (`wrangler containers push`) to the CF managed registry; deploy just references it (no build, no token in CI).
+# Rebuild recipe lives in containers/stream-bridge/README.md. RecorderContainer above still builds from its
+# Dockerfile (no private dep) — wrangler supports a mixed build/reference set.
 [[containers]]
 class_name = "StreamBridgeContainer"
-image = "./containers/stream-bridge/Dockerfile"
+image = "registry.cloudflare.com/d674452f756fe46885a0d6ce7bc23f0a/wave-stream-bridge:v4-803bc93"
 max_instances = 5
 
 [[durable_objects.bindings]]
