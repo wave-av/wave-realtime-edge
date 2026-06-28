@@ -196,3 +196,50 @@ describe("ContainerHandle frames → ONE canonical EBML object via the tap", () 
     await expect(handle.abort()).resolves.toBeUndefined();
   });
 });
+
+// RT-R10 (#72) — the self-host local-sink WIRE: ContainerEncoderDeps.localWriterFor threads through
+// ContainerEncoder → ContainerHandle → selectSink so RECORDER_SINK=localfs|fanout actually selects a local sink.
+// On the Worker (dep undefined) it MUST degrade to R2 (inert / byte-identical) — proving the default stays dormant.
+describe("ContainerHandle.onPublish — RT-R10 local-sink injection (self-host vs Worker)", () => {
+  /** A fake fs writer factory matching the self-host `localWriterFor(dir, session)` injection shape. */
+  const fakeLocalWriterFor = () => ({
+    append: async () => {},
+    close: async () => ({ path: "/rec/recording.webm", bytes: 1 }),
+    discard: async () => {},
+  });
+
+  it("RECORDER_SINK=fanout + injected localWriterFor → tap writes a FanoutSink (R2 + local)", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ adapterId: "a" }));
+    const env = { ...configuredEnv(new FakeBucket()), RECORDER_SINK: "fanout", RECORDER_LOCAL_DIR: "/rec" } as EncoderEnv;
+    const enc = new ContainerEncoder(env, { fetchImpl, localWriterFor: fakeLocalWriterFor });
+    const handle = (await enc.begin(SESSION)) as ContainerHandle;
+    await handle.onPublish("mic", "audio");
+    expect(handle.tapsByTrack.get("mic")!.sinkKind).toBe("fanout");
+  });
+
+  it("RECORDER_SINK=localfs + injected localWriterFor → tap writes a LocalFsSink (on-prem only)", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ adapterId: "a" }));
+    const env = { ...configuredEnv(new FakeBucket()), RECORDER_SINK: "localfs", RECORDER_LOCAL_DIR: "/rec" } as EncoderEnv;
+    const enc = new ContainerEncoder(env, { fetchImpl, localWriterFor: fakeLocalWriterFor });
+    const handle = (await enc.begin(SESSION)) as ContainerHandle;
+    await handle.onPublish("mic", "audio");
+    expect(handle.tapsByTrack.get("mic")!.sinkKind).toBe("localfs");
+  });
+
+  it("RECORDER_SINK=fanout but NO localWriterFor (the Worker path) → degrades to R2 (inert)", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ adapterId: "a" }));
+    const env = { ...configuredEnv(new FakeBucket()), RECORDER_SINK: "fanout", RECORDER_LOCAL_DIR: "/rec" } as EncoderEnv;
+    const enc = new ContainerEncoder(env, { fetchImpl }); // no localWriterFor → Worker default
+    const handle = (await enc.begin(SESSION)) as ContainerHandle;
+    await handle.onPublish("mic", "audio");
+    expect(handle.tapsByTrack.get("mic")!.sinkKind).toBe("r2");
+  });
+
+  it("default (no RECORDER_SINK) → R2 even when a writer is injected (byte-identical default)", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ adapterId: "a" }));
+    const enc = new ContainerEncoder(configuredEnv(new FakeBucket()), { fetchImpl, localWriterFor: fakeLocalWriterFor });
+    const handle = (await enc.begin(SESSION)) as ContainerHandle;
+    await handle.onPublish("mic", "audio");
+    expect(handle.tapsByTrack.get("mic")!.sinkKind).toBe("r2");
+  });
+});

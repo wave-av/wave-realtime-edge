@@ -13,8 +13,17 @@
  */
 import type { EncoderEnv, EncoderHandle, RecordingEncoder, RecordingSession } from "./encoder.js";
 import { ManagedEncoder } from "./managed.js";
-import { ContainerEncoder } from "./container.js";
+import { ContainerEncoder, type ContainerEncoderDeps } from "./container.js";
 import { WasmEncoder } from "./wasm.js";
+
+/**
+ * RT-R10 (#72) — optional deps the host runtime supplies. On the Worker this is empty (the default), keeping the
+ * container path byte-identical. A self-host runtime passes `{ localWriterFor }` so `RECORDER_SINK=localfs|fanout`
+ * lands a real local file (the Node fs writer stays out of the Worker bundle — it is injected, not imported here).
+ */
+export interface SelectEncoderDeps {
+  container?: ContainerEncoderDeps;
+}
 
 /** The inert encoder: recording is disarmed, so `begin` records nothing and returns null. */
 export class DisarmedEncoder implements RecordingEncoder {
@@ -28,11 +37,11 @@ export class DisarmedEncoder implements RecordingEncoder {
  * Select the recording encoder for this env. Disarmed (inert) unless `RT_RECORD==="1"`. When armed, the
  * adapter is chosen by `RT_ENCODER` (default "managed"); A/B throw NOT_SPIKED at `begin` until the §7 spike.
  */
-export function selectEncoder(env: EncoderEnv): RecordingEncoder {
+export function selectEncoder(env: EncoderEnv, deps: SelectEncoderDeps = {}): RecordingEncoder {
   if (env.RT_RECORD !== "1") return new DisarmedEncoder(); // inert default
   switch (env.RT_ENCODER ?? "managed") {
     case "container":
-      return new ContainerEncoder(env); // A — BLOCKED-ON-RT-P0.1-spike
+      return new ContainerEncoder(env, deps.container); // A — BLOCKED-ON-RT-P0.1-spike
     case "wasm":
       return new WasmEncoder(env); // B — BLOCKED-ON-RT-P0.1-spike + feasibility-gated
     case "managed":
