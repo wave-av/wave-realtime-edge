@@ -22,6 +22,9 @@ import { maybeHandleIngestBridge, scheduledIngestReconcile } from "./ingest-brid
 import { voiceAgentEnabled, type AgentSessionConfig } from "./agent-session";
 // E3.P2/P4 (#127) — data-residency sink wiring (used only when RT_RESIDENCY is on). residency-rt.ts stays PURE.
 import { captureSessionZone } from "./residency-sink";
+// #82/#114 EX P2/P3 — cascade relay wiring (used only when RT_CASCADE is on). cascade.ts stays PURE; the
+// env/cf glue lives in src/cascade-sink.ts. OFF/absent → the primary `idFromName(org:room)` path is unchanged.
+import { resolveRelay } from "./cascade-sink";
 // Env shape, route-match constants, and the auth/deps/sink plumbing — extracted to a leaf module (task #56) so
 // neither file exceeds 800 lines. dispatch-helpers.ts imports nothing from here (no cycle).
 import {
@@ -365,8 +368,16 @@ export async function dispatch(
 		const anon = (request.headers.get("x-wave-anon") ?? "") !== "";
 		// Forward to the room's DO with the already-authenticated context bound in. Per-org isolation is
 		// enforced by the DO id (org:room) AND re-checked inside the Room DO (org-mismatch → 403/409).
-		const id = env.ROOM.idFromName(`${org}:${room}`);
-		const stub = env.ROOM.get(id);
+		//
+		// #82/#114 CASCADE (RT_CASCADE, default-off): on a regional JOIN, resolve the nearest-healthy region's
+		// relay DO (a strict-suffix `org:room:region` key) and place it IN that region via get(id,{locationHint}).
+		// resolveRelay returns null when RT_CASCADE is off, the continent is unknown, no relay is healthy, or the
+		// ROOM binding is absent → the UNCHANGED primary `idFromName(org:room)` path. The ctx (org,room) is the
+		// logical room — unchanged — so the relay (shared Room DO code) peers back to the primary and the
+		// org-mismatch re-check still holds. Cascade applies to join only; other intents keep the primary path.
+		const relay = intent === "join" ? resolveRelay(env, request, org, room) : null;
+		const id = relay ? relay.id : env.ROOM.idFromName(`${org}:${room}`);
+		const stub = relay ? env.ROOM.get(id, { locationHint: relay.locationHint }) : env.ROOM.get(id);
 		const intentReq = new Request(`https://room/${intent}`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
