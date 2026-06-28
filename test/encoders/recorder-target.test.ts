@@ -55,7 +55,9 @@ describe("SelfHostTarget — fetch the configured URL", () => {
     );
     expect(t).toBeInstanceOf(SelfHostTarget);
     const out = await t.encode(jpeg, meta);
-    expect(out).toEqual(vp8);
+    expect(out!.bytes).toEqual(vp8);
+    expect(out!.outputCodec).toBe("vp8");
+    expect(out!.outputContainer).toBe("ivf");
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe("https://studio:8080/encode"); // trailing slash stripped
     const h = calls[0].init!.headers as Record<string, string>;
@@ -99,7 +101,9 @@ describe("CfContainerTarget — getContainer + fetch '/encode'", () => {
     );
     expect(t).toBeInstanceOf(CfContainerTarget);
     const out = await t.encode(jpeg, meta);
-    expect(out).toEqual(vp8);
+    expect(out!.bytes).toEqual(vp8);
+    expect(out!.outputCodec).toBe("vp8");
+    expect(out!.outputContainer).toBe("ivf");
     expect(gotId).toBe("rt-encoder");
   });
 

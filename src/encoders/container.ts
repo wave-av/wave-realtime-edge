@@ -29,7 +29,7 @@ import {
 } from "./container-adapter.js";
 import { mintRecorderToken } from "./recorder-auth.js";
 import { selectRecorderTarget, type RecorderTarget, type RecorderTargetEnv } from "./recorder-target.js";
-import { consumerDescriptor, negotiationArmed, type ConsumerCapsEnv } from "./consumer-caps.js";
+import { consumerDescriptor, consumerCapsExplicitlyConfigured, negotiationArmed, type ConsumerCapsEnv } from "./consumer-caps.js";
 import { selectSink, type RecordingSinkEnv, type LocalFileWriter, type SinkSession } from "./recording-sink.js";
 import { parseIvf } from "./ivf.js";
 
@@ -176,17 +176,18 @@ export class ContainerHandle implements EncoderHandle {
    */
   private static videoEncoderFromTarget(target: RecorderTarget, env: ConsumerCapsEnv): AsyncVideoEncoder {
     // #135 NEGOTIATION WIRING (default-OFF). Source the recording consumer's capability descriptor ONCE per
-    // tap and gate it behind NEGOTIATION_ENABLED. Flag OFF → `negotiate:false` → encodeInit attaches NO
-    // x-dst-capabilities header → the /encode request is byte-identical to today. Flag ON → the descriptor
-    // rides every frame so the server's selectLeg negotiates a real leg (→ x-negotiated-transport / 422).
-    const negotiate = negotiationArmed(env);
+    // tap and gate it behind NEGOTIATION_ENABLED plus explicit RT_CONSUMER_* overrides. Flag OFF, or ON
+    // without overrides → `negotiate:false` → encodeInit attaches NO x-dst-capabilities header → the /encode
+    // request is byte-identical to today (the env baseline is not walkable by selectLeg's codec/transport ladder).
+    const negotiate = negotiationArmed(env) && consumerCapsExplicitlyConfigured(env);
     const dst = negotiate ? consumerDescriptor(env) : undefined;
     return {
       codec: "vp8",
       async encode(jpeg: Uint8Array) {
-        const ivf = await target.encode(jpeg, { kind: "video", ts: 0, codec: "jpeg", negotiate, dst });
-        if (!ivf || ivf.length === 0) return [];
-        return parseIvf(ivf).map((f) => ({ data: f.data, keyframe: f.keyframe }));
+        const encoded = await target.encode(jpeg, { kind: "video", ts: 0, codec: "jpeg", negotiate, dst });
+        if (!encoded) return [];
+        if (encoded.outputCodec !== "vp8" || encoded.outputContainer !== "ivf") return [];
+        return parseIvf(encoded.bytes).map((f) => ({ data: f.data, keyframe: f.keyframe }));
       },
     };
   }

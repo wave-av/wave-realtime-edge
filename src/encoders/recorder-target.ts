@@ -69,6 +69,13 @@ function encodeDstHeader(dst: DstCapabilityDescriptor): string {
   return btoa(JSON.stringify(dst));
 }
 
+/** The encoded bytes plus the server's output codec/container headers (x-output-codec / x-output-container). */
+export interface EncodeResult {
+  bytes: Uint8Array;
+  outputCodec: string;
+  outputContainer: string;
+}
+
 /**
  * A runtime that encodes ONE decoded frame → encoded bytes, or `null` when it can't (fail-open). Async because
  * both live runtimes (CF Container fetch, self-host fetch) are network round-trips.
@@ -76,7 +83,7 @@ function encodeDstHeader(dst: DstCapabilityDescriptor): string {
 export interface RecorderTarget {
   /** Which runtime this is (log/correlation). */
   readonly kind: "cf" | "selfhost" | "none";
-  encode(frame: Uint8Array, meta: FrameMeta): Promise<Uint8Array | null>;
+  encode(frame: Uint8Array, meta: FrameMeta): Promise<EncodeResult | null>;
 }
 
 /** Env keys this seam reads. Optional everywhere — absence degrades to a dropped frame (fail-open). */
@@ -115,11 +122,15 @@ function encodeInit(frame: Uint8Array, meta: FrameMeta): RequestInit {
 }
 
 /** Read the encoded bytes from a `/encode` response, or null on a non-2xx / empty body (fail-open). */
-async function readEncoded(res: Response): Promise<Uint8Array | null> {
+async function readEncoded(res: Response): Promise<EncodeResult | null> {
   if (!res.ok) return null;
   const buf = await res.arrayBuffer();
   if (buf.byteLength === 0) return null;
-  return new Uint8Array(buf);
+  return {
+    bytes: new Uint8Array(buf),
+    outputCodec: String(res.headers.get("x-output-codec") || "vp8").toLowerCase(),
+    outputContainer: String(res.headers.get("x-output-container") || "ivf").toLowerCase(),
+  };
 }
 
 /** Path A — encode via a CF Container fronted by the Worker. `getContainer` is injected for unit testing. */
@@ -132,7 +143,7 @@ export class CfContainerTarget implements RecorderTarget {
     private readonly containerId = "rt-encoder",
   ) {}
 
-  async encode(frame: Uint8Array, meta: FrameMeta): Promise<Uint8Array | null> {
+  async encode(frame: Uint8Array, meta: FrameMeta): Promise<EncodeResult | null> {
     try {
       const container = this.getContainerImpl(this.binding, this.containerId);
       const res = await container.fetch(new Request("http://rt-encoder/encode", encodeInit(frame, meta)));
@@ -154,7 +165,7 @@ export class SelfHostTarget implements RecorderTarget {
     this.fetchImpl = (fetchImpl ?? fetch).bind(globalThis);
   }
 
-  async encode(frame: Uint8Array, meta: FrameMeta): Promise<Uint8Array | null> {
+  async encode(frame: Uint8Array, meta: FrameMeta): Promise<EncodeResult | null> {
     try {
       const res = await this.fetchImpl(`${this.base}/encode`, encodeInit(frame, meta));
       return await readEncoded(res);
@@ -168,7 +179,7 @@ export class SelfHostTarget implements RecorderTarget {
 export class NoneTarget implements RecorderTarget {
   readonly kind = "none" as const;
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  async encode(_frame: Uint8Array, _meta: FrameMeta): Promise<Uint8Array | null> {
+  async encode(_frame: Uint8Array, _meta: FrameMeta): Promise<EncodeResult | null> {
     return null;
   }
 }

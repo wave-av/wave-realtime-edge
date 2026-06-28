@@ -47,9 +47,22 @@ export function negotiationArmed(env: ConsumerCapsEnv): boolean {
   return String(env.NEGOTIATION_ENABLED || "").toLowerCase() === "true";
 }
 
-/** Registry codec names this build treats as the proven recorder output (safe baseline the muxer plays back). */
-const BASELINE_DECODE = ["vp8"] as const;
-/** The recorder's local container transport — the leg between the encoder and the in-isolate muxer/sink. */
+/**
+ * Truthy iff the operator explicitly shaped consumer caps via RT_CONSUMER_DECODE or RT_CONSUMER_TRANSPORTS.
+ * The env-only baseline is NOT walkable by selectLeg (codec ladder + activated transport) — attaching it
+ * when only NEGOTIATION_ENABLED is flipped would 422 every /encode. Explicit overrides are required to wire.
+ */
+export function consumerCapsExplicitlyConfigured(env: ConsumerCapsEnv): boolean {
+  return !!(String(env.RT_CONSUMER_DECODE || "").trim() || String(env.RT_CONSUMER_TRANSPORTS || "").trim());
+}
+
+/**
+ * Registry codec names for the env baseline when RT_CONSUMER_DECODE is unset. Must be a #86 ladder codec
+ * (selectLeg walks av1/hevc/h264 only) — h264 is the proven WebM-compatible fallback the muxer path targets
+ * when the operator explicitly arms consumer overrides alongside RT_CONSUMER_TRANSPORTS.
+ */
+const BASELINE_DECODE = ["h264"] as const;
+/** The recorder's local container transport — listed honestly as inactive until RT_CONSUMER_TRANSPORTS arms it. */
 const BASELINE_TRANSPORT = "moq" as const;
 
 /** Split a CSV env value into a trimmed, de-duped, lowercased token list (empty → []). */
@@ -72,10 +85,9 @@ export function consumerDescriptor(env: ConsumerCapsEnv): DstCapabilityDescripto
   const decodeNames = csv(env.RT_CONSUMER_DECODE);
   const transportNames = csv(env.RT_CONSUMER_TRANSPORTS);
   const decode = (decodeNames.length ? decodeNames : [...BASELINE_DECODE]).map((name) => ({ name, available: true }));
-  const transports = (transportNames.length ? transportNames : [BASELINE_TRANSPORT]).map((protocol) => ({
-    protocol,
-    activated: true,
-  }));
+  const transports = transportNames.length
+    ? transportNames.map((protocol) => ({ protocol, activated: true }))
+    : [{ protocol: BASELINE_TRANSPORT, activated: false }];
   const descriptor: DstCapabilityDescriptor = { decode, transports };
   const region = (env.RT_REGION || "").trim();
   if (region) descriptor.region = region;

@@ -6,7 +6,7 @@
 // The container fetch is mocked exactly as recorder-target.test.ts does (inject fetchImpl; capture headers).
 import { describe, it, expect } from "vitest";
 import { SelfHostTarget, type FrameMeta, type DstCapabilityDescriptor } from "../../src/encoders/recorder-target.js";
-import { consumerDescriptor, negotiationArmed } from "../../src/encoders/consumer-caps.js";
+import { consumerDescriptor, consumerCapsExplicitlyConfigured, negotiationArmed } from "../../src/encoders/consumer-caps.js";
 // Import the REAL server-side parser + selector so the test proves cross-module shape agreement, not a copy.
 import { parseDstDescriptor, negotiateTargetCodec } from "../../containers/rt-encoder/server/negotiate.mjs";
 
@@ -90,13 +90,19 @@ describe("#135 negotiation wiring — flag-ON emits a server-parseable descripto
     expect(result.transport).toBe("moq");
   });
 
-  it("default baseline (no overrides) → VP8-decodable over local transport (safe, server-parseable)", () => {
+  it("default baseline (no overrides) → h264-decodable over inactive local transport (server-parseable)", () => {
     const dst = consumerDescriptor({ NEGOTIATION_ENABLED: "true" });
-    expect(dst.decode).toEqual([{ name: "vp8", available: true }]);
-    expect(dst.transports).toEqual([{ protocol: "moq", activated: true }]);
+    expect(dst.decode).toEqual([{ name: "h264", available: true }]);
+    expect(dst.transports).toEqual([{ protocol: "moq", activated: false }]);
     expect(dst.region).toBeUndefined();
     // Server parser accepts the baseline too.
     const json = parseDstDescriptor(btoa(JSON.stringify(dst)));
     expect(json).toEqual(dst);
+  });
+
+  it("consumerCapsExplicitlyConfigured gates the env baseline off selectLeg until overrides are set", () => {
+    expect(consumerCapsExplicitlyConfigured({ NEGOTIATION_ENABLED: "true" })).toBe(false);
+    expect(consumerCapsExplicitlyConfigured({ NEGOTIATION_ENABLED: "true", RT_CONSUMER_DECODE: "av1" })).toBe(true);
+    expect(consumerCapsExplicitlyConfigured({ NEGOTIATION_ENABLED: "true", RT_CONSUMER_TRANSPORTS: "moq" })).toBe(true);
   });
 });
