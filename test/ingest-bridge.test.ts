@@ -104,6 +104,7 @@ describe("parseIngestStartBody — validate-before-sink", () => {
     expect(parseIngestStartBody({ streamKey: "sk1" })).toEqual({ room: "sk1", inbound: {} });
     expect("error" in parseIngestStartBody({})).toBe(true);
     expect("error" in parseIngestStartBody({ room: "../bad" })).toBe(true);
+    expect("error" in parseIngestStartBody({ room: "srt:r1" })).toBe(true); // ':' is reserved for the namespace separator
   });
 });
 
@@ -152,6 +153,32 @@ describe("handleIngestBridge — control-only dispatch, server-side org", () => 
     const res = await handleIngestBridge("stop", "srt", "org_a", { room: "r1" }, "", "", deps);
     expect(res.status).toBe(200);
     expect(deps.stops).toEqual([{ org: "org_a", protocol: "srt", room: "r1" }]);
+  });
+
+  it("stop CLEARS the pending under the SAME namespaced key markPending stored (no ghost re-dispatch)", async () => {
+    // markPending (start path) keys on the NAMESPACED room ("srt:r1"); a stop carries the RAW room ("r1") and must
+    // clear that same key — else a stopped leg's pending record survives and the cron re-dispatches a dead leg.
+    // Regression for the clearPending key mismatch.
+    const deps = fakeDeps();
+    await handleIngestBridge("stop", "srt", "org_a", { room: "r1" }, "", "", deps);
+    expect(deps.cleared).toEqual([ingestRoomFor("srt", "r1")]); // "srt:r1", NOT the raw "r1"
+  });
+
+  it("stop best-effort (dispatchStop throws) STILL clears the namespaced pending key", async () => {
+    const deps = fakeDeps();
+    deps.dispatchStop = async () => {
+      throw new Error("container gone");
+    };
+    const res = await handleIngestBridge("stop", "srt", "org_a", { room: "r1" }, "", "", deps);
+    expect(res.status).toBe(200);
+    expect(deps.cleared).toEqual([ingestRoomFor("srt", "r1")]);
+  });
+
+  it("rejects a caller-injected namespaced room on stop (':' reserved) → 400, no dispatch", async () => {
+    const deps = fakeDeps();
+    const res = await handleIngestBridge("stop", "srt", "org_a", { room: "srt:r1" }, "", "", deps);
+    expect(res.status).toBe(400);
+    expect(deps.stops).toHaveLength(0);
   });
 
   it("control-only: payload fields are TEXT — never a media stream", async () => {

@@ -80,8 +80,11 @@ export function ingestBridgeEnabled(env: { INGEST_BRIDGE_ENABLED?: string | bool
   return v === true || v === "1" || v === "true";
 }
 
-/** Only safe single path/room segments cross into a DO id / container payload (validate-before-sink). */
-const SAFE_ROOM = /^[A-Za-z0-9_:.-]{1,128}$/;
+/** Only safe single path/room segments cross into a DO id / container payload (validate-before-sink).
+ *  `:` is EXCLUDED — it is the reserved protocol-namespace separator (ingestRoomFor → `${proto}:${room}`);
+ *  allowing it in a caller-supplied room would let a client inject a namespaced room and produce a
+ *  double-namespaced (`srt:srt:r1`) DO id / KV key. */
+const SAFE_ROOM = /^[A-Za-z0-9_.-]{1,128}$/;
 
 /**
  * The inbound endpoint info for one contribution leg — the listener coordinates the per-protocol container
@@ -183,15 +186,19 @@ export async function handleIngestBridge(
     if (!room || !SAFE_ROOM.test(room)) {
       return jsonResponse({ error: "BAD_REQUEST", message: "ingest stop requires a path-safe room" }, 400);
     }
+    // The pending KV key is stored under the NAMESPACED room (markPending uses payload.room === ingestRoomFor(...)),
+    // so clearPending MUST namespace too — else a stopped leg's pending record survives and the cron ghost-redispatches
+    // it. dispatchStop still takes the RAW room (it re-namespaces internally for the DO id, line ~394).
+    const pendingRoom = ingestRoomFor(protocol, room);
     try {
       await deps.dispatchStop(org, protocol, room);
-      await deps.clearPending?.(org, protocol, room).catch(() => {});
+      await deps.clearPending?.(org, protocol, pendingRoom).catch(() => {});
       return jsonResponse({ ok: true, action, protocol, room }, 200);
     } catch (err) {
       if (isNotActivated(err)) return notActivated(protocol);
       deps.log?.("ingest-bridge-stop-failed", { ...base, room, error: String(err) });
       // A stop is best-effort teardown — clear the pending so the cron does not keep re-dispatching a dead leg.
-      await deps.clearPending?.(org, protocol, room).catch(() => {});
+      await deps.clearPending?.(org, protocol, pendingRoom).catch(() => {});
       return jsonResponse({ ok: true, action, protocol, room, note: "stop-best-effort" }, 200);
     }
   }
