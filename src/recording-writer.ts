@@ -100,9 +100,24 @@ export function extFor(c: Container): string {
 /**
  * Build the org-prefixed R2 key for a realtime recording (MUST start with `${org}/` — the per-org
  * isolation + register boundary). One object per session under the org's `realtime-recordings/` prefix.
+ *
+ * E3.P2/P4 (#127): an OPTIONAL `region` inserts a self-describing region segment so a data-residency
+ * recording's objects are namespaced per zone:
+ *   region absent → `${org}/realtime-recordings/${sessionId}/recording.${ext}`            (today, unchanged)
+ *   region set    → `${org}/realtime-recordings/${region}/${sessionId}/recording.${ext}` (residency path)
+ * BOTH forms still start with `${org}/` (the register org-prefix invariant). `region` is ADD-ONLY and
+ * defaults undefined, so every existing call site produces the byte-identical key it did before.
  */
-export function recordingKey(org: string, sessionId: string, container: Container): string {
-  return `${org}/realtime-recordings/${sessionId}/recording.${extFor(container)}`;
+export function recordingKey(
+  org: string,
+  sessionId: string,
+  container: Container,
+  region?: string,
+): string {
+  const ext = extFor(container);
+  return region
+    ? `${org}/realtime-recordings/${region}/${sessionId}/recording.${ext}`
+    : `${org}/realtime-recordings/${sessionId}/recording.${ext}`;
 }
 
 /**
@@ -141,9 +156,12 @@ export class RealtimeRecorder {
     org: string,
     sessionId: string,
     first: Uint8Array,
+    region?: string,
   ): Promise<RealtimeRecorder> {
     const container = sniffWebm(first);
-    const key = recordingKey(org, sessionId, container);
+    // E3.P2/P4 (#127): `region` (a WaveZone, e.g. us-east) is passed ONLY on the residency path and inserts
+    // the region segment into the key; absent → the byte-identical today key. Either way it starts `${org}/`.
+    const key = recordingKey(org, sessionId, container, region);
     const rec = new RealtimeRecorder(bucket, key, container, sessionId);
     rec.upload = await bucket.createMultipartUpload(key);
     await rec.append(first);
