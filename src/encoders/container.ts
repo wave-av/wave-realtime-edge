@@ -29,8 +29,17 @@ import {
 } from "./container-adapter.js";
 import { mintRecorderToken } from "./recorder-auth.js";
 import { selectRecorderTarget, type RecorderTarget, type RecorderTargetEnv } from "./recorder-target.js";
-import { selectSink, type RecordingSinkEnv } from "./recording-sink.js";
+import { selectSink, type RecordingSinkEnv, type LocalFileWriter, type SinkSession } from "./recording-sink.js";
 import { parseIvf } from "./ivf.js";
+
+/**
+ * RT-R10 (#72) — self-host local-writer injection. The Workers isolate has NO filesystem, so this is
+ * `undefined` on the Worker path (→ selectSink degrades localfs/fanout to R2, byte-identical inert). A
+ * self-host runtime (the rt-encoder Node image, when it co-hosts the recorder) injects the real fs-backed
+ * factory from `containers/rt-encoder/server/local-file-writer.mjs` so `RECORDER_SINK=localfs|fanout` lands a
+ * REAL local file under `RECORDER_LOCAL_DIR`. Keeping it an injected fn keeps `node:fs` out of the Worker bundle.
+ */
+export type LocalWriterFactory = (dir: string, session: SinkSession) => LocalFileWriter;
 
 const HEX32 = /^[0-9a-f]{32}$/i;
 
@@ -62,6 +71,11 @@ export interface ContainerEncoderDeps {
   recorderEndpointBase?: string;
   /** create-adapter retry budget (rides out the publish→media race). Default DEFAULT_ADAPTER_RETRY. */
   retry?: AdapterRetry;
+  /**
+   * RT-R10 (#72) — self-host fs writer factory for the localfs/fanout sink. UNDEFINED on the Worker (no fs →
+   * localfs/fanout degrade to R2, inert). A self-host runtime injects the real factory so a local file lands.
+   */
+  localWriterFor?: LocalWriterFactory;
 }
 
 /** Default wss base of the Worker recorder route on the live realtime host (overridable for tests/staging). */
@@ -83,6 +97,7 @@ export class ContainerEncoder implements RecordingEncoder {
   private readonly fetchImpl: FetchLike;
   private readonly recorderBase: string;
   private readonly retry: AdapterRetry;
+  private readonly localWriterFor?: LocalWriterFactory;
   constructor(
     private readonly env: EncoderEnv,
     deps: ContainerEncoderDeps = {},
@@ -92,6 +107,7 @@ export class ContainerEncoder implements RecordingEncoder {
     this.fetchImpl = (deps.fetchImpl ?? fetch).bind(globalThis);
     this.recorderBase = (deps.recorderEndpointBase ?? DEFAULT_RECORDER_ENDPOINT_BASE).replace(/\/+$/, "");
     this.retry = deps.retry ?? DEFAULT_ADAPTER_RETRY;
+    this.localWriterFor = deps.localWriterFor; // undefined on Worker (inert); self-host injects the fs writer
   }
 
   async begin(session: RecordingSession): Promise<EncoderHandle | null> {
@@ -107,7 +123,7 @@ export class ContainerEncoder implements RecordingEncoder {
       );
       return null;
     }
-    return new ContainerHandle(this.env, session, this.fetchImpl, this.recorderBase, this.retry);
+    return new ContainerHandle(this.env, session, this.fetchImpl, this.recorderBase, this.retry, this.localWriterFor);
   }
 }
 
@@ -136,6 +152,8 @@ export class ContainerHandle implements EncoderHandle {
     private readonly fetchImpl: FetchLike,
     private readonly recorderBase: string,
     private readonly retry: AdapterRetry,
+    /** RT-R10 (#72): self-host fs writer factory; undefined on the Worker (localfs/fanout degrade to R2, inert). */
+    private readonly localWriterFor?: LocalWriterFactory,
   ) {
     this.keyPrefix = `${session.org}/realtime-recordings/${session.sessionId}/`;
   }
@@ -180,10 +198,11 @@ export class ContainerHandle implements EncoderHandle {
     // RT-R10 (#72): pick WHERE the bytes land. Default RECORDER_SINK='r2' → R2Sink (today's behavior). In the
     // Worker there is no localWriterFor, so localfs/fanout degrade to R2 (inert); a self-host runtime injects a
     // real writer to fan a local copy. selectSink owns the SKIP/single-writer invariant.
-    const sink = selectSink(this.env as unknown as RecordingSinkEnv, {
-      org: this.session.org,
-      sessionId: this.session.sessionId,
-    });
+    const sink = selectSink(
+      this.env as unknown as RecordingSinkEnv,
+      { org: this.session.org, sessionId: this.session.sessionId },
+      { localWriterFor: this.localWriterFor }, // undefined on Worker → localfs/fanout degrade to R2 (inert)
+    );
     let tap: RawSfuTap;
     let outputCodec: "pcm" | "jpeg";
     if (kind === "video") {

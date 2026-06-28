@@ -363,6 +363,11 @@ export class RawSfuTap {
     return this.sink.key;
   }
 
+  /** RT-R10 (#72): which sink this tap writes to ("r2" | "localfs" | "fanout") — log/correlation + wiring assertions. */
+  get sinkKind(): RecordingSink["kind"] {
+    return this.sink.kind;
+  }
+
   /**
    * Feed ONE raw WS binary frame (one Packet): decode → encode → mux frame → flush when full. Audio
    * (outputCodec "pcm") muxes a video-less audio SimpleBlock. Video (outputCodec "jpeg") routes the decoded
