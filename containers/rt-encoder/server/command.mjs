@@ -7,7 +7,7 @@
 // emitted BYTE-IDENTICAL to the original hardcoded FFMPEG_ARGS. The matrix is purely ADDITIVE: a target
 // codec is selected only when the caller explicitly asks for one (x-target-codec).
 
-import { selectEncoder } from "./select.mjs";
+import { selectEncoder, negotiateCodec } from "./select.mjs";
 
 /**
  * The proven, byte-unchanged DEFAULT commands, keyed by SOURCE codec. Kept here verbatim so the test can
@@ -159,4 +159,63 @@ export function buildCommand({ sourceCodec, targetCodec = null, available = new 
     accel: sel.accel,
     container: sel.container,
   };
+}
+
+// ── #83/#75 AV1-DEFAULT master-encode profile (INERT behind AV1_DEFAULT, default-off) ────────────────
+// Today the DEFAULT path (no x-target-codec) emits jpeg→VP8 byte-identical. #83 makes the master encode
+// profile default to AV1 for ELIGIBLE inputs — mirroring the selectEncodeProfile rules merged in
+// wave-storage-meter PR #48: AV1 only for wave-CONVERTED (not a sacred original), NON-remux, encoder-
+// SUPPORTED inputs; a sacred original keeps its codec; AV1 ALWAYS implies a transcode, never an is_derivable
+// passthrough. This Worker's /encode raw frame sources (jpeg = a live SFU-decoded video frame, pcm = decoded
+// audio) are wave-converted + non-remux + non-sacred BY CONSTRUCTION — the SFU already decoded them — so the
+// VIDEO frame source (jpeg) is eligible; audio (pcm) is untouched (AV1 is a video codec).
+
+/** Truthy iff AV1_DEFAULT is explicitly armed. Default-off: absent/""/"0"/"false"/anything-else → off. */
+export function av1DefaultEnabled(env = {}) {
+  const v = env.AV1_DEFAULT;
+  return v === true || (typeof v === "string" && v !== "" && v !== "0" && v.toLowerCase() !== "false");
+}
+
+/**
+ * The master-encode TARGET codec for a DEFAULT (no explicit x-target-codec) encode, applying the #83
+ * AV1-default profile when AV1_DEFAULT is armed. PURE — derives a target codec only; it spawns nothing and
+ * makes no I/O. INERT by default: AV1_DEFAULT off → returns { target: null } → buildCommand keeps the proven
+ * byte-identical default (jpeg→VP8, pcm→Opus).
+ *
+ * When ARMED:
+ *   - Only the VIDEO frame source (jpeg) is eligible (wave-converted, non-remux, non-sacred). pcm/audio and
+ *     any ENCODED source are NOT defaulted to AV1 (audio is not a video codec; an encoded source already
+ *     requires an explicit target — that path is unchanged).
+ *   - AV1 is chosen ONLY when the host actually has an AV1 encoder available (encoder-supported). We walk the
+ *     #86 scored ladder ["av1","h264"] via negotiateCodec, so when no AV1 encoder is present we get a VISIBLE
+ *     H.264 fallback (target "h264", fallbackReason set) instead of a silent substitution or a hard failure.
+ *   - When neither AV1 nor H.264 has an encoder, we return { target: null } → buildCommand keeps the proven
+ *     VP8 default (never a fabricated codec; the byte-identical floor is always reachable).
+ *
+ * @param {string} sourceCodec        the raw frame source ("jpeg"|"pcm").
+ * @param {Set<string>} available     host encoder names (from capability.parseEncoders).
+ * @param {{AV1_DEFAULT?:string|boolean}} [env]
+ * @returns {{ target: string|null, profile: "av1-default"|"default", fallbackReason?: string }}
+ */
+export function selectEncodeProfile(sourceCodec, available, env = {}) {
+  const src = String(sourceCodec || "").toLowerCase();
+  // INERT / ineligible → the proven default (target:null → buildCommand emits the byte-identical command).
+  if (!av1DefaultEnabled(env) || SOURCE_MEDIA[src] !== "video") {
+    return { target: null, profile: "default" };
+  }
+  const avail = available instanceof Set ? available : new Set(available || []);
+  // Eligible video frame source + armed → prefer AV1, with a VISIBLE H.264 fallback (scored ladder, honest).
+  try {
+    const neg = negotiateCodec("video", ["av1", "h264"], avail);
+    if (neg.codec === "av1") return { target: "av1", profile: "av1-default" };
+    // Demoted off AV1 → surface WHY (av1 had no encoder on this host) so the fallback is observable, not silent.
+    return {
+      target: neg.codec,
+      profile: "av1-default",
+      fallbackReason: `av1 encoder unavailable on host; fell back to ${neg.codec}`,
+    };
+  } catch {
+    // Neither AV1 nor H.264 encodable → keep the proven VP8 default (the byte-identical floor), never fabricate.
+    return { target: null, profile: "default", fallbackReason: "no av1/h264 encoder; kept default vp8" };
+  }
 }

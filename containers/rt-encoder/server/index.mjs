@@ -25,7 +25,7 @@
 // frame). No request logging of payload bytes.
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { buildCommand } from "./command.mjs";
+import { buildCommand, selectEncodeProfile, av1DefaultEnabled } from "./command.mjs";
 import { probeCapability, emptyCapability } from "./capability.mjs";
 import { probeDecoders, emptyDecodeCapability } from "./decode.mjs";
 import { CodecUnavailableError, UnknownCodecError } from "./select.mjs";
@@ -181,6 +181,19 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
+      // ── #83/#75 AV1-DEFAULT master-encode profile (default-OFF) ── When AV1_DEFAULT is armed AND the caller
+      // gave no explicit target (and negotiation did not pick one), default the master encode profile to AV1
+      // for the eligible VIDEO frame source (jpeg). selectEncodeProfile prefers AV1 only when the host has an
+      // AV1 encoder, else surfaces a VISIBLE H.264 fallback reason (header below); when neither is encodable it
+      // keeps target=null → the proven byte-identical VP8 default. OFF/absent → target untouched → unchanged.
+      let av1FallbackReason = null;
+      if (!target && av1DefaultEnabled(process.env)) {
+        const available = (await getCapability()).encoders;
+        const profile = selectEncodeProfile(source, available, process.env);
+        if (profile.target) target = profile.target;
+        if (profile.fallbackReason) av1FallbackReason = profile.fallbackReason;
+      }
+
       let cmd;
       try {
         const available = target ? (await getCapability()).encoders : new Set();
@@ -211,6 +224,10 @@ const server = http.createServer(async (req, res) => {
       // Observability marker: present ONLY when the negotiator drove this encode — the live proof that
       // per-leg negotiation actually ran in a real session (absent on the legacy/default path → no drift).
       if (negTransport) headers["x-negotiated-transport"] = negTransport;
+      // #83 observability: present ONLY when the AV1-default profile demoted off AV1 (no host AV1 encoder) — the
+      // VISIBLE proof of an honest H.264/VP8 fallback rather than a silent substitution. Absent on the AV1-hit
+      // path and on the unchanged default path → no drift.
+      if (av1FallbackReason) headers["x-av1-fallback-reason"] = av1FallbackReason;
       res.writeHead(200, headers);
       res.end(encoded);
       return;
