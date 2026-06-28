@@ -51,6 +51,14 @@ export interface EncoderEnv {
   RECORDER_TARGET?: "cf" | "selfhost" | "none"; // selector; default 'none' → video dropped (inert)
   RECORDER?: unknown; // Path A CF Container binding (typed as DurableObjectNamespace<Container> at the seam)
   RECORDER_SELFHOST_URL?: string; // Path B self-hosted rt-encoder base URL (e.g. https://studio:8080)
+  // ── #135 negotiation wiring (default-OFF). When "true", the recorder /encode leg attaches the consumer
+  // capability descriptor (x-dst-capabilities) so the server negotiates a real leg in a live session. Absent
+  // → off → byte-identical to today. RT_REGION / RT_CONSUMER_DECODE / RT_CONSUMER_TRANSPORTS optionally shape
+  // the sourced descriptor (see src/encoders/consumer-caps.ts); all absence-tolerant. ──
+  NEGOTIATION_ENABLED?: string;
+  RT_REGION?: string;
+  RT_CONSUMER_DECODE?: string;
+  RT_CONSUMER_TRANSPORTS?: string;
 }
 
 export type EncoderKind = "managed" | "container" | "wasm";

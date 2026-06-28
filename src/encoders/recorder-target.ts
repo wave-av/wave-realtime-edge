@@ -23,6 +23,22 @@
 import type { Container } from "@cloudflare/containers";
 import type { VideoEncoder } from "./container-adapter.js";
 
+/**
+ * A consuming end's capability surface (#86/#135) — the EXACT shape the rt-encoder server's negotiate.mjs /
+ * leg-select.mjs already parse out of `x-dst-capabilities` (base64 JSON). Mirror it verbatim — do NOT invent
+ * a new schema. Only the fields the selector reads are modeled: `decode[]` (which codecs the consumer can
+ * decode), `transports[]` (which pipes it speaks + whether activated), and `region` (continent placement for
+ * live legs). All optional/absence-tolerant so an unknown consumer degrades safely.
+ */
+export interface DstCapabilityDescriptor {
+  /** Continent-prefixable region (e.g. "us-east"). Used only for live-leg same-continent placement. */
+  region?: string;
+  /** Codecs the consumer can DECODE — registry codec name + availability (selector reads available:true). */
+  decode?: Array<{ name: string; available: boolean }>;
+  /** Transports the consumer speaks — protocol + whether it is activated on this end. */
+  transports?: Array<{ protocol: string; activated: boolean }>;
+}
+
 /** What an encode needs to know about the frame (mirrors the container's `/encode` headers). */
 export interface FrameMeta {
   /** Media kind — the recorder routes video frames through here; audio is PCM-passthrough in-isolate. */
@@ -31,6 +47,26 @@ export interface FrameMeta {
   ts: number;
   /** SOURCE codec the bytes are in: "jpeg" (video) | "pcm" (audio). The container transcodes jpeg→vp8 / pcm→opus. */
   codec: "jpeg" | "pcm";
+  /**
+   * #135 negotiation wiring (default-OFF). The CONSUMER's capability descriptor for THIS leg. Attached as the
+   * `x-dst-capabilities` header ONLY when `negotiate` is true (NEGOTIATION_ENABLED on the caller side). When
+   * `negotiate` is false/absent the header is NEVER sent → the `/encode` request is byte-identical to today,
+   * even if a descriptor is present. Honest-fail: a present descriptor with the flag ON drives a real
+   * server-side leg selection (→ x-negotiated-transport, or 422 + x-negotiation-reason on an unsatisfiable leg).
+   */
+  dst?: DstCapabilityDescriptor;
+  /** #135: opt-in gate. True only when the operator has armed NEGOTIATION_ENABLED. Default-off → header omitted. */
+  negotiate?: boolean;
+  /** #135: live-leg hint → server enforces same-continent region placement. Only emitted when `negotiate`. */
+  live?: boolean;
+}
+
+/**
+ * Base64-encode the dst descriptor exactly as the server's parseDstDescriptor expects (base64 of the JSON).
+ * `btoa` is present in the Workers runtime AND in the self-host Node runtime (Node ≥16 globalThis.btoa).
+ */
+function encodeDstHeader(dst: DstCapabilityDescriptor): string {
+  return btoa(JSON.stringify(dst));
 }
 
 /**
@@ -57,14 +93,23 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 /** Build the `/encode` request init (headers + raw body) shared by the cf + selfhost targets. */
 function encodeInit(frame: Uint8Array, meta: FrameMeta): RequestInit {
+  const headers: Record<string, string> = {
+    "content-type": "application/octet-stream",
+    "x-kind": meta.kind,
+    "x-ts": String(Math.max(0, Math.floor(meta.ts))),
+    "x-codec": meta.codec,
+  };
+  // #135 NEGOTIATION WIRING (default-OFF). Attach the consumer descriptor ONLY when the operator armed
+  // negotiation AND a real descriptor was sourced. Flag OFF (or no descriptor) → emit NOTHING new → this
+  // request is byte-identical to the proven path. The server stamps x-negotiated-transport on success, or
+  // 422 + x-negotiation-reason on an unsatisfiable leg (read by the fail-open caller as a dropped frame).
+  if (meta.negotiate && meta.dst) {
+    headers["x-dst-capabilities"] = encodeDstHeader(meta.dst);
+    if (meta.live) headers["x-live"] = "1";
+  }
   return {
     method: "POST",
-    headers: {
-      "content-type": "application/octet-stream",
-      "x-kind": meta.kind,
-      "x-ts": String(Math.max(0, Math.floor(meta.ts))),
-      "x-codec": meta.codec,
-    },
+    headers,
     body: frame as unknown as BodyInit,
   };
 }

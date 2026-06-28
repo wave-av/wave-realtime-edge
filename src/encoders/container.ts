@@ -29,6 +29,7 @@ import {
 } from "./container-adapter.js";
 import { mintRecorderToken } from "./recorder-auth.js";
 import { selectRecorderTarget, type RecorderTarget, type RecorderTargetEnv } from "./recorder-target.js";
+import { consumerDescriptor, negotiationArmed, type ConsumerCapsEnv } from "./consumer-caps.js";
 import { selectSink, type RecordingSinkEnv, type LocalFileWriter, type SinkSession } from "./recording-sink.js";
 import { parseIvf } from "./ivf.js";
 
@@ -173,11 +174,17 @@ export class ContainerHandle implements EncoderHandle {
    * JPEG → encode → IVF → raw VP8 frames (keyframe flags from the VP8 header; see ivf.ts). Fail-open: a null
    * encode (NoneTarget / fetch error / non-2xx) or a non-IVF body resolves to [] → the muxer drops that frame.
    */
-  private static videoEncoderFromTarget(target: RecorderTarget): AsyncVideoEncoder {
+  private static videoEncoderFromTarget(target: RecorderTarget, env: ConsumerCapsEnv): AsyncVideoEncoder {
+    // #135 NEGOTIATION WIRING (default-OFF). Source the recording consumer's capability descriptor ONCE per
+    // tap and gate it behind NEGOTIATION_ENABLED. Flag OFF → `negotiate:false` → encodeInit attaches NO
+    // x-dst-capabilities header → the /encode request is byte-identical to today. Flag ON → the descriptor
+    // rides every frame so the server's selectLeg negotiates a real leg (→ x-negotiated-transport / 422).
+    const negotiate = negotiationArmed(env);
+    const dst = negotiate ? consumerDescriptor(env) : undefined;
     return {
       codec: "vp8",
       async encode(jpeg: Uint8Array) {
-        const ivf = await target.encode(jpeg, { kind: "video", ts: 0, codec: "jpeg" });
+        const ivf = await target.encode(jpeg, { kind: "video", ts: 0, codec: "jpeg", negotiate, dst });
         if (!ivf || ivf.length === 0) return [];
         return parseIvf(ivf).map((f) => ({ data: f.data, keyframe: f.keyframe }));
       },
@@ -214,7 +221,7 @@ export class ContainerHandle implements EncoderHandle {
         target,
         sink,
         outputCodec,
-        asyncVideoEncoder: ContainerHandle.videoEncoderFromTarget(recorderTarget),
+        asyncVideoEncoder: ContainerHandle.videoEncoderFromTarget(recorderTarget, this.env as unknown as ConsumerCapsEnv),
       });
     } else {
       outputCodec = "pcm";
