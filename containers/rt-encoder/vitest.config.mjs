@@ -9,5 +9,8 @@ export default defineConfig({
     environment: "node",
     root: new URL(".", import.meta.url).pathname,
     include: ["test/**/*.test.mjs"],
+    // Tier-2 cross-codec tests shell out to real ffmpeg/ffprobe (multiple transcodes per test); the 5s
+    // default is too tight on a loaded box. Tier-1 (pure argv) tests are unaffected — they finish in ms.
+    testTimeout: 60_000,
   },
 });

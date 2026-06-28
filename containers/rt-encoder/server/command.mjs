@@ -26,11 +26,12 @@ export const DEFAULT_FFMPEG_ARGS = Object.freeze({
 // Two source classes (#86 capability negotiation — "any flavor each end", the SOURCE leg):
 //   • RAW frame sources (jpeg/pcm) — what the SFU Worker POSTs (decoded frames). These have a DEFAULT
 //     transcode (see DEFAULT_FFMPEG_ARGS) and are byte-unchanged from the original hardcoded path.
-//   • ENCODED elementary sources (h264/vp8/vp9/av1/opus/aac) — an already-compressed stream from an
-//     ingest leg (#91) or a peer publishing a codec our dest doesn't speak. ffmpeg DECODES these and
-//     re-ENCODES to the requested target. They have NO default — a target codec is REQUIRED (cross-codec
-//     negotiation is the whole point; we never silently re-emit the source codec). The chosen elementary
-//     demuxers mirror the proven matrix: H.264 Annex-B (`h264`), VP8/VP9/AV1 in IVF, Opus/AAC in Ogg/ADTS.
+//   • ENCODED elementary sources (h264/vp8/vp9/av1 video; opus/aac/mp3/vorbis/flac audio) — an already-
+//     compressed stream from an ingest leg (#91) or a peer publishing a codec our dest doesn't speak.
+//     ffmpeg DECODES these and re-ENCODES to the requested target. They have NO default — a target codec
+//     is REQUIRED (cross-codec negotiation is the whole point; we never silently re-emit the source
+//     codec). The chosen elementary demuxers mirror the proven matrix: H.264 Annex-B (`h264`), VP8/VP9/AV1
+//     in IVF; for AUDIO (#86 P3, the audio matrix) Opus/Vorbis in Ogg, AAC in ADTS, MP3 raw, FLAC native.
 const SOURCE_INPUT_ARGS = Object.freeze({
   // raw frame sources (SFU transport)
   jpeg: ["-f", "mjpeg", "-i", "-"],
@@ -40,16 +41,20 @@ const SOURCE_INPUT_ARGS = Object.freeze({
   vp8: ["-f", "ivf", "-i", "-"],
   vp9: ["-f", "ivf", "-i", "-"],
   av1: ["-f", "ivf", "-i", "-"],
-  // encoded elementary audio sources
+  // encoded elementary audio sources (#86 P3 — full per-leg audio matrix). Opus & Vorbis ride in Ogg;
+  // AAC arrives as an ADTS elementary stream; MP3 is its own demuxer; FLAC uses the native flac demuxer.
   opus: ["-f", "ogg", "-i", "-"],
   aac: ["-f", "aac", "-i", "-"],
+  mp3: ["-f", "mp3", "-i", "-"],
+  vorbis: ["-f", "ogg", "-i", "-"],
+  flac: ["-f", "flac", "-i", "-"],
 });
 
 /** Source-codec → media kind. video frame (jpeg) / encoded video vs audio (pcm) / encoded audio. */
 const SOURCE_MEDIA = Object.freeze({
   jpeg: "video", pcm: "audio",
   h264: "video", vp8: "video", vp9: "video", av1: "video",
-  opus: "audio", aac: "audio",
+  opus: "audio", aac: "audio", mp3: "audio", vorbis: "audio", flac: "audio",
 });
 
 /**
@@ -106,7 +111,7 @@ export function buildCommand({ sourceCodec, targetCodec = null, available = new 
   const inputArgs = SOURCE_INPUT_ARGS[src];
   if (!inputArgs) {
     throw new Error(
-      `unsupported source codec: ${src} (expected jpeg|pcm|h264|vp8|vp9|av1|opus|aac)`,
+      `unsupported source codec: ${src} (expected jpeg|pcm|h264|vp8|vp9|av1|opus|aac|mp3|vorbis|flac)`,
     );
   }
   const media = SOURCE_MEDIA[src];
