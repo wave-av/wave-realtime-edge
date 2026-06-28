@@ -30,6 +30,14 @@ import { handleWhip, whipIngestEnabled, type WhipEnv } from "./whip";
 // B1 (#91-a) — CF Stream Live → SFU bridge CONTROL PLANE. INERT behind STREAM_BRIDGE_ENABLED. worker.ts only
 // DELEGATES; all matching/auth/dispatch lives in src/stream-bridge.ts (+ cf-stream-bridge-frozen-contract).
 import { maybeHandleStreamBridge, scheduledStreamReconcile } from "./stream-bridge";
+// F (#55) — Direct (Plane-2) any-protocol ingest → SFU bridge CONTROL PLANE. INERT behind INGEST_BRIDGE_ENABLED
+// + per-protocol container binding. worker.ts only DELEGATES; matching/auth/dispatch lives in src/ingest-bridge.ts
+// (+ any-protocol-ingest-frozen-contract). Sibling of the Plane-1 cf-stream bridge; gateway-forwarded start trigger.
+import {
+	maybeHandleIngestBridge,
+	scheduledIngestReconcile,
+	type IngestBridgeRuntimeEnv,
+} from "./ingest-bridge";
 // Task #81 (LK-rip Phase 6b) — voice-agent runtime. INERT behind VOICE_AGENT_PROVIDER==="wave": every new
 // route/DO behavior is gated by voiceAgentEnabled(env); absent/anything-else → the 501 catch-all is unchanged.
 import { voiceAgentEnabled, type AgentSessionConfig } from "./agent-session";
@@ -48,6 +56,15 @@ export { RoomDO } from "./room";
 // a Jake-named ◆); exported here so the class is in scope when the ◆ uncomments the binding.
 export { RecorderContainer } from "./encoders/recorder-container";
 export { StreamBridgeContainer } from "./stream-bridge-container"; // #91 B2 — inert (binding COMMENTED until ◆)
+// F (#55) — per-protocol Plane-2 direct-ingest republisher container classes. INERT: each [[containers]] +
+// [[durable_objects.bindings]] block stays COMMENTED in wrangler.toml until that leg's ◆ go-live. Exporting the
+// classes costs nothing at rest — a class only becomes a live container when its binding + image are provisioned.
+export {
+	SrtBridgeContainer,
+	RistBridgeContainer,
+	RtmpsBridgeContainer,
+	MoqBridgeContainer,
+} from "./ingest-bridge-container";
 
 // Task #81 — the per-room voice-agent session Durable Object. Exported from the main module so the
 // AGENT_SESSION binding + migration resolve on deploy. INERT unless VOICE_AGENT_PROVIDER==="wave".
@@ -62,7 +79,11 @@ interface RoomNamespace {
 // Env extends EncoderEnv so the recording adapter's config (CF_ACCOUNT_ID/CF_API_TOKEN/RTK_APP_ID +
 // RT_RECORD/RT_ENCODER/RT_RECORDINGS + the pull-mode RT_MEETING_ORG meetingId→org KV) flows straight from the
 // worker env into selectEncoder()/pullRecordingConfigured()/the webhook pull sink with no re-mapping.
-interface Env extends EncoderEnv, ResidencySinkEnv {
+interface Env extends EncoderEnv, ResidencySinkEnv, IngestBridgeRuntimeEnv {
+	// F (#55) Plane-2 direct-ingest control plane — INERT behind INGEST_BRIDGE_ENABLED ([vars], default off) +
+	// per-protocol container bindings (SRT_BRIDGE/RIST_BRIDGE/RTMPS_BRIDGE/MOQ_BRIDGE, all COMMENTED until each
+	// leg's ◆). Off/absent → /v1/ingest/{proto}/session falls through to the 501 catch-all, UNCHANGED. The flag,
+	// bindings, WHIP endpoint, and bridge key REF fields all come from IngestBridgeRuntimeEnv (src/ingest-bridge.ts).
 	WAVE_INTERNAL_SECRET?: string; // wrangler SECRET — when set, ONLY the gateway (x-wave-internal) may /rtk/* AND /v1/realtime/*
 	// B3 (#98) WHIP v1 ingest flag ([vars], default off). Falsy/absent → the /v1/whip/* surface is inert and
 	// the 501 catch-all is unchanged. Truthy ("1"/"true") → the WHIP listener (src/whip.ts) handles /v1/whip/*.
@@ -656,6 +677,12 @@ export default {
 		const sbRes = await maybeHandleStreamBridge(request, env, ctx);
 		if (sbRes) return sbRes;
 
+		// ── F (#55) Plane-2 direct any-protocol ingest → SFU bridge — POST /v1/ingest/{proto}/session +
+		// DELETE /v1/ingest/{proto}/session/{room}. INERT behind INGEST_BRIDGE_ENABLED (null → 501 catch-all).
+		// Gateway-forwarded (gatewayGate + x-wave-org server-side); binding-absent → typed *_BRIDGE_NOT_ACTIVATED 501. ──
+		const ibRes = await maybeHandleIngestBridge(request, env, gatewayGate, SAFE_ORG);
+		if (ibRes) return ibRes;
+
 		// ── Task #81 voice-agent runtime (LK-rip Phase 6b) — INERT unless VOICE_AGENT_PROVIDER==="wave" ──
 		// When the flag is off, BOTH blocks below are skipped and the request falls through to the 501 catch-all,
 		// UNCHANGED. When on, the SAME gateway-trust chokepoint as every paid route gates dispatch; the egress WS
@@ -795,5 +822,7 @@ export default {
 		}
 		// B1 (#91-a) — CF Stream bridge lifecycle-poll backstop (INERT unless enabled + KV bound). Best-effort.
 		scheduledStreamReconcile(env, ctx);
+		// F (#55) — Plane-2 ingest-bridge pending-start reconcile backstop (INERT unless enabled + KV bound). Best-effort.
+		scheduledIngestReconcile(env, ctx);
 	},
 };
