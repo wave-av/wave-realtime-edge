@@ -6,7 +6,7 @@
 
 **Architecture:** WSC mints a short-lived, room+role-scoped WAVE Room Token (WRT = a JWT signed HS256 with an HKDF-per-org key derived from one WAVE master secret). The gateway verifies WRTs (re-deriving the org key from the master), constrains them to their one room, stamps `x-wave-org`/`x-wave-role`, and forwards through the existing realtime path. The edge RoomDO enforces an `AdmissionPolicy` (knock/auto per room type) + a waiting room + universal safety ops (lock/eject/ban/capacity).
 
-**Tech Stack:** Cloudflare Workers + Durable Objects (TypeScript), `jose` for JWS, WebCrypto `crypto.subtle` HKDF, vitest. Repos: `wave-gateway`, `wave-realtime-edge`, `wave-surfer-connect`.
+**Tech Stack:** Cloudflare Workers + Durable Objects (TypeScript), `jose` for JWS, WebCrypto `crypto.subtle` HKDF, vitest. Repos: `gateway`, `wave-realtime-edge`, `connect`.
 
 **Spec:** `wave-realtime-edge/docs/superpowers/specs/2026-06-19-wave-rooms-guest-access-security-design.md` (APPROVED 2026-06-19).
 
@@ -14,7 +14,7 @@
 
 ## File structure
 
-**`wave-gateway`** (branch from `origin/main` — prod-critical; trust `gh api`, local main is stale)
+**`gateway`** (branch from `origin/main` — prod-critical; trust `gh api`, local main is stale)
 - Create `src/wrt.ts` — pure WRT verify + HKDF org-key derivation (canonical algorithm; the SSOT).
 - Create `test/wrt.spec.ts` — known-answer vectors + tamper/expiry/cross-org/revocation.
 - Modify `src/worker.ts` — WRT credential branch in `handleRequest` (before x402 fallthrough); `POST /v1/realtime/room-keys` handler.
@@ -28,7 +28,7 @@
 - Modify `src/worker.ts` — read `x-wave-role`, pass `role` + room `type` in the DO ctx.
 - Modify/extend `test/room.test.ts`, `test/signaling.test.ts`, `test/worker.sfu.test.ts`.
 
-**`wave-surfer-connect`** (branch → `staging`; `git -c core.hooksPath=/dev/null`)
+**`connect`** (branch → `staging`; `git -c core.hooksPath=/dev/null`)
 - Create `src/services/realtime/wrt/WrtMintService.ts` — mint a WRT (HKDF org key via cached provisioning) — mirrors `wrt.ts` algorithm.
 - Create `app/api/realtime/guest-token/route.ts` — authed guest-token endpoint (Supabase-authed host decides role/grants).
 - Tests alongside. (Guest room PAGE/UI = design-agent lane, out of this plan.)
@@ -39,7 +39,7 @@
 
 ### Task 1: HKDF per-org key derivation
 
-**Files:** Create `wave-gateway/src/wrt.ts`; Test `wave-gateway/test/wrt.spec.ts`
+**Files:** Create `gateway/src/wrt.ts`; Test `gateway/test/wrt.spec.ts`
 
 - [ ] **Step 1: Failing test** — deterministic derivation + isolation
 
@@ -92,7 +92,7 @@ export async function deriveOrgKey(master: string, org: string): Promise<Uint8Ar
 
 ### Task 2: WRT verify (claims + signature + room binding)
 
-**Files:** Modify `wave-gateway/src/wrt.ts`, `wave-gateway/test/wrt.spec.ts`. Add dep `jose`.
+**Files:** Modify `gateway/src/wrt.ts`, `gateway/test/wrt.spec.ts`. Add dep `jose`.
 
 - [ ] **Step 1: Failing test**
 
@@ -190,7 +190,7 @@ export async function verifyWrt(
 
 ### Task 3: Accept a WRT as an alternative credential on room routes
 
-**Files:** Modify `wave-gateway/src/worker.ts` (the `auth`/`who` block ~lines 560-578), `wave-gateway/test/realtime.spec.ts`
+**Files:** Modify `gateway/src/worker.ts` (the `auth`/`who` block ~lines 560-578), `gateway/test/realtime.spec.ts`
 
 Integration: after `validateKey` fails and BEFORE the x402 fallthrough, if the route is an SFU room route AND a bearer is present, try `verifyWrt`. On success, synthesize a room-constrained principal so the existing scope/meter/forward path runs unchanged (usage meters against the token's org — the customer pays for their guests).
 
@@ -252,7 +252,7 @@ it("a WRT for room r1 is rejected on room r2 (room binding)", async () => {
 
 ### Task 4: Stamp `x-wave-role` on the realtime forward
 
-**Files:** Modify `wave-gateway/src/worker.ts` (attribution map ~line 630), `wave-gateway/src/realtime.ts`, `test/realtime.spec.ts`
+**Files:** Modify `gateway/src/worker.ts` (attribution map ~line 630), `gateway/src/realtime.ts`, `test/realtime.spec.ts`
 
 - [ ] **Step 1: Failing test** — assert the forwarded headers include `x-wave-role` equal to the token role.
 - [ ] **Step 2: Run** → FAIL.
@@ -274,7 +274,7 @@ Ensure `forward()` passes `attribution` through for realtime targets (it already
 
 ### Task 5: `POST /v1/realtime/room-keys`
 
-**Files:** Modify `wave-gateway/src/worker.ts`, `wave-gateway/src/scopes.ts`, `test/realtime.spec.ts`
+**Files:** Modify `gateway/src/worker.ts`, `gateway/src/scopes.ts`, `test/realtime.spec.ts`
 
 Authed with a WAVE key (`realtime:write`). Returns the caller-org's current derived signing key (base64url) + `kid` so WSC can mint locally.
 
@@ -302,7 +302,7 @@ And in `scopes.ts` add the native group entry mapping `POST /v1/realtime/room-ke
 
 ### Task 6: `isWrtRevoked` + eject/ban writes (KV-backed)
 
-**Files:** Modify `wave-gateway/src/wrt.ts` (or new `src/wrt-revocation.ts`), `test/wrt.spec.ts`, `wrangler` KV binding `WRT_REVOCATION`.
+**Files:** Modify `gateway/src/wrt.ts` (or new `src/wrt-revocation.ts`), `test/wrt.spec.ts`, `wrangler` KV binding `WRT_REVOCATION`.
 
 - [ ] **Step 1: Failing test** — a `jti` written to the revocation KV → `isWrtRevoked` true; an `org:room` "lock" marker → all jti for that room revoked.
 - [ ] **Step 2: Run** → FAIL.
@@ -366,16 +366,16 @@ const POLICY_DEFAULTS: Record<RoomType, AdmissionPolicy> = {
 
 ### Task 10: `WrtMintService`
 
-**Files:** Create `wave-surfer-connect/src/services/realtime/wrt/WrtMintService.ts` + test. Branch → `staging`, `git -c core.hooksPath=/dev/null`.
+**Files:** Create `connect/src/services/realtime/wrt/WrtMintService.ts` + test. Branch → `staging`, `git -c core.hooksPath=/dev/null`.
 
 - [ ] **Step 1: Failing test** — mints a WRT that `verifyWrt` (same algorithm) accepts; role/grants/ttl honored; org from the caller's WSC org.
-- [ ] **Step 2: Implement** — fetch the org key once from `${WAVE_GATEWAY_URL}/v1/realtime/room-keys` (Bearer `WAVE_GATEWAY_SECRET`), cache it; sign a `jose` HS256 JWT with the spec's claims. `ServiceResult<T>`, `traceExternalAPI('wave-gateway','room-keys.fetch')`, circuit breaker. No mock data.
+- [ ] **Step 2: Implement** — fetch the org key once from `${WAVE_GATEWAY_URL}/v1/realtime/room-keys` (Bearer `WAVE_GATEWAY_SECRET`), cache it; sign a `jose` HS256 JWT with the spec's claims. `ServiceResult<T>`, `traceExternalAPI('gateway','room-keys.fetch')`, circuit breaker. No mock data.
 - [ ] **Step 3: Run** → PASS.
 - [ ] **Step 4: Commit**
 
 ### Task 11: `POST /api/realtime/guest-token`
 
-**Files:** Create `wave-surfer-connect/app/api/realtime/guest-token/route.ts` + test.
+**Files:** Create `connect/app/api/realtime/guest-token/route.ts` + test.
 
 - [ ] **Step 1: Failing test** — Supabase-authed host can mint a guest token for a room they own (org check via `organization_members`); unauth → 401; role capped by the host's grant.
 - [ ] **Step 2: Implement** — mirror `app/api/livekit/token/route.ts` structure (auth, org-access check, `withRateLimit`, `traceExternalAPI`), call `WrtMintService`. Return `{ token, room, expiresAt, wsUrl: realtime gateway base }`.

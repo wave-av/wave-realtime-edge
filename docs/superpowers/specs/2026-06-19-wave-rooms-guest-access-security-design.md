@@ -3,7 +3,7 @@
 **Date:** 2026-06-19
 **Status:** DESIGN — awaiting Jake review before writing-plans
 **Epic:** #30 LiveKit rip (better-not-1:1). Foundational sub-project of the WAVE-native room plane.
-**Repos touched:** `wave-gateway` (token mint + verify), `wave-realtime-edge` (SignalContext + admission + safety ops in RoomDO), `wave-surfer-connect` (WSC mints, hosts the guest room page).
+**Repos touched:** `gateway` (token mint + verify), `wave-realtime-edge` (SignalContext + admission + safety ops in RoomDO), `connect` (WSC mints, hosts the guest room page).
 
 ---
 
