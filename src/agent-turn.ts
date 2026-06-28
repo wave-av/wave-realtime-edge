@@ -159,6 +159,9 @@ export const DEFAULT_TTS_LEAD_MS = 150;
 
 /** pcm_48000 STEREO interleaved (the synthesize() output): 48 kHz · 2 ch · 2 bytes = 192 bytes per millisecond. */
 const TTS_BYTES_PER_MS = (48_000 * 2 * 2) / 1000;
+/** Bytes per RTP 48 kHz timestamp tick: one stereo sample frame = 2 ch · 2 bytes = 4 bytes. The ingest Packet
+ *  timestamp is the per-channel 48 kHz sample index, so ticks = byteOffset / 4 (#34 barge-in tail fix). */
+const TTS_BYTES_PER_TS_TICK = 2 * 2;
 
 /** Resolve the TTS pacing lead from env (AGENT_TTS_LEAD_MS), clamped to ≥0; falls back to the default. Pure. */
 export function ttsLeadMsFromEnv(env: { AGENT_TTS_LEAD_MS?: string | number }): number {
@@ -434,6 +437,14 @@ export class TurnTakingCore {
     const delay = this.deps.delay ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
     let playoutStartMs = 0;
     let sentMs = 0;
+    // #34 barge-in tail: monotonic 48 kHz RTP timestamp (per-channel sample index). The ingest protocol is a
+    // proto3 Packet{seq,ts,payload} — it has NO flush/control field, so the SFU playout buffer cannot be flushed
+    // out-of-band on abort. The keystone is therefore to make the SFU pace by the MEDIA CLOCK: with a real,
+    // monotonic timestamp the SFU buffer-mode pull emits in lockstep with the timeline and never runs ahead, so
+    // when bargeIn() stops the send the SFU has ~one frame buffered (not an undefined backlog). Sending ts=0 on
+    // every frame (the prior placeholder) left the pacing to the SFU's own cadence — the deep buffer that drained
+    // as the ~700 ms post-abort tail. ts is the START-of-chunk sample index (first frame ts=0, then byteOffset/4).
+    let tsTicks = 0;
     for await (const pcm of this.deps.synthesize(text)) {
       if (this.aborted) return -1; // barge-in: stop publishing the now-stale reply mid-stream
       if (!sock || pcm.length === 0) continue;
@@ -448,12 +459,11 @@ export class TurnTakingCore {
           }
         }
         const seq = this.outSeq++;
-        // timestamp 0: a real source timeline lands with the live ingest wiring slice; the contract field is
-        // present + monotonic-by-seq. (proven-live-or-not-done: not claiming a real media timeline yet.)
-        const wire = encodeIngestFrame(chunk, { sequenceNumber: seq, timestamp: 0 }, this.framing);
+        const wire = encodeIngestFrame(chunk, { sequenceNumber: seq, timestamp: tsTicks }, this.framing);
         sock.send(wire);
         pcmBytesOut += chunk.length;
         sentMs += chunk.length / TTS_BYTES_PER_MS;
+        tsTicks += Math.floor(chunk.length / TTS_BYTES_PER_TS_TICK); // advance the media clock by this chunk's samples
       }
     }
     return pcmBytesOut;
