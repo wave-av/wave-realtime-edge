@@ -7,7 +7,7 @@
  *   POST ${WAVE_GATEWAY_ORIGIN}/v1/internal/recordings/register
  *   Authorization: Bearer ${WAVE_SERVICE_TOKEN}
  * so the object is registered in iso_recordings (resolve/clips/VOD can find it) AND the gateway enforces
- * residency (zone↔bucket). The contract (wave-gateway src/recordings.ts handleRecordingsRegister):
+ * residency (zone↔bucket). The contract (the gateway's recordings.ts handleRecordingsRegister):
  *   • principal.org — MUST be a UUID (the org the row is written under).
  *   • r2Key         — MUST start with `${org}/` (storage-side tenant boundary).
  *   • bucket        — where the bytes live; MUST be gateway-allow-listed (REGISTRY_BUCKETS / RESIDENCY_BUCKETS).

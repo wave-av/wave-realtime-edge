@@ -2,12 +2,12 @@
 /**
  * E3.P2/P4 (#127) — data-residency resolver for the realtime/SFU recorder. PURE + INERT.
  *
- * This is the realtime-edge mirror of the LIVE gateway residency contract (wave-gateway src/region.ts +
+ * This is the realtime-edge mirror of the LIVE gateway residency contract (the gateway's region.ts +
  * src/residency.ts + the register endpoint in src/recordings.ts). The gateway is the ENFORCEMENT point;
  * this module exists so the recorder can pre-compute a residency-CONSISTENT (zone, bucket) pair so that a
  * correct register() call NEVER 403s `residency_bucket_mismatch`.
  *
- * Why a local mirror instead of a cross-repo import: wave-realtime-edge does not depend on wave-gateway,
+ * Why a local mirror instead of a cross-repo import: wave-realtime-edge does not depend on the gateway repo,
  * and the registries-consolidated law forbids a second authoritative SSOT — so we DELIBERATELY mirror only
  * the enam/eu subset this recorder can produce (the two continents the zone resolver maps), nothing more.
  * Every other continent falls back to the NON-residency default path (recordingKey + RT_RECORDINGS), so no
@@ -19,7 +19,7 @@
  * WaveZone string (not a jurisdiction) and locally resolve the SAME bucket the gateway will, so the two
  * agree by construction.
  *
- * Live gateway config this mirrors (wave-gateway wrangler.toml, 2026-06-27):
+ * Live gateway config this mirrors (the gateway wrangler.toml, 2026-06-27):
  *   RESIDENCY_BUCKETS = "enam=wave-recordings-enam,eu=wave-recordings-eu"
  *   (region.ts: us-east→enam, eu-west→eu).
  */
