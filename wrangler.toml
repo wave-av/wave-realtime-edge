@@ -79,6 +79,14 @@ WHIP_INGEST_ENABLED = "1"
 # ◆ ARMED "1" (#48 go-live, Jake-named 2026-06-26).
 STREAM_BRIDGE_ENABLED = "1"
 
+# ── #82/#114 CASCADE multi-region relay (RT_CASCADE). INERT by default. ──
+# Absent/"0"/"false" → the realtime room path is byte-identical to today: a join routes to the PRIMARY Room
+# DO `idFromName(org:room)` with NO locationHint and NO regional relay. Set RT_CASCADE="1" → a regional join
+# is placed on its nearest-HEALTHY region's relay DO (a strict-suffix `org:room:region` key) via
+# ROOM.get(id,{locationHint}); resolver = src/cascade.ts (PURE), glue = src/cascade-sink.ts. Each per-region
+# relay/recorder spawn is a Jake-named ◆ crossing (cascade ADR §◆) — NOT a blanket global flip.
+# RT_CASCADE = "1"
+
 # ── Task #81 (LK-rip Phase 6b) — Voice-Agent runtime provider flag. DEFAULT OFF / FULLY INERT. ──
 # Absent/anything-but-"wave" → the /v1/realtime/agents/* dispatch + egress routes are skipped entirely
 # (voiceAgentEnabled(env)=false) and a request falls through to the honest 501 catch-all — UNCHANGED. Setting

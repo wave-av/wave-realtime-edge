@@ -13,17 +13,20 @@ import {
 } from "./rtk-webhook";
 import { type IngestBridgeRuntimeEnv } from "./ingest-bridge";
 import { buildResidencyDeps, residencyEnabled, type ResidencySinkEnv } from "./residency-sink";
+import { type CascadeSinkEnv } from "./cascade-sink";
 
-/** Minimal Durable Object namespace shape (avoids a hard dependency on cloudflare:workers types). */
+/** Minimal Durable Object namespace shape (avoids a hard dependency on cloudflare:workers types).
+ *  `get` accepts the optional `{ locationHint }` CF supports so the cascade path (#82, RT_CASCADE) can place
+ *  a regional relay DO in its region; the option is ignored on the primary path (today's behavior unchanged). */
 interface RoomNamespace {
 	idFromName(name: string): unknown;
-	get(id: unknown): { fetch(request: Request): Promise<Response> };
+	get(id: unknown, options?: { locationHint?: DurableObjectLocationHint }): { fetch(request: Request): Promise<Response> };
 }
 
 // Env extends EncoderEnv so the recording adapter's config (CF_ACCOUNT_ID/CF_API_TOKEN/RTK_APP_ID +
 // RT_RECORD/RT_ENCODER/RT_RECORDINGS + the pull-mode RT_MEETING_ORG meetingId→org KV) flows straight from the
 // worker env into selectEncoder()/pullRecordingConfigured()/the webhook pull sink with no re-mapping.
-export interface Env extends EncoderEnv, ResidencySinkEnv, IngestBridgeRuntimeEnv {
+export interface Env extends EncoderEnv, ResidencySinkEnv, IngestBridgeRuntimeEnv, CascadeSinkEnv {
 	// F (#55) Plane-2 direct-ingest control plane — INERT behind INGEST_BRIDGE_ENABLED ([vars], default off) +
 	// per-protocol container bindings (SRT_BRIDGE/RIST_BRIDGE/RTMPS_BRIDGE/MOQ_BRIDGE, all COMMENTED until each
 	// leg's ◆). Off/absent → /v1/ingest/{proto}/session falls through to the 501 catch-all, UNCHANGED. The flag,
