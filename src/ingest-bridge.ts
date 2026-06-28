@@ -17,7 +17,7 @@
  *   gateway DELETE /v1/ingest/{proto}/session/{room} → edge → container /stop
  *
  * MEDIA NEVER ON THE WORKER (frozen invariant #2, contract §9.2): every byte of the contribution feed
- * terminates IN the per-protocol Container (the wave-transports engine decodes/re-encodes there) and at the
+ * terminates IN the per-protocol Container (the transport engine decodes/re-encodes there) and at the
  * SFU. This module relays ONLY JSON/SDP text via the container's /start + /stop control fetch — it never
  * decodes, transcodes, or carries a media frame. (Transcode in the container is the §9.5 amendment;
  * invariant #2 — no media on a Worker — is unchanged and honored here.)

@@ -1,0 +1,10 @@
+# File-size gate justified exceptions (consumed by wave-foundation checks.yml "File-size gate").
+# One exact repo-relative path per line; lines starting with '#' are ignored (no exact match).
+# Each entry is AUDITED debt, not a free pass — every file here MUST have a tracked split task.
+#
+# src/worker.ts — the realtime-edge entry/router. Already 798 lines before #55; the 5 lines of
+# Plane-2 ingest wiring (import + 4 container re-exports + dispatch + cron reconcile, all INERT)
+# tip it to 828. The DO/container re-exports MUST live in the entry module for wrangler binding
+# resolution, so they can't be moved trivially. Splitting the router is its own prod-critical
+# refactor (tracked follow-up), not something to ride an INERT scaffold PR. Reversible.
+src/worker.ts
