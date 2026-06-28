@@ -63,3 +63,19 @@ D: flip live `RT_ENCODER` `managed`→`container` + `RECORDER_TARGET` `none`→`
 
 Until then: `RT_ENCODER` stays `managed`, `RECORDER_TARGET` defaults `none`, `RECORDER_SINK` defaults `r2`,
 and the `[[containers]]` block stays commented — prod is untouched.
+
+## AV1_DEFAULT (#83/#75) — master-encode profile, INERT default-off
+
+`AV1_DEFAULT` (container env var; absent/`"0"`/`"false"` = OFF) makes the DEFAULT master-encode profile
+(no explicit `x-target-codec`) default to **AV1** for the eligible VIDEO frame source (jpeg), mirroring the
+#83 `selectEncodeProfile` rules (wave-converted / non-remux / encoder-supported; sacred originals keep their
+codec; AV1 always implies a transcode, never an `is_derivable` passthrough). The Worker's `/encode` raw
+frames are wave-converted + non-remux + non-sacred by construction.
+
+- OFF (default): byte-identical to today — jpeg→VP8, pcm→Opus.
+- ON + host has an AV1 encoder: jpeg defaults to AV1.
+- ON + host has NO AV1 encoder: VISIBLE H.264 fallback (`x-av1-fallback-reason` response header), never a
+  silent substitution; if neither AV1 nor H.264 is encodable, the proven VP8 default is kept.
+- Audio (pcm) is never AV1-defaulted (AV1 is a video codec). An explicit `x-target-codec` still wins.
+
+Arming `AV1_DEFAULT="1"` on a live rt-encoder container is a Jake-named ◆ crossing.
