@@ -27,8 +27,9 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 import { buildCommand } from "./command.mjs";
 import { probeCapability, emptyCapability } from "./capability.mjs";
-import { selectEncoder, CodecUnavailableError, UnknownCodecError } from "./select.mjs";
-import { CODECS } from "./codecs.mjs";
+import { probeDecoders, emptyDecodeCapability } from "./decode.mjs";
+import { CodecUnavailableError, UnknownCodecError } from "./select.mjs";
+import { buildCapabilityDescriptor, toCapabilitiesResponse } from "./descriptor.mjs";
 
 const PORT = Number(process.env.PORT || 8080);
 const MAX_BODY = 8 * 1024 * 1024; // 8 MiB — one JPEG frame or a PCM chunk is far smaller; bounds memory.
@@ -51,6 +52,22 @@ async function getCapability() {
     _cap = emptyCapability(); // probe failed → empty set; target requests honest-fail, default unaffected.
   }
   return _cap;
+}
+
+/**
+ * Host DECODE capability, probed lazily on /capabilities only (the /encode path never needs decode). Same
+ * fail-safe contract: probe failure → empty decode set (descriptor reports decode:available:false for all).
+ * @type {{decoders:Set<string>, decodeCodecs:Set<string>}|null}
+ */
+let _decode = null;
+async function getDecodeCapability() {
+  if (_decode) return _decode;
+  try {
+    _decode = await probeDecoders();
+  } catch {
+    _decode = emptyDecodeCapability();
+  }
+  return _decode;
 }
 
 /** Read the full request body into one Buffer, capping at MAX_BODY (over-cap → reject). */
@@ -102,17 +119,12 @@ const server = http.createServer(async (req, res) => {
     // GET /capabilities — report THIS host's encoder matrix: which registry codecs have an available
     // encoder, and the chosen impl (encoder/kind/accel). Additive, read-only; no effect on /encode.
     if (req.method === "GET" && req.url === "/capabilities") {
+      // Full CapabilityDescriptor (#86): EXISTING {hwaccels, codecs} keys stay byte-stable; region/decode/
+      // transports/maxResFps are ADDITIVE (descriptor.toCapabilitiesResponse preserves the encode shape).
       const cap = await getCapability();
-      const codecs = {};
-      for (const [name, entry] of Object.entries(CODECS)) {
-        try {
-          const sel = selectEncoder(entry.media, name, cap.encoders);
-          codecs[name] = { media: entry.media, available: true, encoder: sel.encoder, encoderKind: sel.kind, accel: sel.accel };
-        } catch {
-          codecs[name] = { media: entry.media, available: false };
-        }
-      }
-      const payload = JSON.stringify({ hwaccels: [...cap.hwaccels], codecs });
+      const decode = await getDecodeCapability();
+      const descriptor = buildCapabilityDescriptor({ capability: cap, decode, env: process.env });
+      const payload = JSON.stringify(toCapabilitiesResponse(descriptor));
       res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(payload) });
       res.end(payload);
       return;
