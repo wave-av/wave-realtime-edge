@@ -30,6 +30,12 @@
  * the SKIP-tier RealtimeRecorder, which is itself content-hash-free — asserted by the bundle-guard.)
  */
 import { RealtimeRecorder, type RecordingResult } from "./recording-writer.js";
+import {
+  bucketForBinding,
+  type RtResidencyBinding,
+  type RtResidencyZone,
+} from "./residency-rt.js";
+import { registerRecording, type RegisterConfig } from "./recordings-register.js";
 
 /** CF's published RTK webhook public key — `{ success, data: { publicKey: "-----BEGIN PUBLIC KEY-----…" } }`. */
 const WEBHOOK_KEYS_URL = "https://api.realtime.cloudflare.com/.well-known/webhooks.json"; // fixed host (SSRF-safe)
@@ -212,6 +218,26 @@ export interface RecordingPullSink {
   /** Durable retry: persist a pending-pull record (recordingId→meetingId) the cron reconcile re-pulls. Optional
    * (absent in observe-only/test deps) — when absent, a POST-ack pull failure is logged but not auto-recovered. */
   markPending?(recordingId: string, meetingId: string): Promise<void>;
+  /**
+   * E3.P2/P4 (#127) DATA-RESIDENCY (present ONLY when RT_RESIDENCY is on). When set, this turns the pull into
+   * the residency-aware path:
+   *   • residency.lookupZone(meetingId) → the WaveZone captured at join (null → fall back to the default path).
+   *   • residency.bucketFor(zone)       → the jurisdiction R2 bucket the bytes must land in (null → default path).
+   *   • residency.register(...)         → POST the finalized object to the gateway register endpoint.
+   * ABSENT (the default, RT_RESIDENCY off) → the pull is byte-identical to today: default bucket, no region
+   * segment, no register() call. The presence of this field is the ONLY thing that changes behavior.
+   */
+  residency?: ResidencyPullDeps;
+}
+
+/** The residency capabilities the pull uses when RT_RESIDENCY is on (injected → unit-testable, no live net/R2). */
+export interface ResidencyPullDeps {
+  /** The WaveZone the session recorded in (captured at join). Null → no residency placement → default path. */
+  lookupZone(meetingId: string): Promise<RtResidencyZone | null>;
+  /** The jurisdiction bucket for a zone, and its wrangler binding name (for the register bucket field). */
+  bucketFor(zone: RtResidencyZone): { bucket: R2Bucket; bucketName: string; binding: RtResidencyBinding } | null;
+  /** POST the finalized object to the gateway register endpoint (fail-loud, never throws — bytes already safe). */
+  register(input: { org: string; r2Key: string; bucketName: string; zone: RtResidencyZone }): Promise<void>;
 }
 
 /** KV key prefix + bound for the durable pending-pull retry set (read by reconcilePending). */
@@ -255,6 +281,25 @@ export async function pullUploadedRecording(
     org = UNATTRIBUTED_ORG;
     log?.("rt-pull-unattributed", { id: recording.id, meetingId }); // alarm: bytes preserved but not org-attributed
   }
+
+  // E3.P2/P4 (#127) DATA-RESIDENCY placement (RT_RESIDENCY ON ⇒ sink.residency present). Resolve the
+  // session's zone (captured at join) and its jurisdiction bucket. A residency placement holds ONLY when
+  // ALL THREE are true: residency deps present, a zone was captured, AND a bucket is bound for that zone.
+  // Any miss → `placement` stays null → the pull uses the DEFAULT bucket + non-region key + NO register
+  // (byte-identical to today). We NEVER mix: residency bytes never land in the default bucket and a default
+  // recording never gets a region segment or a register() call. Unattributed (no org) is also kept on the
+  // default path — a register requires a real (UUID) org, and bytes are still preserved under __unattributed__/.
+  let placement: { bucket: R2Bucket; bucketName: string; binding: RtResidencyBinding; zone: RtResidencyZone } | null = null;
+  if (sink.residency && org !== UNATTRIBUTED_ORG) {
+    const zone = await sink.residency.lookupZone(meetingId);
+    if (zone) {
+      const b = sink.residency.bucketFor(zone);
+      if (b) placement = { ...b, zone };
+      else log?.("rt-pull-residency-no-bucket", { id: recording.id, meetingId, zone }); // bound? loud, fall to default
+    }
+  }
+  const targetBucket = placement ? placement.bucket : sink.bucket;
+  const region = placement ? placement.zone : undefined;
   let url = recording.downloadUrl ?? null;
   if (!url) url = await sink.resolveDownloadUrl(recording.id);
   if (!url) {
@@ -291,7 +336,7 @@ export async function pullUploadedRecording(
       log?.("rt-pull-skip-empty", { id: recording.id, meetingId, fileSize: recording.fileSize });
       return null; // nothing recorded → never a 0-byte object
     }
-    recorder = await RealtimeRecorder.begin(sink.bucket, org, meetingId, first);
+    recorder = await RealtimeRecorder.begin(targetBucket, org, meetingId, first, region);
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -304,7 +349,16 @@ export async function pullUploadedRecording(
     reader.releaseLock();
   }
   const result = await recorder.finalize();
-  if (result) log?.("rt-pull-stored", { id: recording.id, meetingId, key: result.key, bytes: result.bytes });
+  if (result) {
+    log?.("rt-pull-stored", { id: recording.id, meetingId, key: result.key, bytes: result.bytes });
+    // E3.P2/P4 (#127): on the residency path ONLY, register the finalized object with the gateway (residency
+    // enforcement + iso_recordings membership). The bytes are ALREADY durable — register is metadata, so it is
+    // fail-loud-but-never-fatal (registerRecording itself never throws). The (org, region-key, bucket, zone)
+    // are consistent by construction (same resolver wrote the bytes), so a correct call never 403s.
+    if (placement) {
+      await sink.residency!.register({ org, r2Key: result.key, bucketName: placement.bucketName, zone: placement.zone });
+    }
+  }
   return result;
 }
 

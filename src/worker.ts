@@ -37,20 +37,20 @@ import { voiceAgentEnabled, type AgentSessionConfig } from "./agent-session";
 // Re-export the Room Durable Object so the wrangler `ROOM` binding + migration (v1, new_sqlite_classes)
 // resolve from this main module. The class itself is defined in room.ts (P5 substrate); it is not yet
 // wired into fetch() — that is the P5.2 signaling follow-up. Exporting it here lets the binding deploy.
+// E3.P2/P4 (#127) — data-residency sink wiring (used only when RT_RESIDENCY is on). worker.ts only DELEGATES;
+// the env/KV/network glue + residency Env fields live in src/residency-sink.ts. residency-rt.ts stays PURE.
+import { buildResidencyDeps, residencyEnabled, captureSessionZone, type ResidencySinkEnv } from "./residency-sink";
+
 export { RoomDO } from "./room";
 
-// RT-R10 (#72) — the PORTABLE raw-SFU encode container Durable Object class (Path A). Mirrors bridge-edge's
-// MoqContainer verbatim: a Container-DO the Worker reaches via getContainer(env.RECORDER, id).fetch('/encode')
-// to transcode JPEG→VP8 / PCM→Opus (the Workers isolate can't host libvpx/libopus). INERT: the matching
-// `[[containers]] RECORDER` block in wrangler.toml stays COMMENTED (Path A attach is a Jake-named ◆), so this
-// export resolves the class without provisioning a live container or a `new_sqlite_classes` migration. It is
-// exported here (the main module) so that, when the ◆ uncomments the binding, the class is already in scope.
+// RT-R10 (#72) — the PORTABLE raw-SFU encode container Durable Object class (Path A; mirrors bridge-edge's
+// MoqContainer). INERT: the `[[containers]] RECORDER` block in wrangler.toml stays COMMENTED (Path A attach is
+// a Jake-named ◆); exported here so the class is in scope when the ◆ uncomments the binding.
 export { RecorderContainer } from "./encoders/recorder-container";
 export { StreamBridgeContainer } from "./stream-bridge-container"; // #91 B2 — inert (binding COMMENTED until ◆)
 
 // Task #81 — the per-room voice-agent session Durable Object. Exported from the main module so the
-// AGENT_SESSION binding + migration resolve on deploy. INERT: the dispatch/egress routes only reach it when
-// VOICE_AGENT_PROVIDER==="wave"; this export merely resolves the class for the binding.
+// AGENT_SESSION binding + migration resolve on deploy. INERT unless VOICE_AGENT_PROVIDER==="wave".
 export { AgentSessionDO } from "./agent-session";
 
 /** Minimal Durable Object namespace shape (avoids a hard dependency on cloudflare:workers types). */
@@ -62,7 +62,7 @@ interface RoomNamespace {
 // Env extends EncoderEnv so the recording adapter's config (CF_ACCOUNT_ID/CF_API_TOKEN/RTK_APP_ID +
 // RT_RECORD/RT_ENCODER/RT_RECORDINGS + the pull-mode RT_MEETING_ORG meetingId→org KV) flows straight from the
 // worker env into selectEncoder()/pullRecordingConfigured()/the webhook pull sink with no re-mapping.
-interface Env extends EncoderEnv {
+interface Env extends EncoderEnv, ResidencySinkEnv {
 	WAVE_INTERNAL_SECRET?: string; // wrangler SECRET — when set, ONLY the gateway (x-wave-internal) may /rtk/* AND /v1/realtime/*
 	// B3 (#98) WHIP v1 ingest flag ([vars], default off). Falsy/absent → the /v1/whip/* surface is inert and
 	// the 501 catch-all is unchanged. Truthy ("1"/"true") → the WHIP listener (src/whip.ts) handles /v1/whip/*.
@@ -91,6 +91,7 @@ interface Env extends EncoderEnv {
 	// ── Task #81 voice-agent runtime — ALL inert unless VOICE_AGENT_PROVIDER==="wave" ──
 	VOICE_AGENT_PROVIDER?: string; // "wave" arms the voice-agent dispatch + egress routes; else fully inert
 	AGENT_SESSION?: RoomNamespace; // Durable Object binding (wrangler AGENT_SESSION → AgentSessionDO)
+	// ── E3.P2/P4 (#127) DATA-RESIDENCY fields come from ResidencySinkEnv (src/residency-sink.ts); inert unless RT_RESIDENCY. ──
 }
 
 /** Injectable RTK primitives the egress/start path drives (live: realtimekit.join + ManagedApi.start). */
@@ -124,10 +125,8 @@ const REALTIME_INTENTS = new Set(["join", "publish", "subscribe", "renegotiate",
 /** POST /v1/realtime/rooms/:room/:intent */
 const REALTIME_ROUTE = /^\/v1\/realtime\/rooms\/([^/]+)\/([^/]+)\/?$/;
 /** RT-R9 hibernatable WS recorder route the SFU dials OUT to: /v1/realtime/recorder/:org/:room/:sessionId/:trackName.
- *  :room is REQUIRED so a frame addresses the SAME RoomDO (keyed `${org}:${room}`) that holds the tap created on the
- *  publish path — without it the frame lands on a DIFFERENT DO (keyed by sessionId) with no tap and is silently
- *  dropped. The capability token still binds ONLY (org, sessionId, trackName); room is a routing key, not part of the
- *  signed identity (a wrong room routes to a tap-less DO — a harmless no-op, never a forgery). */
+ *  :room is REQUIRED so a frame addresses the SAME RoomDO (keyed `${org}:${room}`) holding the publish-path tap;
+ *  the capability token binds ONLY (org, sessionId, trackName) — room is a routing key, not signed identity. */
 const RECORDER_ROUTE = /^\/v1\/realtime\/recorder\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
 /** LK-rip #77 egress control plane the gateway fronts (WSC WaveEgressProviderService #4984 drives these):
  * POST /rtk/egress/start|stop|info. Intent allowlist — anything else is not a recognized egress route. */
@@ -142,10 +141,8 @@ const AGENT_DISPATCH_INTENTS = new Set(["bind", "info"]);
  *  Mirrors RECORDER_ROUTE; the DO key is `${org}:${room}`-derived so a frame reaches the SAME AgentSessionDO
  *  the dispatch bound. The capability token (?t=) authorizes the third-party SFU dial-in (it can't send x-wave-internal). */
 const AGENT_EGRESS_ROUTE = /^\/v1\/realtime\/agents\/egress\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
-/** Task #81 — agent INGEST WS the SFU dials IN to PULL the agent's published PCM (createIngestAdapter
- *  location:"local"): /v1/realtime/agents/ingest/:org/:room/:sessionId/:trackName. Symmetric to AGENT_EGRESS_ROUTE,
- *  but the upgrade is FORWARDED to the `${org}:${room}` AgentSessionDO so the DO owns the live socket it sends on
- *  (egress forwards per-frame over HTTP; ingest must hold a durable socket the agent pushes to over time). */
+/** Task #81 — agent INGEST WS (SFU dials IN to PULL the agent's PCM): /v1/realtime/agents/ingest/:org/:room/:sessionId/:trackName.
+ *  Symmetric to AGENT_EGRESS_ROUTE, but the upgrade is FORWARDED to the `${org}:${room}` AgentSessionDO so the DO owns the durable socket. */
 const AGENT_INGEST_ROUTE = /^\/v1\/realtime\/agents\/ingest\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
 
 // ── WAVE-native ingress listeners (LK-rip #42) — POST /v1/realtime/ingress/:protocol/:intent ──
@@ -154,14 +151,10 @@ const AGENT_INGEST_ROUTE = /^\/v1\/realtime\/agents\/ingest\/([^/]+)\/([^/]+)\/(
 // allowlist MUST match #204 (rtmp/whip/srt/url + create/delete; plus protocol-less management). The
 // gateway already validates the shape; we re-validate here (defense in depth, never trust transport).
 //
-// FEASIBILITY (correctness-by-design, no fabrication): a Cloudflare Worker cannot accept raw inbound TCP
-// (RTMP) or UDP (SRT) sockets, and has no media pipeline to decode an arbitrary pulled URL into SFU tracks.
-//   • WHIP  → LIVE: WHIP is WebRTC-over-HTTP (POST an SDP offer, return an SDP answer) — exactly the SFU
-//     newSession(offer)→answer the room/join path already performs. We forward WHIP create to the Room DO
-//     `join` intent (reusing org:room isolation + admission), returning the SFU answer as the WHIP 201 body.
-//   • rtmp / srt / url → honest 501 (ingress_protocol_requires_vm_listener): these REQUIRE an out-of-Worker
-//     VM listener (raw socket / media decode) that bridges into the room — a separate follow-up slice. We do
-//     NOT fake a Worker listener for them.
+// FEASIBILITY (correctness-by-design): a Worker cannot accept raw inbound TCP (RTMP) / UDP (SRT) sockets, nor
+// decode an arbitrary pulled URL into SFU tracks. WHIP → LIVE (WebRTC-over-HTTP: the SFU newSession(offer)→
+// answer the room/join path already performs; forwarded to the Room DO `join`, SFU answer = the WHIP 201).
+// rtmp/srt/url → honest 501 (ingress_protocol_requires_vm_listener): need an out-of-Worker VM listener.
 const INGRESS_ROUTE = /^\/v1\/realtime\/ingress\/([a-z]+)\/([a-z]+)\/?$/;
 /** Worker-feasible ingress protocols served LIVE here. WHIP only (WebRTC-over-HTTP). */
 const INGRESS_LIVE_PROTOCOLS = new Set(["whip"]);
@@ -222,6 +215,9 @@ function buildPullSink(env: Env): RecordingPullSink | null {
 				expirationTtl: PENDING_TTL_SECONDS,
 			});
 		},
+		// E3.P2/P4 (#127): attach residency deps ONLY when RT_RESIDENCY is on. Absent → byte-identical to today
+		// (default bucket, no region key, no register). See residency-sink.ts for the gating + arm contract.
+		residency: residencyEnabled(env) ? buildResidencyDeps(env, kv) : undefined,
 	};
 }
 
@@ -296,6 +292,9 @@ export default {
 								// Persist meetingId→org FIRST so the recording webhook can attribute the pull to this org. A
 								// 14-day TTL comfortably outlives any meeting + RTK's upload/webhook latency.
 								await env.RT_MEETING_ORG?.put(result.meetingId, org, { expirationTtl: 60 * 60 * 24 * 14 });
+								// E3.P2/P4 (#127): when residency is on, capture the session's zone from request.cf.continent
+								// (one-line delegate to residency-sink; INERT when RT_RESIDENCY is off → byte-identical join).
+								await captureSessionZone(env, request, result.meetingId);
 								const h = await selectEncoder(env).begin(session);
 								if (h) console.log(JSON.stringify({ msg: "rt-recording-armed", meetingId: result.meetingId, org }));
 							})().catch(() => {}),
