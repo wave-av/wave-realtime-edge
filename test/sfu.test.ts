@@ -51,6 +51,15 @@ describe("SfuClient construction", () => {
 		expect(f.mock.calls[0][0]).not.toContain(CFG.appSecret);
 	});
 
+	it("sends a non-empty User-Agent (CF Realtime blocks a UA-less request → 1010/400 → WHIP 503; #100B)", async () => {
+		const f = stub(() => jsonResp({ sessionId: SESSION }));
+		await new SfuClient(CFG, f as never).newSession();
+		const init = f.mock.calls[0][1] as RequestInit;
+		const ua = (init.headers as Record<string, string>)["User-Agent"];
+		expect(ua).toBeTruthy();
+		expect(ua.length).toBeGreaterThan(0);
+	});
+
 	// Regression (live 500 "Illegal invocation"): the client must invoke fetchImpl DETACHED from `this`.
 	// The global `fetch` builtin throws when called with a non-global receiver, so calling it as
 	// `this.fetchImpl(...)` (receiver = the SfuClient instance) breaks at runtime. A this-sensitive stub

@@ -9,17 +9,23 @@ name: deploy
 #   1. npm ci || npm install   (standalone worker — NO @wave-av/* deps, so no GitHub Packages auth)
 #   2. typecheck + test (re-run the gate before a real deploy)
 #   3. wrangler deploy
-#      wrangler reads wrangler.toml: name, main, routes (rt.wave.online custom_domain),
-#      the ROOM Durable Object binding + v1 migration (new_sqlite_classes ["RoomDO"]), vars,
-#      and observability. First deploy bootstraps the RoomDO migration.
+#      wrangler reads wrangler.toml: name, main, routes (rt.wave.online custom_domain), the Durable Object
+#      bindings + migrations — ROOM/v1, RECORDER, and AGENT_SESSION (voice-agent runtime, migration v3,
+#      new_sqlite_classes ["AgentSessionDO"]) — vars, and observability. First deploy bootstraps the migrations.
 #
 # Secrets required in this repo (set once, NOT here — same org secrets the other spokes use):
 #   CLOUDFLARE_API_TOKEN   — CF API token: Workers Scripts:Edit, Workers KV:Edit, Zone Workers Routes:Edit
 #   CLOUDFLARE_ACCOUNT_ID  — the WAVE CF account id
 #
-# Worker runtime secrets are set separately via `wrangler secret put` (values from Doppler wave/prd):
+# Worker runtime secrets are NOT set here — and NOT from this PUBLIC repo's CI (GitHub won't expose the org
+# DOPPLER_TOKEN to a public repo, and prod creds must never live here). Provision them from the PRIVATE
+# foundation hub: run wave-av/wave-foundation `provision-worker-secrets.yml` (workflow_dispatch) with
+# worker=wave-realtime-edge and secret_names="WAVE_SERVICE_TOKEN ELEVENLABS_API_KEY ELEVENLABS_VOICE_ID
+# CF_CALLS_APP_ID CF_CALLS_APP_SECRET" — values flow Doppler -> foundation CI -> Cloudflare. They include:
 #   CF_CALLS_APP_ID, CF_CALLS_APP_SECRET   — CF Realtime SFU app creds (sfu.ts)
-#   WAVE_SERVICE_TOKEN                     — metering-tap bearer to the gateway (room.ts)
+#   WAVE_SERVICE_TOKEN                     — gateway bearer: metering tap (room.ts) AND, via
+#                                            normalizeGatewayEnv, the voice-agent LLM/STT/tools paths
+#   ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID — voice-agent TTS (agent-turn.ts), behind VOICE_AGENT_PROVIDER
 #   WAVE_INTERNAL_SECRET, CF_API_TOKEN, TURN_KEY_ID, TURN_KEY_TOKEN — existing /rtk surface (worker.ts)
 
 on:

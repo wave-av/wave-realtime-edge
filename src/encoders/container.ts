@@ -1,0 +1,296 @@
+/// <reference types="@cloudflare/workers-types" />
+/**
+ * RT-R8/RT-R9 — Adapter A: CF Container WAVE-owned encoder (design §3), audio-first INERT impl.
+ *
+ * WHAT A DOES (audio-first, no Docker): A taps published SFU tracks over the CF Realtime WS media-transport
+ * adapter (`createWebsocketAdapter`). The SFU dials OUT to OUR hibernatable Worker recorder route, pushing one
+ * track's media as proto3 `Packet` frames; a `RawSfuTap` decodes → encodes (PCM passthrough, no WASM) → muxes
+ * (WebM/Matroska) → streams into the SKIP-tier `RealtimeRecorder` at the ONE canonical org-rooted R2 object.
+ * Audio needs NO container at all — it is hosted entirely in the Worker isolate. ONLY the JPEG→VP8 video slice
+ * needs the rt-encoder container (deferred ◆ infra; the video seam lands in container-adapter.ts, dormant).
+ *
+ * INERT BY CONSTRUCTION: `begin` NEVER throws. When recording is disarmed (`RT_RECORD!=="1"`) or the CF-Calls
+ * app creds are unconfigured (`containerRecordingConfigured(env)===false`), it logs loudly and returns `null`
+ * (the caller no-ops) — config-no-silent-noop, fail-open. So even with `RT_ENCODER="container"` selected, a
+ * prod env that has not been ◆-armed records nothing and breaks nothing. Live wrangler.toml keeps
+ * `RT_ENCODER="managed"`, so this path is never selected in prod until a Jake-named flip.
+ *
+ * SKIP INVARIANT (design §4): this module NEVER imports `@wave-av/content-hash`; every byte flows to the
+ * single canonical object via `RealtimeRecorder`. The bundle-guard test asserts this mechanically.
+ */
+import type { EncoderEnv, EncoderHandle, RecordingEncoder, RecordingSession } from "./encoder.js";
+import type { RecordingResult } from "../recording-writer.js";
+import {
+  createWebsocketAdapter,
+  RawSfuTap,
+  type AdapterRetry,
+  type AsyncVideoEncoder,
+  type WsAdapterTrack,
+} from "./container-adapter.js";
+import { mintRecorderToken } from "./recorder-auth.js";
+import { selectRecorderTarget, type RecorderTarget, type RecorderTargetEnv } from "./recorder-target.js";
+import { selectSink, type RecordingSinkEnv, type LocalFileWriter, type SinkSession } from "./recording-sink.js";
+import { parseIvf } from "./ivf.js";
+
+/**
+ * RT-R10 (#72) — self-host local-writer injection. The Workers isolate has NO filesystem, so this is
+ * `undefined` on the Worker path (→ selectSink degrades localfs/fanout to R2, byte-identical inert). A
+ * self-host runtime (the rt-encoder Node image, when it co-hosts the recorder) injects the real fs-backed
+ * factory from `containers/rt-encoder/server/local-file-writer.mjs` so `RECORDER_SINK=localfs|fanout` lands a
+ * REAL local file under `RECORDER_LOCAL_DIR`. Keeping it an injected fn keeps `node:fs` out of the Worker bundle.
+ */
+export type LocalWriterFactory = (dir: string, session: SinkSession) => LocalFileWriter;
+
+const HEX32 = /^[0-9a-f]{32}$/i;
+
+type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+
+/**
+ * Is adapter A (raw-SFU container, audio-first WS path) configured to arm a recording? Requires:
+ *   • armed (RT_RECORD==="1")
+ *   • the SKIP sink R2 binding (RT_RECORDINGS) — the tap writes the one canonical object there
+ *   • the CF-Calls SFU app creds (CF_CALLS_APP_ID hex + CF_CALLS_APP_SECRET) — the create-adapter Bearer
+ * Any absent → false (the caller logs loudly and records nothing — config-no-silent-noop, never a silent
+ * broken write). Mirrors `pullRecordingConfigured` (managed.ts) so both adapters gate the same shape.
+ */
+export function containerRecordingConfigured(env: EncoderEnv): boolean {
+  return (
+    env.RT_RECORD === "1" &&
+    !!env.RT_RECORDINGS &&
+    !!env.CF_CALLS_APP_ID &&
+    HEX32.test(env.CF_CALLS_APP_ID) &&
+    !!env.CF_CALLS_APP_SECRET
+  );
+}
+
+/** Injectable seam so every path is unit-tested with no live network: the SFU create-adapter fetch + the
+ *  base URL of OUR Worker recorder route the SFU dials OUT to (`${base}/${org}/${sessionId}/${trackName}`). */
+export interface ContainerEncoderDeps {
+  fetchImpl?: FetchLike;
+  /** wss base of the hibernatable Worker recorder route (worker.ts /v1/realtime/recorder/...). */
+  recorderEndpointBase?: string;
+  /** create-adapter retry budget (rides out the publish→media race). Default DEFAULT_ADAPTER_RETRY. */
+  retry?: AdapterRetry;
+  /**
+   * RT-R10 (#72) — self-host fs writer factory for the localfs/fanout sink. UNDEFINED on the Worker (no fs →
+   * localfs/fanout degrade to R2, inert). A self-host runtime injects the real factory so a local file lands.
+   */
+  localWriterFor?: LocalWriterFactory;
+}
+
+/** Default wss base of the Worker recorder route on the live realtime host (overridable for tests/staging). */
+export const DEFAULT_RECORDER_ENDPOINT_BASE = "wss://rt.wave.online/v1/realtime/recorder";
+
+/**
+ * Live create-adapter retry budget. The publisher's media starts ~hundreds of ms AFTER `/publish` returns, so
+ * the SFU answers `not_found_track_error` for the first try or two; ~7 attempts over ~4.5s (ramped backoff)
+ * rides that out without ever blocking the publish (the call is backgrounded — see ContainerHandle.onPublish).
+ */
+export const DEFAULT_ADAPTER_RETRY: AdapterRetry = { maxAttempts: 7 };
+
+/**
+ * ContainerEncoder (adapter A). Constructed armed by the factory (`RT_RECORD==="1"` + `RT_ENCODER="container"`).
+ * `begin` returns a `ContainerHandle` when configured, else `null` (loud-warn, never throw — fail-open).
+ */
+export class ContainerEncoder implements RecordingEncoder {
+  readonly kind = "container" as const;
+  private readonly fetchImpl: FetchLike;
+  private readonly recorderBase: string;
+  private readonly retry: AdapterRetry;
+  private readonly localWriterFor?: LocalWriterFactory;
+  constructor(
+    private readonly env: EncoderEnv,
+    deps: ContainerEncoderDeps = {},
+  ) {
+    // Bind to globalThis: native `fetch` throws "Illegal invocation" when later called as `this.fetchImpl(...)`;
+    // binding makes every call site safe (a no-op for an injected test fake). See managed.ts for the same fix.
+    this.fetchImpl = (deps.fetchImpl ?? fetch).bind(globalThis);
+    this.recorderBase = (deps.recorderEndpointBase ?? DEFAULT_RECORDER_ENDPOINT_BASE).replace(/\/+$/, "");
+    this.retry = deps.retry ?? DEFAULT_ADAPTER_RETRY;
+    this.localWriterFor = deps.localWriterFor; // undefined on Worker (inert); self-host injects the fs writer
+  }
+
+  async begin(session: RecordingSession): Promise<EncoderHandle | null> {
+    if (!containerRecordingConfigured(this.env)) {
+      // Loud, not silent (config-no-silent-noop). Inert: nothing is recorded, nothing throws.
+      console.warn(
+        JSON.stringify({
+          msg: "rt-container-not-configured",
+          armed: this.env.RT_RECORD === "1",
+          hasBucket: !!this.env.RT_RECORDINGS,
+          hasApp: !!this.env.CF_CALLS_APP_ID,
+        }),
+      );
+      return null;
+    }
+    return new ContainerHandle(this.env, session, this.fetchImpl, this.recorderBase, this.retry, this.localWriterFor);
+  }
+}
+
+/**
+ * ContainerHandle — one armed raw-SFU session's recording. Holds a `Map<trackName, RawSfuTap>`: the FIRST time
+ * an AUDIO track publishes, it (1) opens a `RawSfuTap` writing the SKIP object and (2) creates a CF WS adapter
+ * so the SFU dials our recorder route for that track. VIDEO publishes are a no-op here (audio-first; the video
+ * encode seam is the deferred ◆). `finalize`/`abort` fan out over every tap, fail-open. `toMeta` → null (the
+ * tap's own multipart hibernation is owned by the RoomDO's per-session recorder map, not this handle).
+ *
+ * Fail-open everywhere: a create-adapter or tap error NEVER propagates up the publish/leave path — the caller
+ * wraps onPublish/finalize in try/catch (best-effort recording, media-safety > recording).
+ */
+export class ContainerHandle implements EncoderHandle {
+  private readonly taps = new Map<string, RawSfuTap>();
+  /** In-flight create-adapter calls. BACKGROUNDED so they NEVER block the publish path (design §4); each is
+   *  fail-open (its `.then(ok, err)` collapses to void). finalize()/whenAdapterSettled() await them so teardown
+   *  and tests are deterministic. The DO stays alive on this pending fetch I/O (CF: no waitUntil needed). */
+  private readonly adapterCreates: Promise<void>[] = [];
+  /** Org-rooted R2 key prefix the taps write the canonical object under (correlation/log line). */
+  readonly keyPrefix: string;
+
+  constructor(
+    private readonly env: EncoderEnv,
+    private readonly session: RecordingSession,
+    private readonly fetchImpl: FetchLike,
+    private readonly recorderBase: string,
+    private readonly retry: AdapterRetry,
+    /** RT-R10 (#72): self-host fs writer factory; undefined on the Worker (localfs/fanout degrade to R2, inert). */
+    private readonly localWriterFor?: LocalWriterFactory,
+  ) {
+    this.keyPrefix = `${session.org}/realtime-recordings/${session.sessionId}/`;
+  }
+
+  /** Await every in-flight create-adapter call (teardown/test determinism). Never throws — each is fail-open. */
+  async whenAdapterSettled(): Promise<void> {
+    await Promise.all(this.adapterCreates);
+  }
+
+  /** The live taps, keyed by trackName — the RoomDO feeds decoded frames to the right tap by (sessionId,trackName). */
+  get tapsByTrack(): ReadonlyMap<string, RawSfuTap> {
+    return this.taps;
+  }
+
+  /**
+   * Adapt a RecorderTarget (async network /encode → IVF) into the tap's AsyncVideoEncoder seam. One decoded
+   * JPEG → encode → IVF → raw VP8 frames (keyframe flags from the VP8 header; see ivf.ts). Fail-open: a null
+   * encode (NoneTarget / fetch error / non-2xx) or a non-IVF body resolves to [] → the muxer drops that frame.
+   */
+  private static videoEncoderFromTarget(target: RecorderTarget): AsyncVideoEncoder {
+    return {
+      codec: "vp8",
+      async encode(jpeg: Uint8Array) {
+        const ivf = await target.encode(jpeg, { kind: "video", ts: 0, codec: "jpeg" });
+        if (!ivf || ivf.length === 0) return [];
+        return parseIvf(ivf).map((f) => ({ data: f.data, keyframe: f.keyframe }));
+      },
+    };
+  }
+
+  /**
+   * A track went live. AUDIO → open a PCM tap. VIDEO → open a JPEG tap whose async VP8 encode runs on the
+   * selected RecorderTarget (container/self-host); when RECORDER_TARGET is unset/'none' (the live default) the
+   * target is NoneTarget, so NO video tap is opened and frames are dropped — main stays inert. Both kinds ask
+   * the SFU to push that track to our recorder route. Idempotent per trackName.
+   */
+  async onPublish(trackName: string, kind: "audio" | "video"): Promise<void> {
+    if (this.taps.has(trackName)) return; // idempotent — one tap per track
+    const bucket = this.env.RT_RECORDINGS;
+    if (!bucket) return; // defense in depth (containerRecordingConfigured already gated)
+    const target = { bucket, org: this.session.org, sessionId: this.session.sessionId };
+    // RT-R10 (#72): pick WHERE the bytes land. Default RECORDER_SINK='r2' → R2Sink (today's behavior). In the
+    // Worker there is no localWriterFor, so localfs/fanout degrade to R2 (inert); a self-host runtime injects a
+    // real writer to fan a local copy. selectSink owns the SKIP/single-writer invariant.
+    const sink = selectSink(
+      this.env as unknown as RecordingSinkEnv,
+      { org: this.session.org, sessionId: this.session.sessionId },
+      { localWriterFor: this.localWriterFor }, // undefined on Worker → localfs/fanout degrade to R2 (inert)
+    );
+    let tap: RawSfuTap;
+    let outputCodec: "pcm" | "jpeg";
+    if (kind === "video") {
+      // Pick the encode runtime by env. 'none' (default/dormant) → NoneTarget → DROP video (no tap), main inert.
+      const recorderTarget = selectRecorderTarget(this.env as unknown as RecorderTargetEnv);
+      if (recorderTarget.kind === "none") return; // dormant: no video tap, frames dropped (main stays inert)
+      outputCodec = "jpeg";
+      tap = new RawSfuTap({
+        target,
+        sink,
+        outputCodec,
+        asyncVideoEncoder: ContainerHandle.videoEncoderFromTarget(recorderTarget),
+      });
+    } else {
+      outputCodec = "pcm";
+      tap = new RawSfuTap({ target, sink });
+    }
+    this.taps.set(trackName, tap);
+    // Build the recorder endpoint (+ optional signed capability token). The path carries :room so the SFU's frames
+    // reach the SAME RoomDO (keyed `${org}:${room}`) that holds THIS tap — without it they land on a tap-less DO
+    // (keyed by sessionId) and are dropped. The SFU is a third party — it cannot send our `x-wave-internal` header
+    // — so when the internal secret is bound, append a signed, expiring, per-(org,session,track) token the recorder
+    // route accepts as alternative auth (the token does NOT cover room — room is a routing key, not signed identity).
+    // Minting is local HMAC (fast); a mint failure falls back to the bare endpoint (the route still enforces x-wave-internal).
+    let endpoint = `${this.recorderBase}/${this.session.org}/${this.session.room}/${this.session.sessionId}/${trackName}`;
+    try {
+      if (this.env.WAVE_INTERNAL_SECRET) {
+        const t = await mintRecorderToken(
+          this.env.WAVE_INTERNAL_SECRET,
+          this.session.org,
+          this.session.sessionId,
+          trackName,
+        );
+        endpoint = `${endpoint}?t=${t}`;
+      }
+    } catch {
+      // best-effort — bare endpoint
+    }
+    const track: WsAdapterTrack = {
+      location: "remote",
+      sessionId: this.session.sessionId,
+      trackName,
+      endpoint,
+      outputCodec, // "pcm" for audio, "jpeg" for video — the SFU mirrors that codec to our recorder route
+    };
+    // Ask the SFU to dial OUT to our recorder route. BACKGROUND it — do NOT await up the publish chain: the
+    // create races the publisher's media (the SFU returns not_found_track_error until ICE/DTLS bring the track
+    // up ~hundreds of ms after /publish returns), so it RETRIES internally (this.retry). Backgrounding keeps
+    // the publish non-blocking (design §4: recording is never on the media critical path); the DO stays alive
+    // on this pending fetch I/O. Fail-open: a create failure leaves the tap in place (it just gets no frames).
+    const create = createWebsocketAdapter(
+      { fetchImpl: this.fetchImpl, retry: this.retry },
+      { appId: this.env.CF_CALLS_APP_ID ?? "", bearer: this.env.CF_CALLS_APP_SECRET ?? "", tracks: [track] },
+    ).then(
+      () => undefined,
+      () => undefined,
+    );
+    this.adapterCreates.push(create);
+  }
+
+  /** Session end: finalize every tap, return the FIRST canonical result (one object per audio track). Fail-open. */
+  async finalize(): Promise<RecordingResult | null> {
+    await this.whenAdapterSettled(); // let any in-flight create settle (bounded by the retry budget) — never throws
+    let first: RecordingResult | null = null;
+    for (const tap of this.taps.values()) {
+      try {
+        const r = await tap.finalize();
+        if (r && !first) first = r;
+      } catch {
+        /* fail-open — a finalize error never throws the leave down */
+      }
+    }
+    return first;
+  }
+
+  /** Best-effort abort over every tap. Never throws. */
+  async abort(): Promise<void> {
+    for (const tap of this.taps.values()) {
+      try {
+        await tap.abort();
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
+
+  /** No handle-level hibernation snapshot: the RoomDO persists each tap's recorder meta in its own session map. */
+  toMeta(): unknown | null {
+    return null;
+  }
+}

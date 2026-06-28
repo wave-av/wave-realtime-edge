@@ -132,7 +132,15 @@ export class SfuClient {
     // body-optional endpoints: POST /sessions/new WITHOUT an offer returns 400 "decoding_error: Body
     // JSON validation error: sessionDescription" for `{}`, but 201 for no body at all. So pass the body
     // (and the JSON Content-Type) only when `body != null`; a no-offer newSession sends neither.
-    const headers: Record<string, string> = { Authorization: `Bearer ${this.appSecret}` };
+    // CF Realtime's edge firewall BLOCKS a request that carries NO `User-Agent`: a Workers `fetch()` sends
+    // none, so rtc.live.cloudflare.com replied 403 "error code: 1010" / 400 — surfaced to the publisher as a
+    // 503 and the exact reason a real WHIP publish never reached the SFU (#100B). Verified live against the
+    // wave-realtime-sfu app: an absent UA is blocked, but ANY non-empty UA → 201 + SDP answer. Send an
+    // explicit UA so every SfuClient call actually reaches the CF Realtime API.
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.appSecret}`,
+      "User-Agent": "wave-realtime-edge/1.0",
+    };
     const init: RequestInit = { method, headers };
     if (body != null) {
       headers["Content-Type"] = "application/json";
