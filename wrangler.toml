@@ -54,7 +54,7 @@ GATEWAY_BASE_URL = "https://api.wave.online"
 # zone invented). Flipping RT_RESIDENCY in any live env is a Jake-named ◆ crossing (multi-region storage go-live).
 # WAVE_GATEWAY_ORIGIN is OPTIONAL (defaults to GATEWAY_BASE_URL above); WAVE_SERVICE_TOKEN is the EXISTING
 # wrangler SECRET the metering tap already uses (no new secret).
-# RT_RESIDENCY = "1"   # <- ARM here at the ◆ crossing (kept commented = OFF)
+RT_RESIDENCY = "1"   # ARMED 2026-06-28 — #127 ◆ crossing (Jake-named, full-arc). WAVE is the dogfood customer.
 
 # ── B3 (#98) — IETF WHIP v1 ingest surface (/v1/whip/*). DEFAULT OFF / INERT. ──
 # WHIP_INGEST_ENABLED gates the whole /v1/whip/{publish,resource/{id}} listener (src/whip.ts). Absent/"0" →
