@@ -30,6 +30,12 @@ import { probeCapability, emptyCapability } from "./capability.mjs";
 import { probeDecoders, emptyDecodeCapability } from "./decode.mjs";
 import { CodecUnavailableError, UnknownCodecError } from "./select.mjs";
 import { buildCapabilityDescriptor, toCapabilitiesResponse } from "./descriptor.mjs";
+import {
+  negotiationEnabled,
+  parseDstDescriptor,
+  negotiateTargetCodec,
+  NegotiationInputError,
+} from "./negotiate.mjs";
 
 const PORT = Number(process.env.PORT || 8080);
 const MAX_BODY = 8 * 1024 * 1024; // 8 MiB — one JPEG frame or a PCM chunk is far smaller; bounds memory.
@@ -137,7 +143,44 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       // OPTIONAL target codec. Absent → byte-unchanged DEFAULT path (no capability probe needed).
-      const target = String(req.headers["x-target-codec"] || "").toLowerCase() || null;
+      let target = String(req.headers["x-target-codec"] || "").toLowerCase() || null;
+
+      // ── NEGOTIATION (#86, default-OFF) ── When NEGOTIATION_ENABLED==="true" AND the request carries a DST
+      // capability descriptor (x-dst-capabilities, base64 JSON), the per-leg selector negotiates the target
+      // codec from THIS host's caps vs the consumer's — instead of trusting the caller's x-target-codec. The
+      // flag OFF, or ON-but-no-descriptor, leaves `target` exactly as the header set it → byte-identical to
+      // today. An x-live:"1" hint enables region-placement enforcement (live legs same-continent only).
+      let negTransport = null;
+      if (negotiationEnabled(process.env)) {
+        let dstDescriptor;
+        try {
+          dstDescriptor = parseDstDescriptor(req.headers["x-dst-capabilities"]);
+        } catch (e) {
+          if (e instanceof NegotiationInputError) {
+            res.writeHead(400, { "content-type": "text/plain" });
+            res.end(`bad x-dst-capabilities: ${e.message}`);
+            return;
+          }
+          throw e;
+        }
+        if (dstDescriptor) {
+          // Build THIS host's descriptor (src) from its probed caps, then negotiate.
+          const cap = await getCapability();
+          const decode = await getDecodeCapability();
+          const srcDescriptor = buildCapabilityDescriptor({ capability: cap, decode, env: process.env });
+          const live = String(req.headers["x-live"] || "") === "1";
+          const result = negotiateTargetCodec(srcDescriptor, dstDescriptor, { live });
+          if (!result.negotiated) {
+            // HONEST-FAIL: no viable leg → explicit 422 with the TYPED reason. NEVER a silent downgrade.
+            res.writeHead(422, { "content-type": "text/plain", "x-negotiation-reason": result.reason });
+            res.end(`no viable leg: ${result.reason}${result.detail ? ` (${result.detail})` : ""}`);
+            return;
+          }
+          target = result.targetCodec; // negotiated codec drives the encode (overrides any x-target-codec).
+          negTransport = result.transport;
+        }
+      }
+
       let cmd;
       try {
         const available = target ? (await getCapability()).encoders : new Set();
@@ -158,13 +201,17 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const encoded = await transcode(cmd.args, body);
-      res.writeHead(200, {
+      const headers = {
         "content-type": "application/octet-stream",
         "content-length": encoded.length,
         "x-encoder": cmd.encoder, // observability: which encoder actually ran (default = libvpx/libopus).
         "x-output-codec": cmd.target,
         "x-output-container": cmd.container,
-      });
+      };
+      // Observability marker: present ONLY when the negotiator drove this encode — the live proof that
+      // per-leg negotiation actually ran in a real session (absent on the legacy/default path → no drift).
+      if (negTransport) headers["x-negotiated-transport"] = negTransport;
+      res.writeHead(200, headers);
       res.end(encoded);
       return;
     }
