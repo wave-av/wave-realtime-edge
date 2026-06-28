@@ -21,8 +21,10 @@ export const LegExclusionReason = Object.freeze({
 /** Codec fallback ladder, best (most efficient) first (design §3c). */
 export const CODEC_LADDER = Object.freeze(["av1", "hevc", "h264"]);
 
-// Map the ladder's display names to the registry codec keys (registry uses "h265" for HEVC).
-const LADDER_TO_REGISTRY = Object.freeze({ av1: "av1", hevc: "h265", h264: "h264" });
+// Map the ladder's display names to the registry codec keys (registry uses "h265" for HEVC). Exported so
+// the negotiation wiring can translate a negotiated `encodeCodec` (ladder name) back to the registry key
+// that buildCommand/selectEncoder expect — without re-deriving the mapping (one source of truth).
+export const LADDER_TO_REGISTRY = Object.freeze({ av1: "av1", hevc: "h265", h264: "h264" });
 
 /** Transport fallback ladder, lowest-latency first (design §3c). srt/rist are the same rung. */
 export const TRANSPORT_LADDER = Object.freeze(["moq", "srt", "rist", "ll-hls"]);
