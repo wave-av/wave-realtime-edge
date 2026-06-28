@@ -136,6 +136,10 @@ bucket_name = "wave-recordings-enam"
 [[r2_buckets]]
 binding = "RT_RECORDINGS_EU"
 bucket_name = "wave-recordings-eu"
+# EU DATA-RESIDENCY: this bucket lives in CF R2's EU jurisdiction namespace (location EEUR), so the binding
+# MUST declare jurisdiction = "eu" — without it the binding resolves to the default (non-EU) namespace and an
+# EU session's bytes would NOT be residency-correct. (#127 ◆ Jake-named EU-residency crossing, 2026-06-28.)
+jurisdiction = "eu"
 
 [[kv_namespaces]]
 binding = "RT_MEETING_ORG"

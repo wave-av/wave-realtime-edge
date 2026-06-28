@@ -43,4 +43,18 @@ describe("wrangler.toml RT_RESIDENCY arm is coherent (#127 ARMED)", () => {
     expect(/^\s*binding\s*=\s*"RT_RECORDINGS_EU"/m.test(toml)).toBe(true);
     expect(/^\s*bucket_name\s*=\s*"wave-recordings-eu"/m.test(toml)).toBe(true);
   });
+
+  it("the EU binding carries jurisdiction = \"eu\" (residency-correct EU namespace, not the default ns)", () => {
+    // The EU recordings bucket lives in R2's EU jurisdiction namespace (location EEUR). The RT_RECORDINGS_EU
+    // [[r2_buckets]] block MUST declare jurisdiction = "eu" inside it — otherwise the binding silently resolves
+    // to the default (non-EU) namespace and EU residency is violated. Anchor the match to the EU block.
+    const euBlock = toml.match(
+      /\[\[r2_buckets\]\][^\[]*?binding\s*=\s*"RT_RECORDINGS_EU"[^\[]*/m,
+    );
+    expect(euBlock, "RT_RECORDINGS_EU [[r2_buckets]] block must exist").not.toBeNull();
+    expect(
+      /^\s*jurisdiction\s*=\s*"eu"/m.test(euBlock![0]),
+      'RT_RECORDINGS_EU block must declare jurisdiction = "eu"',
+    ).toBe(true);
+  });
 });
