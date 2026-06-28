@@ -16,8 +16,9 @@
 import { dispatch, scheduledHandler, type Env } from "./route-dispatch";
 
 // Re-export the Room Durable Object so the wrangler `ROOM` binding + migration (v1, new_sqlite_classes)
-// resolve from this main module. The class itself is defined in room.ts (P5 substrate); it is not yet
-// wired into fetch() — that is the P5.2 signaling follow-up. Exporting it here lets the binding deploy.
+// resolve from this main module. The class is defined in room.ts (P5 substrate) and its fetch() control
+// plane runs the P5.2 Signaling orchestration (join/publish/subscribe/renegotiate/leave); the worker
+// routes POST /v1/realtime/rooms/:room/:intent to it below. Exporting it here lets the binding deploy.
 // E3.P2/P4 (#127) — data-residency sink wiring (used only when RT_RESIDENCY is on). worker.ts only DELEGATES;
 // the env/KV/network glue + residency Env fields live in src/residency-sink.ts. residency-rt.ts stays PURE.
 export { RoomDO } from "./room";
