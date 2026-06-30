@@ -10,6 +10,9 @@ import { handleRecordingWebhook, reconcilePending } from "./rtk-webhook";
 // B3 (#98) — IETF WHIP v1 ingest surface (/v1/whip/*). INERT behind WHIP_INGEST_ENABLED ([vars], default off
 // → the 501 catch-all is unchanged). See src/whip.ts + whip-v1-frozen-contract.md §3/§4/§6-B3.
 import { handleWhip, whipIngestEnabled, type WhipEnv } from "./whip";
+// #53 — IETF WHEP v1 egress surface (/v1/whep/*), the egress SIBLING of WHIP. INERT behind WHEP_EGRESS_ENABLED
+// ([vars], default off → the 501 catch-all is unchanged). See src/whep.ts + docs/whep-v1-frozen-contract.md.
+import { handleWhep, whepEgressEnabled, type WhepEnv } from "./whep";
 // B1 (#91-a) — CF Stream Live → SFU bridge CONTROL PLANE. INERT behind STREAM_BRIDGE_ENABLED. worker.ts only
 // DELEGATES; all matching/auth/dispatch lives in src/stream-bridge.ts (+ cf-stream-bridge-frozen-contract).
 import { maybeHandleStreamBridge, scheduledStreamReconcile } from "./stream-bridge";
@@ -492,6 +495,27 @@ export async function dispatch(
 		}
 		const whipRes = await handleWhip(request, env as WhipEnv, org);
 		if (whipRes) return whipRes; // null → unrecognized /v1/whip/* sub-path → 501 fall-through below
+	}
+
+	// ── #53 IETF WHEP v1 egress — /v1/whep/subscribe + /v1/whep/resource/{id} ──
+	// The egress SIBLING of the WHIP block above. INERT behind WHEP_EGRESS_ENABLED ([vars], default off): when
+	// the flag is falsy/absent, this block is skipped entirely and a /v1/whep/* request falls through to the
+	// 501 catch-all below — UNCHANGED. When ON, the SAME gateway-trust chokepoint as every other paid route
+	// gates it (WAVE_INTERNAL_SECRET / x-wave-internal); org is the gateway-stamped x-wave-org. The handler
+	// (src/whep.ts) resolves the source publisher session from the WHIP resource record (same-org only) and
+	// talks to the CF Realtime SFU directly (signaling-only glue; media terminates at the SFU, never here).
+	if (url.pathname.startsWith("/v1/whep/") && whepEgressEnabled(env as WhepEnv)) {
+		const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
+		if (denied) return denied;
+		const org = request.headers.get("x-wave-org") ?? "";
+		if (!SAFE_ORG.test(org)) {
+			return Response.json(
+				{ error: "BAD_REQUEST", message: "missing or malformed org context (x-wave-org) — stamped by the gateway" },
+				{ status: 400 },
+			);
+		}
+		const whepRes = await handleWhep(request, env as WhepEnv, org);
+		if (whepRes) return whepRes; // null → unrecognized /v1/whep/* sub-path → 501 fall-through below
 	}
 
 	// ── B1 (#91-a) CF Stream Live → SFU bridge — POST /v1/stream/bridge/webhook. INERT behind
