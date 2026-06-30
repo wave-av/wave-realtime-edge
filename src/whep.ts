@@ -1,54 +1,55 @@
 // #53 — IETF WHEP v1 egress listener (draft-murillo-whep-03) for wave-realtime-edge.
 //
-// FROZEN CONTRACT: docs/whep-v1-frozen-contract.md (v1.0), §3/§4/§10. The egress SIBLING of src/whip.ts
-// (the WHIP ingest surface) — same gateway-trust auth, same fail-closed-503-on-absent-SFU-creds, same
-// KV-backed resource record + fail-open teardown meter, same INERT-behind-a-[vars]-flag posture.
+// FROZEN CONTRACT: docs/whep-v1-frozen-contract.md (v1.1), §0/§3/§4/§10. The egress SIBLING of src/whip.ts
+// (the WHIP ingest surface) — same gateway-trust auth, same fail-closed-503, same KV-backed resource record +
+// fail-open teardown meter, same INERT-behind-a-[vars]-flag posture.
 //
-// This is the dedicated `/v1/whep/*` SFU-only egress surface: a subscriber receives a published WebRTC
-// stream over plain HTTP signaling.
-//   POST   /v1/whep/subscribe?resource={whipResourceId}&track={trackName}  (application/sdp offer)
-//                                                            → newSession(offer)+pullTracks → 201 + SDP answer
-//   PATCH  /v1/whep/resource/{id}  (application/trickle-ice-sdpfrag)                                    → 204
-//   DELETE /v1/whep/resource/{id}                                          → 204 + stop meter
+// SOURCE = CLOUDFLARE STREAM WebRTC PLAYBACK (the repoint). The CF Realtime SFU does NOT expose a one-shot WHEP
+// pull (its `pullTracks` is SFU-offer/client-answer, the INVERSE of single-shot WHEP — see git history). The
+// correct one-shot WHEP path is Cloudflare Stream's WebRTC playback endpoint, which IS a standard WHEP server:
+//   POST {webRTCPlayback.url}  (application/sdp offer)  → 201 + application/sdp ANSWER + Location (resource)
+// The playback URL is deterministic and SECRET-FREE: `https://customer-{CODE}.cloudflarestream.com/{uid}/webRTC/play`
+// (confirmed live via the Stream live_inputs API field `.result.webRTCPlayback.url`). The edge substitutes the
+// live-input uid into `WHEP_SRC_URL_TEMPLATE` (the `{uid}` placeholder; customer code baked in) and RELAYS the
+// subscriber's SDP offer to it verbatim, returning Stream's 201 + answer verbatim. ONE-SHOT — no renegotiation.
 //
-// MEDIA OFF THE WORKER (§8.2): ICE/DTLS/SRTP terminate at CF Realtime SFU (rtc.live.cloudflare.com). The
-// Worker is signaling-only glue — it relays SDP verbatim and never decodes/transcodes/carries media.
+//   POST   /v1/whep/subscribe?resource={liveInputUid}   (application/sdp offer) → relay → 201 + SDP answer
+//   PATCH  /v1/whep/resource/{id}  (application/trickle-ice-sdpfrag)            → proxy to Stream resource → 204
+//   DELETE /v1/whep/resource/{id}                                              → proxy DELETE + stop meter → 204
 //
-// TRUST (§3, §9): gateway-forwarded; the edge trusts ONLY the gateway-injected `x-wave-internal` secret via
-// the worker's EXISTING timingSafeEqual gateway-trust check (gatewayGate). No JWT. Org comes from the
-// gateway-stamped `x-wave-org` header (server-side from the key, never body).
+// MEDIA OFF THE WORKER (§8.2): ICE/DTLS/SRTP terminate at Cloudflare Stream's WebRTC edge, never on the Worker.
+// The Worker is signaling-only glue — it relays SDP verbatim and never decodes/transcodes/carries media.
 //
-// SOURCE RESOLUTION (§3, §0): the publisher's SFU session is resolved from the WHIP resource record
-// (`whip:{resourceId}` in RT_MEETING_ORG) the WHIP publish persisted — the WHIP→WHEP join point. The source
-// record's org MUST equal the request org (§9.6 tenant isolation; cross-org/unknown → indistinguishable 404).
+// TRUST (§3, §9): gateway-forwarded; the edge trusts ONLY the gateway-injected `x-wave-internal` secret via the
+// worker's EXISTING timingSafeEqual gateway-trust check (gatewayGate). No JWT. Org comes from the gateway-stamped
+// `x-wave-org` header (server-side from the key, never body).
 //
-// INERT (§3 tail): the whole surface is reached ONLY when `WHEP_EGRESS_ENABLED` is truthy. Off (the default)
-// → the worker's 501 catch-all is unchanged. This module is never entered.
+// TENANT ISOLATION (§3, §9.6): the source live-input's org is resolved SERVER-SIDE from the `stream-input-org:`
+// KV record (the SAME uid→org map src/stream-bridge.ts uses for org attribution). A WHEP subscriber may pull a
+// live input ONLY when its registered org equals the request org; an unknown OR cross-org input is an
+// indistinguishable 404 (no existence leak across tenants). The uid is a LOOKUP KEY, never an org claim.
 //
-// ⚠️ SFU-API GAP (§10): CF Realtime pull is SFU-offer/client-answer (the inverse of single-shot WHEP).
-// newSession(clientOffer) returns the transport answer, but the PULLED track is attached by a SECOND
-// negotiation the single WHEP answer cannot carry; v1 signals this with `x-wave-whep-renegotiation: 1`.
-// First-frame is therefore NOT proven by this surface alone — see the contract §10.
+// INERT (§3 tail): the whole surface is reached ONLY when `WHEP_EGRESS_ENABLED` is truthy. Off (the default) →
+// the worker's 501 catch-all is unchanged; this module is never entered. The Stream backend additionally
+// fail-closes 503 when `USE_CLOUDFLARE_STREAM` is off or no playback URL is resolvable.
 
-import { SfuClient, SfuError, type SessionDescription } from "./sfu.js";
 import {
 	type MeterEmitEnv,
 	isEmitProvisioned,
 	type UsageEnvelope,
 	type MeterLine,
 } from "./metering.js";
+import { STREAM_INPUT_ORG_PREFIX } from "./stream-bridge.js";
 
 /** WHEP egress meter — dedicated SKU per the frozen contract §4 (priced to STRIPE_PRICE_WHEP_EGRESS_MIN). */
 export const METER_WHEP_EGRESS_MINUTES = "wave_whep_egress_minutes";
 
 /** WHEP resource ids are opaque url-safe tokens we mint; guard before path interpolation / KV keys. */
 const RESOURCE_ID = /^[0-9a-zA-Z_-]{8,128}$/;
-/** Track names (subscriber-supplied, §10 gap 2) are url-safe SFU identifiers; guard before relay. */
-const TRACK_NAME = /^[0-9a-zA-Z_.:-]{1,256}$/;
+/** CF Stream live-input uids are 32-hex tokens; guard BEFORE interpolating into the playback URL (SSRF-safe). */
+const LIVE_INPUT_UID = /^[0-9a-fA-F]{32}$/;
 /** KV key prefix for the WHEP resourceId → session record (reuses the RT_MEETING_ORG namespace). */
 const WHEP_KV_PREFIX = "whep:";
-/** The WHIP publish persists its resource record under this prefix — the WHEP source-resolution join point. */
-const WHIP_KV_PREFIX = "whip:";
 /** Resource records outlive a subscribe session comfortably; TTL bounds the teardown window. */
 const WHEP_KV_TTL_SECONDS = 60 * 60 * 24; // 24h
 
@@ -59,45 +60,43 @@ export interface WhepKv {
 	delete(key: string): Promise<void>;
 }
 
-/** The subset of worker Env this module reads. SFU creds gate liveness; meter/KV are optional → INERT. */
+/**
+ * The subset of worker Env this module reads. The Stream playback URL gates liveness; meter/KV are optional → INERT.
+ * The CF Stream creds are `wrangler secret put` values (never in wrangler.toml). Both the `CF_STREAM_*` and the
+ * legacy `CLOUDFLARE_STREAM_*` names are accepted (Doppler populates the latter); whichever is bound wins.
+ */
 export interface WhepEnv extends MeterEmitEnv {
 	WHEP_EGRESS_ENABLED?: string | boolean; // [vars] flag — falsy/absent → surface is inert (worker 501s)
-	CF_CALLS_APP_ID?: string; // CF Realtime SFU app id (hex) — SfuClient appId
-	CF_CALLS_APP_SECRET?: string; // CF Realtime SFU app secret (Bearer) — never logged/returned
-	RT_MEETING_ORG?: WhepKv; // reused KV namespace: WHEP resourceId record + WHIP source lookup
+	USE_CLOUDFLARE_STREAM?: string | boolean; // Stream backend gate — falsy/absent → subscribe fails closed 503
+	WHEP_SRC_URL_TEMPLATE?: string; // SECRET. Stream WHEP playback URL template with a `{uid}` placeholder (primary)
+	CF_STREAM_CUSTOMER_CODE?: string; // SECRET. Stream customer subdomain code — fallback URL build when no template
+	CF_STREAM_API_TOKEN?: string; // SECRET. Reserved: Stream-API source resolution/validation (not on the hot path)
+	CLOUDFLARE_STREAM_CUSTOMER_CODE?: string; // accepted alias of CF_STREAM_CUSTOMER_CODE (Doppler-populated name)
+	CLOUDFLARE_STREAM_API_TOKEN?: string; // accepted alias of CF_STREAM_API_TOKEN
+	RT_MEETING_ORG?: WhepKv; // reused KV namespace: WHEP resourceId record + `stream-input-org:` source lookup
 }
 
-/** A persisted WHEP resource record (resourceId → subscriber SFU session), used by PATCH/DELETE. */
+/** A persisted WHEP resource record (resourceId → the upstream Stream WHEP resource), used by PATCH/DELETE. */
 interface WhepResource {
-	subscriberSessionId: string;
-	publisherSessionId: string;
-	trackName: string;
+	streamResourceUrl: string; // absolute Stream WHEP resource URL (Stream's Location) — proxy PATCH/DELETE here
+	liveInputUid: string;
 	org: string;
 	startedAt: number; // epoch ms — start of the subscribe session, for the teardown meter
 }
 
-/** Shape of the WHIP publish record we read to resolve the source publisher session (whip.ts WhipResource). */
-interface WhipSourceRecord {
-	sessionId: string;
-	org: string;
-}
-
 /** Injectable seams so every path unit-tests with NO live network (mirrors src/whip.ts WhipDeps). */
 export interface WhepDeps {
-	/** Build the SFU client (live: from env creds). Throws SfuError(503) when unconfigured (fail-closed). */
-	sfu(env: WhepEnv): SfuClient;
 	/** Wall clock (epoch ms) — injectable so teardown-meter duration is deterministic in tests. */
 	now(): number;
 	/** Mint an opaque resource id. Injectable for deterministic tests; live uses crypto.randomUUID. */
 	mintResourceId(): string;
-	/** HTTP for the teardown meter emit (fail-open). Defaults to global fetch. */
+	/** HTTP for the Stream WHEP relay AND the teardown meter emit. Defaults to global fetch. */
 	fetch: typeof fetch;
 }
 
-/** Live deps: SfuClient from env, real clock, crypto-random ids, global fetch. */
+/** Live deps: real clock, crypto-random ids, global fetch (the Stream relay + meter client). */
 export function liveWhepDeps(): WhepDeps {
 	return {
-		sfu: (env) => new SfuClient({ appId: env.CF_CALLS_APP_ID ?? "", appSecret: env.CF_CALLS_APP_SECRET ?? "" }),
 		now: () => Date.now(),
 		mintResourceId: () => crypto.randomUUID().replace(/-/g, ""),
 		fetch,
@@ -108,6 +107,26 @@ export function liveWhepDeps(): WhepDeps {
 export function whepEgressEnabled(env: WhepEnv): boolean {
 	const v = env.WHEP_EGRESS_ENABLED;
 	return v === true || v === "1" || v === "true";
+}
+
+/** True when the CF Stream WebRTC playback backend is armed. Off → subscribe fails closed (503). */
+export function useCloudflareStream(env: WhepEnv): boolean {
+	const v = env.USE_CLOUDFLARE_STREAM;
+	return v === true || v === "1" || v === "true";
+}
+
+/**
+ * Resolve the Cloudflare Stream WHEP playback URL for a live-input uid. PURE (no I/O) — the playback URL is
+ * deterministic and secret-free. Primary: substitute `{uid}` in `WHEP_SRC_URL_TEMPLATE`. Fallback: build it
+ * from the customer code (`https://customer-{code}.cloudflarestream.com/{uid}/webRTC/play`). Null when neither
+ * is configured (→ caller fail-closes 503). The uid is pre-validated (LIVE_INPUT_UID) before it reaches here.
+ */
+export function resolveStreamPlaybackUrl(env: WhepEnv, uid: string): string | null {
+	const template = env.WHEP_SRC_URL_TEMPLATE;
+	if (template && template.includes("{uid}")) return template.replaceAll("{uid}", uid);
+	const code = env.CF_STREAM_CUSTOMER_CODE ?? env.CLOUDFLARE_STREAM_CUSTOMER_CODE;
+	if (code) return `https://customer-${code}.cloudflarestream.com/${uid}/webRTC/play`;
+	return null;
 }
 
 /** Typed JSON error envelope (the 201 body is SDP; every error body is JSON, mirroring the spoke contract). */
@@ -163,16 +182,14 @@ async function loadResource(kv: WhepKv | undefined, resourceId: string): Promise
 	try {
 		const r = JSON.parse(raw) as Partial<WhepResource>;
 		if (
-			typeof r.subscriberSessionId === "string" &&
-			typeof r.publisherSessionId === "string" &&
-			typeof r.trackName === "string" &&
+			typeof r.streamResourceUrl === "string" &&
+			typeof r.liveInputUid === "string" &&
 			typeof r.org === "string" &&
 			typeof r.startedAt === "number"
 		) {
 			return {
-				subscriberSessionId: r.subscriberSessionId,
-				publisherSessionId: r.publisherSessionId,
-				trackName: r.trackName,
+				streamResourceUrl: r.streamResourceUrl,
+				liveInputUid: r.liveInputUid,
 				org: r.org,
 				startedAt: r.startedAt,
 			};
@@ -184,48 +201,30 @@ async function loadResource(kv: WhepKv | undefined, resourceId: string): Promise
 }
 
 /**
- * Resolve the source publisher SFU session from a WHIP resource record (`whip:{resourceId}`). Returns the
- * publisher sessionId ONLY when the record exists AND is owned by the SAME org (§9.6 tenant isolation:
- * cross-org/unknown is an indistinguishable null → 404 to the caller, no existence leak). Null on absent/corrupt.
+ * Resolve the source live-input's org from the `stream-input-org:{uid}` KV record (the SAME uid→org map
+ * src/stream-bridge.ts uses). Returns the org ONLY when the record exists AND equals the request org (§9.6
+ * tenant isolation: cross-org/unknown is an indistinguishable null → 404, no existence leak). Null on absent.
  */
-async function resolvePublisherSession(kv: WhepKv | undefined, resourceId: string, org: string): Promise<string | null> {
-	if (!kv) return null;
-	const raw = await kv.get(`${WHIP_KV_PREFIX}${resourceId}`);
-	if (!raw) return null;
-	try {
-		const r = JSON.parse(raw) as Partial<WhipSourceRecord>;
-		if (typeof r.sessionId === "string" && typeof r.org === "string" && r.org === org) {
-			return r.sessionId;
-		}
-	} catch {
-		/* corrupt record → treat as absent */
-	}
-	return null;
+async function resolveInputOrgMatch(kv: WhepKv | undefined, uid: string, org: string): Promise<boolean> {
+	if (!kv) return false;
+	const stored = await kv.get(`${STREAM_INPUT_ORG_PREFIX}${uid}`);
+	return typeof stored === "string" && stored === org;
 }
 
 /**
  * POST /v1/whep/subscribe — the WHEP offer handshake. The request body is the subscriber's SDP offer
- * (Content-Type: application/sdp). We resolve the source publisher session from the WHIP resource id
- * (`?resource=`), create the subscriber's SFU session FROM the offer (newSession, verbatim SDP passthrough),
- * pull the named published track (`?track=`) into it, and return the SFU's SDP answer as the 201 body plus a
- * `Location: /v1/whep/resource/{resourceId}` the gateway rewrites to a gateway-absolute path.
- *
- * ⚠️ §10 gap 1: CF Realtime pull is SFU-offer/client-answer. The 201 answer is the transport answer; the
- * pulled track may need a follow-up renegotiation (signalled via `x-wave-whep-renegotiation: 1`). First-frame
- * over the single-shot answer is therefore not guaranteed — see the contract §10.
+ * (Content-Type: application/sdp). We resolve the source live-input's org (`?resource=` = the CF Stream live-input
+ * uid) — same-org only (§9.6) — build the Stream WebRTC playback URL, RELAY the offer to it verbatim, and return
+ * Stream's 201 + answer body verbatim plus a `Location: /v1/whep/resource/{resourceId}` the gateway rewrites to a
+ * gateway-absolute path. ONE-SHOT: Stream's WHEP playback returns the final answer; no renegotiation header.
  *
  * AUTH is enforced by the worker (gatewayGate) BEFORE this runs — org arrives via x-wave-org.
  */
 async function handleSubscribe(request: Request, env: WhepEnv, deps: WhepDeps, org: string): Promise<Response> {
 	const url = new URL(request.url);
-	const sourceResource = url.searchParams.get("resource") ?? "";
-	const trackName = url.searchParams.get("track") ?? "";
-	if (!RESOURCE_ID.test(sourceResource) || !TRACK_NAME.test(trackName)) {
-		return jsonError(
-			"WHEP_BAD_REQUEST",
-			"WHEP subscribe requires a valid ?resource={whipResourceId} and ?track={trackName}",
-			400,
-		);
+	const liveInputUid = url.searchParams.get("resource") ?? "";
+	if (!LIVE_INPUT_UID.test(liveInputUid)) {
+		return jsonError("WHEP_BAD_REQUEST", "WHEP subscribe requires a valid ?resource={liveInputUid}", 400);
 	}
 
 	const ct = (request.headers.get("content-type") ?? "").toLowerCase();
@@ -237,96 +236,90 @@ async function handleSubscribe(request: Request, env: WhepEnv, deps: WhepDeps, o
 	if (!sdp || !/^v=0(\r?\n|\r)/.test(sdp)) {
 		return jsonError("WHEP_UNPROCESSABLE_SDP", "request body is not a parseable SDP offer", 422);
 	}
-	// CF Realtime's SDP parser REJECTS an offer that does not end in a newline (400 "Unable to parse SDP").
-	// The .trim() above (needed for the v=0 guard) strips the subscriber's trailing CRLF, so re-terminate the
-	// relayed offer. (Mirrors src/whip.ts #100B.)
-	const offer: SessionDescription = { type: "offer", sdp: sdp + "\r\n" };
+	// Re-terminate the offer with CRLF (the .trim() above strips the subscriber's trailing newline). Harmless and
+	// conformant for a standard WHEP server. (Mirrors src/whip.ts #100B.)
+	const offerSdp = sdp + "\r\n";
 
-	// Resolve the source publisher session from the WHIP resource record (same-org only — §9.6). An unknown or
-	// cross-org source is an indistinguishable 404 (no existence leak across tenants).
-	const publisherSessionId = await resolvePublisherSession(env.RT_MEETING_ORG, sourceResource, org);
-	if (!publisherSessionId) {
+	// Tenant isolation (§9.6): the live-input must be registered to THIS org. Unknown OR cross-org → 404.
+	if (!(await resolveInputOrgMatch(env.RT_MEETING_ORG, liveInputUid, org))) {
 		return jsonError("WHEP_SOURCE_NOT_FOUND", "no such WHEP source resource for this org", 404);
 	}
 
-	let sfu: SfuClient;
-	try {
-		sfu = deps.sfu(env); // throws SfuError(503) when CF Realtime app creds are absent (fail-closed)
-	} catch (e) {
-		const err = e instanceof SfuError ? e : new SfuError("REALTIME_NOT_CONFIGURED", "SFU unavailable", 503);
-		return jsonError(err.code, err.message, err.status);
+	// Fail-CLOSED when the Stream backend is disabled OR no playback URL is resolvable (no creds).
+	if (!useCloudflareStream(env)) {
+		return jsonError("REALTIME_NOT_CONFIGURED", "Cloudflare Stream WebRTC playback is not enabled", 503);
+	}
+	const playbackUrl = resolveStreamPlaybackUrl(env, liveInputUid);
+	if (!playbackUrl) {
+		return jsonError("REALTIME_NOT_CONFIGURED", "no Cloudflare Stream WHEP playback URL is configured", 503);
 	}
 
+	// Relay the offer to Stream's WHEP playback endpoint VERBATIM. The playback URL carries no secret, so no
+	// Authorization header is sent. Stream answers 201 + application/sdp + a Location (the WHEP resource).
+	let upstream: Response;
 	try {
-		// newSession(offer) creates the subscriber's SFU session FROM the offer and returns the SFU's transport
-		// answer (verbatim SDP passthrough).
-		const session = await sfu.newSession(offer);
-		const answer = session.sessionDescription;
-		if (!answer || answer.type !== "answer" || !answer.sdp) {
-			return jsonError("REALTIME_UPSTREAM", "SFU did not return an SDP answer", 503);
-		}
-
-		// Attach the published track: pull it from the PUBLISHER's session into the subscriber's session. The SFU
-		// may return requiresImmediateRenegotiation (an SFU offer the client answers) — §10 gap 1. We surface that
-		// to the caller via a response header; we do NOT throw on it (the transport answer is still valid).
-		let renegotiationRequired = false;
-		try {
-			const pull = await sfu.pullTracks(session.sessionId, [
-				{ location: "remote", sessionId: publisherSessionId, trackName },
-			]);
-			renegotiationRequired = pull.requiresImmediateRenegotiation === true;
-		} catch (e) {
-			const err = e instanceof SfuError ? e : new SfuError("REALTIME_ERROR", "WHEP pull failed", 503);
-			const status = err.status === 502 ? 503 : err.status;
-			return jsonError(err.code, err.message, status);
-		}
-
-		const resourceId = deps.mintResourceId();
-		if (!RESOURCE_ID.test(resourceId)) {
-			return jsonError("REALTIME_ERROR", "failed to mint a resource id", 500);
-		}
-
-		// Persist the resourceId → session record so PATCH(trickle)/DELETE(teardown) can address this session.
-		// Fail-open on the KV write: a persistence blip must not fail an otherwise-good subscribe. Loud, never silent.
-		const record: WhepResource = {
-			subscriberSessionId: session.sessionId,
-			publisherSessionId,
-			trackName,
-			org,
-			startedAt: deps.now(),
-		};
-		try {
-			await env.RT_MEETING_ORG?.put(`${WHEP_KV_PREFIX}${resourceId}`, JSON.stringify(record), {
-				expirationTtl: WHEP_KV_TTL_SECONDS,
-			});
-		} catch (e) {
-			console.warn(`whep-resource persist failed resourceId=${resourceId}: ${(e as Error)?.message ?? e}`);
-		}
-
-		// 201 Created — body is the SFU's SDP answer; Location is an edge-relative WHEP resource path (the
-		// gateway rewrites it to a gateway-absolute path so PATCH/DELETE stay on the control plane, §2/§3).
-		return new Response(answer.sdp, {
-			status: 201,
-			headers: {
-				"content-type": "application/sdp",
-				location: `/v1/whep/resource/${resourceId}`,
-				"x-wave-whep-renegotiation": renegotiationRequired ? "1" : "0",
-			},
+		upstream = await deps.fetch(playbackUrl, {
+			method: "POST",
+			headers: { "content-type": "application/sdp" },
+			body: offerSdp,
 		});
 	} catch (e) {
-		const err = e instanceof SfuError ? e : new SfuError("REALTIME_ERROR", "WHEP subscribe failed", 503);
-		// SfuError default status is 502 for upstream; surface the SFU-unavailable class as 503 per §3.
-		const status = err.status === 502 ? 503 : err.status;
-		return jsonError(err.code, err.message, status);
+		console.warn(`whep-relay error uid=${liveInputUid}: ${(e as Error)?.message ?? e}`);
+		return jsonError("REALTIME_UPSTREAM", "Cloudflare Stream WHEP relay failed", 503);
 	}
+
+	const answer = await upstream.text();
+	if (upstream.status !== 201 || !answer) {
+		console.warn(`whep-relay non-201 uid=${liveInputUid} status=${upstream.status}`);
+		return jsonError("REALTIME_UPSTREAM", `Cloudflare Stream WHEP returned ${upstream.status}`, 503);
+	}
+
+	// Stream's Location is the WHEP resource the client/edge addresses for trickle/teardown. Resolve it absolute
+	// (against the playback URL) so PATCH/DELETE can proxy to it. Absent → PATCH/DELETE degrade to a local ack.
+	const loc = upstream.headers.get("location");
+	let streamResourceUrl = "";
+	if (loc) {
+		try {
+			streamResourceUrl = new URL(loc, playbackUrl).toString();
+		} catch {
+			streamResourceUrl = "";
+		}
+	}
+
+	const resourceId = deps.mintResourceId();
+	if (!RESOURCE_ID.test(resourceId)) {
+		return jsonError("REALTIME_ERROR", "failed to mint a resource id", 500);
+	}
+
+	// Persist the resourceId → Stream-resource record so PATCH(trickle)/DELETE(teardown) can address it. Fail-open
+	// on the KV write: a persistence blip must not fail an otherwise-good subscribe. Loud, never silent.
+	const record: WhepResource = { streamResourceUrl, liveInputUid, org, startedAt: deps.now() };
+	try {
+		await env.RT_MEETING_ORG?.put(`${WHEP_KV_PREFIX}${resourceId}`, JSON.stringify(record), {
+			expirationTtl: WHEP_KV_TTL_SECONDS,
+		});
+	} catch (e) {
+		console.warn(`whep-resource persist failed resourceId=${resourceId}: ${(e as Error)?.message ?? e}`);
+	}
+
+	// 201 Created — body is Stream's SDP answer VERBATIM; Location is an edge-relative WHEP resource path (the
+	// gateway rewrites it to a gateway-absolute path so PATCH/DELETE stay on the control plane, §2/§3). One-shot:
+	// Stream's WHEP playback returns the final answer, so there is NO renegotiation header.
+	return new Response(answer, {
+		status: 201,
+		headers: {
+			"content-type": "application/sdp",
+			location: `/v1/whep/resource/${resourceId}`,
+		},
+	});
 }
 
 /**
  * PATCH /v1/whep/resource/{id} — trickle-ICE candidate update (application/trickle-ice-sdpfrag) → 204.
- * v1 is SFU-only: CF Realtime negotiates ICE end-to-end with the subscriber, so an edge trickle PATCH is a
- * protocol-conformant ACK (204 No Content) — we validate the content-type and resource, and return 204.
+ * Proxies the trickle frag to the upstream Stream WHEP resource (best-effort), then returns the protocol-conformant
+ * 204 ACK. (Stream negotiates ICE end-to-end; a relay failure never fails the trickle ack.)
  */
-async function handlePatch(request: Request, env: WhepEnv, _deps: WhepDeps, resourceId: string): Promise<Response> {
+async function handlePatch(request: Request, env: WhepEnv, deps: WhepDeps, resourceId: string): Promise<Response> {
 	if (!RESOURCE_ID.test(resourceId)) {
 		return jsonError("WHEP_BAD_RESOURCE", "invalid WHEP resource id", 404);
 	}
@@ -342,14 +335,27 @@ async function handlePatch(request: Request, env: WhepEnv, _deps: WhepDeps, reso
 	if (!resource) {
 		return jsonError("WHEP_RESOURCE_GONE", "no such WHEP resource", 404);
 	}
-	// 204 No Content — the trickle is accepted (SFU handles ICE end-to-end with the subscriber).
+	// Proxy the trickle frag to the Stream WHEP resource (best-effort, fail-open). The 204 ACK is the trickle
+	// contract regardless of the upstream result (Stream handles ICE end-to-end with the subscriber).
+	if (resource.streamResourceUrl) {
+		const frag = await request.text();
+		try {
+			await deps.fetch(resource.streamResourceUrl, {
+				method: "PATCH",
+				headers: { "content-type": "application/trickle-ice-sdpfrag" },
+				body: frag,
+			});
+		} catch (e) {
+			console.warn(`whep-trickle proxy failed resourceId=${resourceId}: ${(e as Error)?.message ?? e}`);
+		}
+	}
 	return new Response(null, { status: 204 });
 }
 
 /**
  * DELETE /v1/whep/resource/{id} — teardown. Emit the teardown meter (`wave_whep_egress_minutes`,
- * idempotency = resourceId, FAIL-OPEN), and clear the resource record. 204. CF Realtime sessions GC on idle,
- * so there is no explicit SFU close primitive to drive from here in v1.
+ * idempotency = resourceId, FAIL-OPEN), proxy a DELETE to the upstream Stream WHEP resource (best-effort), and
+ * clear the resource record. 204.
  */
 async function handleDelete(env: WhepEnv, deps: WhepDeps, resourceId: string): Promise<Response> {
 	if (!RESOURCE_ID.test(resourceId)) {
@@ -363,6 +369,16 @@ async function handleDelete(env: WhepEnv, deps: WhepDeps, resourceId: string): P
 	// idempotency key (resourceId) and the org/startedAt are still in hand. A meter failure never blocks teardown.
 	const line = buildWhepMeterLine(resourceId, resource.startedAt, deps.now());
 	await emitWhepTeardownMeter(env, resource.org, line, deps.fetch);
+
+	// Proxy the teardown to the upstream Stream WHEP resource (best-effort, fail-open) so Stream releases the
+	// subscriber session promptly rather than waiting on idle-GC.
+	if (resource.streamResourceUrl) {
+		try {
+			await deps.fetch(resource.streamResourceUrl, { method: "DELETE" });
+		} catch (e) {
+			console.warn(`whep-teardown proxy failed resourceId=${resourceId}: ${(e as Error)?.message ?? e}`);
+		}
+	}
 
 	// Best-effort: clear the resource record. Dropping it makes a re-DELETE the idempotent no-op above.
 	try {

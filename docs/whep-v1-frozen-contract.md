@@ -1,21 +1,29 @@
-# WHEP v1 — Frozen Wire Contract (#53)  — v1.0
+# WHEP v1 — Frozen Wire Contract (#53)  — v1.1
 
 The **egress** sibling of `whip-v1-frozen-contract.md` (the WHIP ingest surface). WHEP =
 **WebRTC-HTTP Egress Protocol** (`draft-murillo-whep-03`): a subscriber receives a published WebRTC
 stream over plain HTTP signaling. This freezes the wire BEFORE implementation so the builder conforms.
 Method: persist the wire → builder conforms → zero drift. Mirrors the WHIP contract section-for-section.
 
-## 0. v1 scope (locked)
-- **SFU-only egress.** Control through the gateway (forwarded request, `x-wave-internal` seal); **media
-  off the Worker** — ICE/DTLS/SRTP terminate at **CF Realtime SFU** (`rtc.live.cloudflare.com`), never on
-  a Worker. The rt-edge `/v1/whep/*` handler is signaling-only glue: it relays SDP to/from the SFU verbatim.
-- **Pairs with WHIP.** A WHEP subscribe pulls a track that a WHIP publish (or any SFU session in the same
-  org) put on the SFU. The publisher's SFU session is resolved from the WHIP resource record
-  (`whip:{resourceId}` in `RT_MEETING_ORG`) the WHIP publish persisted — this is the WHIP→WHEP join point.
+## 0. v1 scope (locked) — RESOLVED via Cloudflare Stream webRTCPlayback (one-shot)
+- **Source = Cloudflare Stream WebRTC playback.** The CF Realtime SFU does NOT expose a one-shot WHEP pull
+  (its `pullTracks` is SFU-offer/client-answer, the INVERSE of single-shot WHEP). The correct one-shot WHEP
+  path is **Cloudflare Stream's WebRTC playback endpoint** (`.webRTCPlayback.url` on a Stream live input),
+  which IS a standard WHEP server. Control through the gateway (forwarded request, `x-wave-internal` seal);
+  **media off the Worker** — ICE/DTLS/SRTP terminate at Cloudflare Stream's WebRTC edge, never on a Worker.
+  The rt-edge `/v1/whep/*` handler is signaling-only glue: it RELAYS the subscriber's SDP offer to the Stream
+  playback URL verbatim and returns Stream's answer verbatim.
+- **Playback URL is deterministic + secret-free:** `https://customer-{CODE}.cloudflarestream.com/{uid}/webRTC/play`
+  (confirmed live via the Stream `live_inputs` API field `.result.webRTCPlayback.url`). The edge substitutes
+  the live-input uid into `WHEP_SRC_URL_TEMPLATE` (a `wrangler` SECRET with a `{uid}` placeholder; customer
+  code baked in), or builds it from `CF_STREAM_CUSTOMER_CODE`. No token is in the playback URL.
+- **`?resource=` is the CF Stream live-input uid** (32-hex). Org is resolved SERVER-SIDE from the
+  `stream-input-org:{uid}` KV record (the SAME uid→org map `src/stream-bridge.ts` uses) and MUST equal the
+  request org — the tenant-isolation join point. The uid is a lookup key, never an org claim (§9.6).
 - **Per-product metering standard:** dedicated scope `whep:read` + dedicated SKU `wave_whep_egress_minutes`
   + own `STRIPE_PRICE_WHEP_EGRESS_MIN`.
-- **NOT in v1:** track-discovery registry (the subscriber NAMES the track — see §10 gap 2), multi-track
-  bundles, SVC layer selection, server-driven renegotiation completion (see §10 gap 1).
+- **NOT in v1:** track/quality selection (Stream plays the live program), multi-bundle. **Backend gate:**
+  `USE_CLOUDFLARE_STREAM` (off → subscribe fails closed 503).
 
 ## 1. Lockstep enums — BYTE-IDENTICAL to `c1g1-frozen-contract.md` §4 / WHIP §1
 - **CODECS** = `[h264, hevc, av1, vp8, vp9, aac, opus, pcm, flac]`
@@ -34,20 +42,22 @@ Method: persist the wire → builder conforms → zero drift. Mirrors the WHIP c
   WHEP-resource `PATCH`(trickle)/`DELETE`(teardown) stay on the control plane (auth + meter).
 
 ## 3. WHEP handshake at the edge — behind `WHEP_EGRESS_ENABLED`
-- `POST {gateway}/v1/whep/subscribe?resource={whipResourceId}&track={trackName}` → (forwarded,
-  `x-wave-internal`) → edge:
+- `POST {gateway}/v1/whep/subscribe?resource={liveInputUid}` → (forwarded, `x-wave-internal`) → edge:
   validate `x-wave-internal` (the edge's EXISTING `timingSafeEqual` gateway-trust check — NOT a JWT) →
-  resolve the publisher SFU session from `whip:{resourceId}` in `RT_MEETING_ORG` (must be the SAME org —
-  tenant isolation, §9.6) → `SfuClient.newSession(clientOffer)` (transport + answer) +
-  `SfuClient.pullTracks(subscriberSession, [{remote, sessionId, trackName}])` (attach the published track) →
-  **201 Created**, `Location: /v1/whep/resource/{resourceId}`, `Content-Type: application/sdp`, body = SDP
-  **ANSWER**. Response header `x-wave-whep-renegotiation: 0|1` signals whether the SFU requires a follow-up
-  renegotiation (§10 gap 1). (The gateway rewrites Location on the way back.)
-- `PATCH {gateway}/v1/whep/resource/{id}` — `application/trickle-ice-sdpfrag` → **204** (trickle ACK).
-- `DELETE {gateway}/v1/whep/resource/{id}` → **204** (teardown → stop meter; SFU session GCs on idle).
+  resolve the live-input's org from `stream-input-org:{uid}` in `RT_MEETING_ORG` (must equal the request org —
+  tenant isolation, §9.6) → resolve the Stream WHEP playback URL (`WHEP_SRC_URL_TEMPLATE` `{uid}` substitution,
+  or built from `CF_STREAM_CUSTOMER_CODE`) → **RELAY** the client's `application/sdp` offer to the Stream
+  playback URL verbatim (one-shot) → return Stream's **201 Created** body (SDP **ANSWER**) verbatim,
+  `Location: /v1/whep/resource/{resourceId}`, `Content-Type: application/sdp`. **One-shot — NO
+  `x-wave-whep-renegotiation` header** (Stream's WHEP playback returns the final answer). (The gateway rewrites
+  Location on the way back.)
+- `PATCH {gateway}/v1/whep/resource/{id}` — `application/trickle-ice-sdpfrag` → proxy the frag to the upstream
+  Stream WHEP resource (best-effort) → **204** (trickle ACK).
+- `DELETE {gateway}/v1/whep/resource/{id}` → proxy DELETE to the Stream WHEP resource (best-effort) → **204**
+  (teardown → stop meter).
 - Errors (typed JSON; 201 body is SDP): **401** missing/invalid `x-wave-internal` · **400** missing/malformed
-  org OR missing `track` · **404** unknown/cross-org source resource OR bad/gone WHEP resource · **415** wrong
-  content-type · **422** unparseable SDP offer · **503** SFU unavailable.
+  org OR missing/invalid `resource` · **404** unknown/cross-org source live-input OR bad/gone WHEP resource ·
+  **415** wrong content-type · **422** unparseable SDP offer · **503** Stream disabled/unavailable.
 - **INERT:** behind `WHEP_EGRESS_ENABLED` (`[vars]`). Off/absent → a `/v1/whep/*` request falls through to the
   honest 501 catch-all (`worker.ts`), UNCHANGED. This module is never entered.
 
@@ -59,8 +69,9 @@ Method: persist the wire → builder conforms → zero drift. Mirrors the WHIP c
 
 ## 5. Builders
 - **rt-edge** (#53, wave-realtime-edge, branch `feat/53-whep-v1`): `src/whep.ts` `/v1/whep/*` handler; trust
-  `x-wave-internal` via the existing chokepoint; `newSession`/`pullTracks` → answer+Location; PATCH/DELETE;
-  meter on teardown; contract tests. **INERT** behind `WHEP_EGRESS_ENABLED` until the deploy ◆.
+  `x-wave-internal` via the existing chokepoint; resolve org via `stream-input-org:{uid}` → relay the offer to
+  the Stream WHEP playback URL → return Stream's answer+Location; PATCH/DELETE proxy to the Stream resource;
+  meter on teardown; contract tests. **INERT** behind `WHEP_EGRESS_ENABLED` (+ `USE_CLOUDFLARE_STREAM`) until ◆.
 - **gateway** (follow-up): add `whep` to the scope group + the `/v1/whep/*` forward mapping + Location rewrite
   + `usage.ts` `wave_whep_egress_minutes`/`STRIPE_PRICE_WHEP_EGRESS_MIN`.
 
@@ -69,8 +80,9 @@ Method: persist the wire → builder conforms → zero drift. Mirrors the WHIP c
 2. `npx wrangler deploy` rt-edge with `WHEP_EGRESS_ENABLED` armed → prove a `/v1/whep/subscribe` probe is
    **401** (gateway-trust), NOT 501 (surface live + sealed).
 3. ◆ gateway forward mapping + `whep:read` scope + `STRIPE_PRICE_WHEP_EGRESS_MIN`.
-4. ◆ prove a real WHIP-publish → WHEP-subscribe → **first frame** lands (receipt = 201 + SFU answer SDP with
-   the pulled m-line + decoded first frame at the subscriber + usage row).
+4. ◆ prove first frame: publish into a CF Stream live input (WHIP/RTMP/SRT) → WHEP-subscribe via
+   `webRTCPlayback` → **first frame** lands (receipt = 201 + Stream answer SDP with the playback m-line +
+   decoded first frame at the subscriber + usage row).
 
 ## 7. ◆ crossings needing Jake (NAME, don't auto-fire)
 - `WHEP_EGRESS_ENABLED=1` on a live env (NEW LIVE EGRESS path activation) — named-floor.
@@ -91,17 +103,13 @@ Method: persist the wire → builder conforms → zero drift. Mirrors the WHIP c
 - §9.6 tenant isolation: the source `whip:{resourceId}` record's org MUST equal the request org, else 404
   (no existence leak across tenants).
 
-## 10. Known SFU-API gaps (HONEST — first-frame is NOT proven by this PR)
-1. **Negotiation direction.** CF Realtime SFU pull is **SFU-offer / client-answer** (`pullTracks` returns
-   `requiresImmediateRenegotiation` + an SFU offer the client answers via `renegotiate`; see
-   `signaling.ts:199-222`). This is the INVERSE of single-shot WHEP (client-offer → server-answer). So
-   `newSession(clientOffer)` returns the transport answer, but the PULLED track's media is attached by a
-   SECOND negotiation the single WHEP answer cannot carry. v1 surfaces this with the
-   `x-wave-whep-renegotiation: 1` response header; completing media flow (server-offer renegotiation over
-   the WHEP resource) is a deferred follow-up. **Until then, single-shot first-frame is BLOCKED by the CF
-   pull model — the surface is wired, sealed, metered, and inert-correct, but first-frame must be proven
-   after the renegotiation seam lands (or a CF one-shot-pull primitive ships).**
-2. **Track discovery.** The WHIP v1 resource record persists only `{sessionId, org, startedAt, meter}` —
-   NOT the published trackNames. CF pull needs an explicit `(sessionId, trackName)`. So in v1 the WHEP
-   subscriber MUST name the track (`?track=`); there is no track-discovery registry on the SFU-only WHIP
-   path. A follow-up can persist published trackNames at WHIP publish to enable discovery.
+## 10. Negotiation model — RESOLVED via Cloudflare Stream webRTCPlayback (one-shot first-frame)
+1. **One-shot WHEP (RESOLVED).** The prior SFU `pullTracks` path was SFU-offer / client-answer (the INVERSE
+   of single-shot WHEP), which blocked single-shot first-frame. The repoint to **Cloudflare Stream WebRTC
+   playback** (`.webRTCPlayback.url`) is a standard one-shot WHEP server: the edge relays the client's offer
+   and Stream returns the FINAL SDP answer in the 201 body — first frame flows over that single exchange.
+   There is NO `x-wave-whep-renegotiation` header and no deferred renegotiation seam. First-frame is provable
+   end-to-end (see §6 step 4 receipt).
+2. **Track/quality selection.** Cloudflare Stream WebRTC playback plays the live input's program; there is no
+   per-track naming on the playback URL. `?resource=` is the live-input uid; no `?track=` is required. SVC /
+   quality selection is a Stream-side concern, out of scope for v1.

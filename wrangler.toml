@@ -79,6 +79,13 @@ WHIP_INGEST_ENABLED = "1"
 # binding (orphan meter blocks GA). Reuses the EXISTING x-wave-internal realtime seal + RT_MEETING_ORG KV.
 # Default OFF until that ◆.
 WHEP_EGRESS_ENABLED = "0"
+# Source = Cloudflare Stream WebRTC playback (one-shot WHEP). USE_CLOUDFLARE_STREAM is the backend gate —
+# absent/"0" → /v1/whep/subscribe fails closed 503 (in addition to the WHEP_EGRESS_ENABLED surface gate above).
+# The playback URL is resolved from `wrangler secret put` SECRETS (NEVER in this file): WHEP_SRC_URL_TEMPLATE
+# (Stream playback URL with a `{uid}` placeholder; the customer code is baked in, NO token in the URL), or
+# built from CF_STREAM_CUSTOMER_CODE. CF_STREAM_API_TOKEN is reserved for Stream-API source resolution. Org
+# isolation reuses the `stream-input-org:{uid}` KV map (src/stream-bridge.ts). Default OFF until the ◆.
+# USE_CLOUDFLARE_STREAM = "1"
 
 # ── B1 (#91-a) — CF Stream Live → SFU bridge control plane (POST /v1/stream/bridge/webhook). DEFAULT OFF. ──
 # STREAM_BRIDGE_ENABLED gates the self-authenticating CF Stream webhook receiver (src/stream-bridge.ts). Absent/

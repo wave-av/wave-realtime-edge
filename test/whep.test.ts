@@ -1,27 +1,33 @@
-// #53 — IETF WHEP v1 egress listener contract tests (docs/whep-v1-frozen-contract.md §3/§4/§9/§10).
+// #53 — IETF WHEP v1 egress listener contract tests (docs/whep-v1-frozen-contract.md §0/§3/§4/§9/§10).
 //
-// Drives the WHEP surface THROUGH the worker entry (so the flag-gate + gateway-trust + org wiring are covered)
-// with WHEP_EGRESS_ENABLED on. The SFU is mocked via the handleWhep deps seam (no live network). KV is an
-// in-memory stub seeded with a WHIP source record (the WHIP→WHEP join point). Asserts: 201 + Location + SDP
-// answer body + renegotiation header, 400 (missing track/resource), 404 (unknown/cross-org source), 415/422/503
-// errors, PATCH 204 trickle, DELETE teardown + meter emit + idempotency. Also re-confirms 501 when flag is OFF.
+// REPOINTED to Cloudflare Stream WebRTC playback (one-shot WHEP). Drives the WHEP surface THROUGH the worker
+// entry (so the flag-gate + gateway-trust + org wiring are covered) with WHEP_EGRESS_ENABLED on. The Stream
+// WHEP playback endpoint is mocked via the handleWhep deps.fetch seam (no live network). KV is an in-memory
+// stub seeded with a `stream-input-org:{uid}` record (the tenant-isolation join point). Asserts: 201 + Location
+// + SDP answer body (verbatim) + NO renegotiation header, offer relayed verbatim+newline-terminated to the
+// resolved playback URL, 400 (bad resource), 404 (unknown/cross-org input), 415/422/503 errors, PATCH 204
+// trickle proxy, DELETE teardown + meter emit + Stream DELETE proxy + idempotency. Also 501 when flag is OFF.
 import { describe, it, expect } from "vitest";
 import worker from "../src/worker.js";
 import {
 	handleWhep,
 	buildWhepMeterLine,
 	whepEgressEnabled,
+	useCloudflareStream,
+	resolveStreamPlaybackUrl,
 	emitWhepTeardownMeter,
 	METER_WHEP_EGRESS_MINUTES,
 	type WhepEnv,
 	type WhepDeps,
 	type WhepKv,
 } from "../src/whep.js";
-import { SfuError, type SessionDescription } from "../src/sfu.js";
 
 const ctx = { waitUntil: () => {} } as unknown as ExecutionContext;
 const OFFER_SDP = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n";
 const ANSWER_SDP = "v=0\r\no=- 2 2 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n";
+const UID = "a1b2c3d4e5f6071829304a5b6c7d8e9f"; // 32-hex CF Stream live-input uid
+const TEMPLATE = "https://customer-test.cloudflarestream.com/{uid}/webRTC/play";
+const STREAM_RESOURCE = `https://customer-test.cloudflarestream.com/${UID}/webRTC/play/sessions/SESS123`;
 
 /** In-memory KV stub implementing the minimal WhepKv surface. */
 function memKv(): WhepKv & { store: Map<string, string> } {
@@ -40,37 +46,56 @@ function memKv(): WhepKv & { store: Map<string, string> } {
 	};
 }
 
-/** Deps with a mocked SFU (newSession→answer, pullTracks→track), deterministic clock + id, recording fetch. */
-function mockDeps(
-	over: Partial<WhepDeps> = {},
-	pullResult: { requiresImmediateRenegotiation?: boolean } = {},
-): { deps: WhepDeps; meterCalls: { url: string; body: unknown }[] } {
+interface RelayCall {
+	url: string;
+	method?: string;
+	body?: unknown;
+	ct?: string;
+}
+
+/**
+ * Deps with a mocked Stream WHEP endpoint (POST→201+answer+Location; PATCH/DELETE→204) AND the meter emit
+ * (POST /v1/internal/usage→200), distinguished by URL. Deterministic clock + id.
+ */
+function mockDeps(over: Partial<WhepDeps> = {}, relayStatus = 201): {
+	deps: WhepDeps;
+	meterCalls: { url: string; body: unknown }[];
+	relayCalls: RelayCall[];
+} {
 	const meterCalls: { url: string; body: unknown }[] = [];
+	const relayCalls: RelayCall[] = [];
 	const deps: WhepDeps = {
-		sfu: () =>
-			({
-				newSession: async () => ({ sessionId: "sub00001abcd", sessionDescription: { type: "answer", sdp: ANSWER_SDP } }),
-				pullTracks: async () => ({ tracks: [{ trackName: "cam0" }], ...pullResult }),
-			}) as never,
 		now: () => 1_000_000,
 		mintResourceId: () => "wep00000001",
-		fetch: (async (url: string, init?: RequestInit) => {
-			meterCalls.push({ url, body: init?.body ? JSON.parse(init.body as string) : undefined });
-			return new Response(null, { status: 200 });
+		fetch: (async (input: string, init?: RequestInit) => {
+			const url = String(input);
+			if (url.includes("/v1/internal/usage")) {
+				meterCalls.push({ url, body: init?.body ? JSON.parse(init.body as string) : undefined });
+				return new Response(null, { status: 200 });
+			}
+			const ct = (init?.headers as Record<string, string> | undefined)?.["content-type"];
+			relayCalls.push({ url, method: init?.method, body: init?.body, ct });
+			if (init?.method === "POST") {
+				return new Response(ANSWER_SDP, {
+					status: relayStatus,
+					headers: { "content-type": "application/sdp", location: STREAM_RESOURCE },
+				});
+			}
+			return new Response(null, { status: 204 }); // PATCH / DELETE proxy
 		}) as unknown as typeof fetch,
 		...over,
 	};
-	return { deps, meterCalls };
+	return { deps, meterCalls, relayCalls };
 }
 
-/** Env with an in-memory KV pre-seeded with a WHIP source record `whip:pub00000001` owned by `org_A`. */
+/** Env with USE_CLOUDFLARE_STREAM + a playback template, and KV pre-seeded with `stream-input-org:{UID}`=org_A. */
 function whepEnv(over: Record<string, unknown> = {}): WhepEnv & Record<string, unknown> {
 	const kv = memKv();
-	kv.store.set("whip:pub00000001", JSON.stringify({ sessionId: "pubsess0001", org: "org_A", startedAt: 1 }));
+	kv.store.set(`stream-input-org:${UID}`, "org_A");
 	return {
 		WHEP_EGRESS_ENABLED: "1",
-		CF_CALLS_APP_ID: "a".repeat(32),
-		CF_CALLS_APP_SECRET: "sekret",
+		USE_CLOUDFLARE_STREAM: "1",
+		WHEP_SRC_URL_TEMPLATE: TEMPLATE,
 		RT_MEETING_ORG: kv,
 		...over,
 	} as never;
@@ -80,11 +105,11 @@ function whepReq(method: string, path: string, headers: Record<string, string> =
 	return new Request(`https://rt.wave.online${path}`, { method, headers, body });
 }
 
-const SUB = "/v1/whep/subscribe?resource=pub00000001&track=cam0";
+const SUB = `/v1/whep/subscribe?resource=${UID}`;
 
 // ── Direct handler tests (deps injected) ──────────────────────────────────
-describe("handleWhep — POST /v1/whep/subscribe (happy path)", () => {
-	it("201 + Location + application/sdp answer body; persists the resource; renegotiation header", async () => {
+describe("handleWhep — POST /v1/whep/subscribe (happy path, Stream relay)", () => {
+	it("201 + Location + application/sdp answer body; persists the resource; NO renegotiation header", async () => {
 		const { deps } = mockDeps();
 		const env = whepEnv();
 		const res = await handleWhep(whepReq("POST", SUB, { "content-type": "application/sdp" }, OFFER_SDP), env, "org_A", deps);
@@ -92,57 +117,27 @@ describe("handleWhep — POST /v1/whep/subscribe (happy path)", () => {
 		expect(res!.status).toBe(201);
 		expect(res!.headers.get("content-type")).toMatch(/application\/sdp/);
 		expect(res!.headers.get("location")).toBe("/v1/whep/resource/wep00000001");
-		expect(res!.headers.get("x-wave-whep-renegotiation")).toBe("0");
+		expect(res!.headers.get("x-wave-whep-renegotiation")).toBeNull();
 		expect(await res!.text()).toBe(ANSWER_SDP);
 		const kv = env.RT_MEETING_ORG as WhepKv & { store: Map<string, string> };
 		expect(kv.store.has("whep:wep00000001")).toBe(true);
+		expect(JSON.parse(kv.store.get("whep:wep00000001")!).streamResourceUrl).toBe(STREAM_RESOURCE);
 	});
 
-	it("signals x-wave-whep-renegotiation=1 when the SFU pull requires renegotiation (§10 gap 1)", async () => {
-		const { deps } = mockDeps({}, { requiresImmediateRenegotiation: true });
-		const res = await handleWhep(whepReq("POST", SUB, { "content-type": "application/sdp" }, OFFER_SDP), whepEnv(), "org_A", deps);
-		expect(res!.status).toBe(201);
-		expect(res!.headers.get("x-wave-whep-renegotiation")).toBe("1");
-	});
-
-	it("relays a NEWLINE-TERMINATED offer to the SFU (CF rejects a trimmed SDP 400)", async () => {
-		let seen: SessionDescription | undefined;
-		const { deps } = mockDeps({
-			sfu: () =>
-				({
-					newSession: async (offer?: SessionDescription) => {
-						seen = offer;
-						return { sessionId: "sub00001abcd", sessionDescription: { type: "answer", sdp: ANSWER_SDP } };
-					},
-					pullTracks: async () => ({ tracks: [] }),
-				}) as never,
-		});
+	it("relays a NEWLINE-TERMINATED offer verbatim to the resolved Stream playback URL", async () => {
+		const { deps, relayCalls } = mockDeps();
 		await handleWhep(whepReq("POST", SUB, { "content-type": "application/sdp" }, OFFER_SDP), whepEnv(), "org_A", deps);
-		expect(seen?.type).toBe("offer");
-		expect(seen?.sdp.endsWith("\n")).toBe(true);
-		expect(seen?.sdp).toBe(OFFER_SDP.trim() + "\r\n");
+		expect(relayCalls.length).toBe(1);
+		expect(relayCalls[0].url).toBe(`https://customer-test.cloudflarestream.com/${UID}/webRTC/play`);
+		expect(relayCalls[0].method).toBe("POST");
+		expect(relayCalls[0].ct).toMatch(/application\/sdp/);
+		expect(String(relayCalls[0].body)).toBe(OFFER_SDP.trim() + "\r\n");
 	});
 
-	it("pulls the NAMED track from the resolved PUBLISHER session (§3 source resolution)", async () => {
-		let pulledFrom: { sessionId: string; trackName: string } | undefined;
-		const { deps } = mockDeps({
-			sfu: () =>
-				({
-					newSession: async () => ({ sessionId: "sub00001abcd", sessionDescription: { type: "answer", sdp: ANSWER_SDP } }),
-					pullTracks: async (sessionId: string, tracks: { sessionId: string; trackName: string }[]) => {
-						pulledFrom = { sessionId: tracks[0].sessionId, trackName: tracks[0].trackName };
-						return { tracks: [] };
-					},
-				}) as never,
-		});
-		await handleWhep(whepReq("POST", SUB, { "content-type": "application/sdp" }, OFFER_SDP), whepEnv(), "org_A", deps);
-		expect(pulledFrom).toEqual({ sessionId: "pubsess0001", trackName: "cam0" });
-	});
-
-	it("400 when ?track is missing", async () => {
+	it("400 when ?resource is missing/invalid (not a 32-hex uid)", async () => {
 		const { deps } = mockDeps();
 		const res = await handleWhep(
-			whepReq("POST", "/v1/whep/subscribe?resource=pub00000001", { "content-type": "application/sdp" }, OFFER_SDP),
+			whepReq("POST", "/v1/whep/subscribe?resource=nope", { "content-type": "application/sdp" }, OFFER_SDP),
 			whepEnv(),
 			"org_A",
 			deps,
@@ -150,10 +145,10 @@ describe("handleWhep — POST /v1/whep/subscribe (happy path)", () => {
 		expect(res!.status).toBe(400);
 	});
 
-	it("404 when the source resource is unknown", async () => {
+	it("404 when the source live-input is unknown (no stream-input-org record)", async () => {
 		const { deps } = mockDeps();
 		const res = await handleWhep(
-			whepReq("POST", "/v1/whep/subscribe?resource=ghost0000001&track=cam0", { "content-type": "application/sdp" }, OFFER_SDP),
+			whepReq("POST", "/v1/whep/subscribe?resource=ffffffffffffffffffffffffffffffff", { "content-type": "application/sdp" }, OFFER_SDP),
 			whepEnv(),
 			"org_A",
 			deps,
@@ -161,7 +156,7 @@ describe("handleWhep — POST /v1/whep/subscribe (happy path)", () => {
 		expect(res!.status).toBe(404);
 	});
 
-	it("404 when the source resource is owned by a DIFFERENT org (§9.6 tenant isolation)", async () => {
+	it("404 when the source live-input is owned by a DIFFERENT org (§9.6 tenant isolation)", async () => {
 		const { deps } = mockDeps();
 		const res = await handleWhep(whepReq("POST", SUB, { "content-type": "application/sdp" }, OFFER_SDP), whepEnv(), "org_OTHER", deps);
 		expect(res!.status).toBe(404);
@@ -179,18 +174,49 @@ describe("handleWhep — POST /v1/whep/subscribe (happy path)", () => {
 		expect(res!.status).toBe(422);
 	});
 
-	it("503 when the SFU is unavailable (newSession throws SfuError 503)", async () => {
-		const { deps } = mockDeps({
-			sfu: () => ({ newSession: async () => { throw new SfuError("REALTIME_NOT_CONFIGURED", "no app", 503); } }) as never,
-		});
+	it("503 when USE_CLOUDFLARE_STREAM is off (fail-closed)", async () => {
+		const { deps } = mockDeps();
+		const res = await handleWhep(
+			whepReq("POST", SUB, { "content-type": "application/sdp" }, OFFER_SDP),
+			whepEnv({ USE_CLOUDFLARE_STREAM: "0" }),
+			"org_A",
+			deps,
+		);
+		expect(res!.status).toBe(503);
+	});
+
+	it("503 when no playback URL is resolvable (no template, no customer code)", async () => {
+		const { deps } = mockDeps();
+		const res = await handleWhep(
+			whepReq("POST", SUB, { "content-type": "application/sdp" }, OFFER_SDP),
+			whepEnv({ WHEP_SRC_URL_TEMPLATE: undefined }),
+			"org_A",
+			deps,
+		);
+		expect(res!.status).toBe(503);
+	});
+
+	it("503 when the Stream WHEP relay returns a non-201", async () => {
+		const { deps } = mockDeps({}, 500);
 		const res = await handleWhep(whepReq("POST", SUB, { "content-type": "application/sdp" }, OFFER_SDP), whepEnv(), "org_A", deps);
 		expect(res!.status).toBe(503);
+	});
+
+	it("builds the playback URL from CF_STREAM_CUSTOMER_CODE when no template is set", async () => {
+		const { deps, relayCalls } = mockDeps();
+		await handleWhep(
+			whepReq("POST", SUB, { "content-type": "application/sdp" }, OFFER_SDP),
+			whepEnv({ WHEP_SRC_URL_TEMPLATE: undefined, CF_STREAM_CUSTOMER_CODE: "abc123" }),
+			"org_A",
+			deps,
+		);
+		expect(relayCalls[0].url).toBe(`https://customer-abc123.cloudflarestream.com/${UID}/webRTC/play`);
 	});
 });
 
 describe("handleWhep — PATCH/DELETE on the resource", () => {
-	it("PATCH trickle → 204 for a known resource", async () => {
-		const { deps } = mockDeps();
+	it("PATCH trickle → 204 for a known resource; proxies the frag to the Stream resource", async () => {
+		const { deps, relayCalls } = mockDeps();
 		const env = whepEnv();
 		await handleWhep(whepReq("POST", SUB, { "content-type": "application/sdp" }, OFFER_SDP), env, "org_A", deps);
 		const res = await handleWhep(
@@ -200,6 +226,8 @@ describe("handleWhep — PATCH/DELETE on the resource", () => {
 			deps,
 		);
 		expect(res!.status).toBe(204);
+		const patch = relayCalls.find((c) => c.method === "PATCH");
+		expect(patch?.url).toBe(STREAM_RESOURCE);
 	});
 
 	it("PATCH with wrong content-type → 415", async () => {
@@ -210,18 +238,14 @@ describe("handleWhep — PATCH/DELETE on the resource", () => {
 		expect(res!.status).toBe(415);
 	});
 
-	it("DELETE → 204, emits the teardown meter (idempotency=resourceId), clears the record", async () => {
-		const { deps, meterCalls } = mockDeps({ now: () => 1_000_000 + 90_000 }); // +90s → ceil = 2 min
+	it("DELETE → 204, emits the teardown meter (idempotency=resourceId), proxies DELETE, clears the record", async () => {
+		const { deps, meterCalls, relayCalls } = mockDeps({ now: () => 1_000_000 + 90_000 }); // +90s → ceil = 2 min
 		const env = whepEnv({ GATEWAY_BASE_URL: "https://api.wave.online", WAVE_SERVICE_TOKEN: "svc-token" });
-		// subscribe (startedAt = 1_000_000), then seed the known startedAt + advance the delete clock.
+		// subscribe (startedAt = 1_000_000) with a separate mock, then advance the delete clock.
 		await handleWhep(whepReq("POST", SUB, { "content-type": "application/sdp" }, OFFER_SDP), env, "org_A", mockDeps().deps);
-		const kv = env.RT_MEETING_ORG as WhepKv;
-		await kv.put(
-			"whep:wep00000001",
-			JSON.stringify({ subscriberSessionId: "sub00001abcd", publisherSessionId: "pubsess0001", trackName: "cam0", org: "org_A", startedAt: 1_000_000 }),
-		);
 		const res = await handleWhep(whepReq("DELETE", "/v1/whep/resource/wep00000001"), env, "org_A", deps);
 		expect(res!.status).toBe(204);
+		expect(relayCalls.some((c) => c.method === "DELETE" && c.url === STREAM_RESOURCE)).toBe(true);
 		expect(meterCalls.length).toBe(1);
 		expect(meterCalls[0].url).toMatch(/\/v1\/internal\/usage$/);
 		const body = meterCalls[0].body as { org: string; usage: { meter: string; meter_value: number; event_id: string } };
@@ -240,6 +264,27 @@ describe("handleWhep — PATCH/DELETE on the resource", () => {
 		const res = await handleWhep(whepReq("DELETE", "/v1/whep/resource/doesnotexist1"), whepEnv(), "org_A", deps);
 		expect(res!.status).toBe(204);
 		expect(meterCalls.length).toBe(0);
+	});
+});
+
+describe("resolveStreamPlaybackUrl — template substitution + code fallback", () => {
+	it("substitutes {uid} in the template", () => {
+		expect(resolveStreamPlaybackUrl({ WHEP_SRC_URL_TEMPLATE: TEMPLATE } as WhepEnv, UID)).toBe(
+			`https://customer-test.cloudflarestream.com/${UID}/webRTC/play`,
+		);
+	});
+	it("builds from the customer code when no template", () => {
+		expect(resolveStreamPlaybackUrl({ CF_STREAM_CUSTOMER_CODE: "xyz" } as WhepEnv, UID)).toBe(
+			`https://customer-xyz.cloudflarestream.com/${UID}/webRTC/play`,
+		);
+	});
+	it("accepts the CLOUDFLARE_STREAM_CUSTOMER_CODE alias", () => {
+		expect(resolveStreamPlaybackUrl({ CLOUDFLARE_STREAM_CUSTOMER_CODE: "leg" } as WhepEnv, UID)).toBe(
+			`https://customer-leg.cloudflarestream.com/${UID}/webRTC/play`,
+		);
+	});
+	it("null when nothing is configured", () => {
+		expect(resolveStreamPlaybackUrl({} as WhepEnv, UID)).toBeNull();
 	});
 });
 
@@ -302,7 +347,7 @@ describe("worker /v1/whep/* gating", () => {
 	});
 });
 
-describe("whepEgressEnabled flag parsing", () => {
+describe("whepEgressEnabled / useCloudflareStream flag parsing", () => {
 	it.each([
 		[undefined, false],
 		["0", false],
@@ -313,5 +358,14 @@ describe("whepEgressEnabled flag parsing", () => {
 		[true, true],
 	])("WHEP_EGRESS_ENABLED=%s → %s", (v, expected) => {
 		expect(whepEgressEnabled({ WHEP_EGRESS_ENABLED: v } as WhepEnv)).toBe(expected);
+	});
+	it.each([
+		[undefined, false],
+		["0", false],
+		["1", true],
+		["true", true],
+		[true, true],
+	])("USE_CLOUDFLARE_STREAM=%s → %s", (v, expected) => {
+		expect(useCloudflareStream({ USE_CLOUDFLARE_STREAM: v } as WhepEnv)).toBe(expected);
 	});
 });
