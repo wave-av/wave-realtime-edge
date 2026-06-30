@@ -69,6 +69,24 @@ RT_RESIDENCY = "1"   # ARMED 2026-06-28 — #127 ◆ crossing (Jake-named, full-
 # enabling customers stays a deliberate per-key scope-grant — flipping this exposes nothing broken to customers.
 WHIP_INGEST_ENABLED = "1"
 
+# ── #53 — IETF WHEP v1 egress surface (/v1/whep/*). DEFAULT OFF / INERT. ──
+# WHEP_EGRESS_ENABLED gates the whole /v1/whep/{subscribe,resource/{id}} listener (src/whep.ts) — the egress
+# SIBLING of WHIP above. Absent/"0" → the surface is inert: a /v1/whep/* request falls through to the honest
+# 501 catch-all (worker.ts), UNCHANGED. Flipping this to "1" on a live env is a Jake-named ◆ crossing (NEW
+# LIVE EGRESS path activation — docs/whep-v1-frozen-contract.md §6/§7) and is the ORCHESTRATOR's deploy, not
+# this builder's: when armed, an unauthenticated /v1/whep/subscribe probe is 401 (gateway-trust), not 501.
+# Preconditions for go-live: gateway /v1/whep/* forward mapping + whep:read scope + STRIPE_PRICE_WHEP_EGRESS_MIN
+# binding (orphan meter blocks GA). Reuses the EXISTING x-wave-internal realtime seal + RT_MEETING_ORG KV.
+# Default OFF until that ◆.
+WHEP_EGRESS_ENABLED = "0"
+# Source = Cloudflare Stream WebRTC playback (one-shot WHEP). USE_CLOUDFLARE_STREAM is the backend gate —
+# absent/"0" → /v1/whep/subscribe fails closed 503 (in addition to the WHEP_EGRESS_ENABLED surface gate above).
+# The playback URL is resolved from `wrangler secret put` SECRETS (NEVER in this file): WHEP_SRC_URL_TEMPLATE
+# (Stream playback URL with a `{uid}` placeholder; the customer code is baked in, NO token in the URL), or
+# built from CF_STREAM_CUSTOMER_CODE. CF_STREAM_API_TOKEN is reserved for Stream-API source resolution. Org
+# isolation reuses the `stream-input-org:{uid}` KV map (src/stream-bridge.ts). Default OFF until the ◆.
+# USE_CLOUDFLARE_STREAM = "1"
+
 # ── B1 (#91-a) — CF Stream Live → SFU bridge control plane (POST /v1/stream/bridge/webhook). DEFAULT OFF. ──
 # STREAM_BRIDGE_ENABLED gates the self-authenticating CF Stream webhook receiver (src/stream-bridge.ts). Absent/
 # "0" → the route falls through to the honest 501 catch-all, UNCHANGED — the whole bridge is inert. The webhook
