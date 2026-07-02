@@ -109,6 +109,19 @@ describe("WaveRenderEgressBackend — owns the waveRender tier, defers the rest"
     expect(await be.render()).toEqual({ status: "empty" });
     expect(client.calls).toHaveLength(0);
   });
+
+  it("surfaces a misconfigured backend as `unroutable` (bad geometry → router rejects) — never renders on garbage", async () => {
+    const client = fakeClient();
+    // A width:0 config is type-valid but egress-INVALID; buildEgressJob → validateEgressJob rejects → egressRoute
+    // returns ok:false, so render() must report `unroutable` with the router's reason, not call the client or crash.
+    const badGeometry: WaveRenderEgressConfig = { ...DEFAULT_WAVE_RENDER_EGRESS_CONFIG, width: 0 };
+    const be = new WaveRenderEgressBackend(badGeometry, client);
+    be.onFrame(frame());
+    const outcome = await be.render();
+    expect(outcome.status).toBe("unroutable");
+    if (outcome.status === "unroutable") expect(outcome.reason).toMatch(/width/);
+    expect(client.calls).toHaveLength(0);
+  });
 });
 
 describe("WaveRenderEgressBackend — frame tracking (latest-per-track composite inputs)", () => {
