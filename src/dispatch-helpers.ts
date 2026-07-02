@@ -32,6 +32,10 @@ export interface Env extends EncoderEnv, ResidencySinkEnv, IngestBridgeRuntimeEn
 	// leg's ◆). Off/absent → /v1/ingest/{proto}/session falls through to the 501 catch-all, UNCHANGED. The flag,
 	// bindings, WHIP endpoint, and bridge key REF fields all come from IngestBridgeRuntimeEnv (src/ingest-bridge.ts).
 	WAVE_INTERNAL_SECRET?: string; // wrangler SECRET — when set, ONLY the gateway (x-wave-internal) may /rtk/* AND /v1/realtime/*
+	// E-ROOMS P4 (#73) client presence/state-sync + data channel flag ([vars], default off). Falsy/absent →
+	// GET /v1/realtime/rooms/:room/presence is inert (falls through to the 501 catch-all, UNCHANGED). Truthy
+	// ("1"/"true") → the WS-upgrade presence surface is served (the DO owns the hibernatable socket).
+	PRESENCE_ENABLED?: string | boolean;
 	// B3 (#98) WHIP v1 ingest flag ([vars], default off). Falsy/absent → the /v1/whip/* surface is inert and
 	// the 501 catch-all is unchanged. Truthy ("1"/"true") → the WHIP listener (src/whip.ts) handles /v1/whip/*.
 	WHIP_INGEST_ENABLED?: string | boolean;
@@ -92,6 +96,14 @@ export const recordingWebhookDeps = liveWebhookDeps();
 export const REALTIME_INTENTS = new Set(["join", "publish", "subscribe", "renegotiate", "leave"]);
 /** POST /v1/realtime/rooms/:room/:intent */
 export const REALTIME_ROUTE = /^\/v1\/realtime\/rooms\/([^/]+)\/([^/]+)\/?$/;
+/** E-ROOMS P4 (#73) client presence/state-sync + data channel — GET(upgrade) /v1/realtime/rooms/:room/presence.
+ *  Matched BEFORE the generic :intent route (presence is not a signaling intent) and gated by presenceEnabled. */
+export const PRESENCE_ROUTE = /^\/v1\/realtime\/rooms\/([^/]+)\/presence\/?$/;
+/** Presence surface flag ([vars], default off → inert). Truthy "1"/"true"/boolean-true arms it. */
+export function presenceEnabled(env: Env): boolean {
+	const v = env.PRESENCE_ENABLED;
+	return v === true || v === "1" || v === "true";
+}
 /** RT-R9 hibernatable WS recorder route the SFU dials OUT to: /v1/realtime/recorder/:org/:room/:sessionId/:trackName.
  *  :room is REQUIRED so a frame addresses the SAME RoomDO (keyed `${org}:${room}`) holding the publish-path tap;
  *  the capability token binds ONLY (org, sessionId, trackName) — room is a routing key, not signed identity. */

@@ -46,6 +46,8 @@ import {
 	AGENT_DISPATCH_INTENTS,
 	AGENT_EGRESS_ROUTE,
 	AGENT_INGEST_ROUTE,
+	PRESENCE_ROUTE,
+	presenceEnabled,
 	INGRESS_ROUTE,
 	INGRESS_LIVE_PROTOCOLS,
 	INGRESS_VM_PROTOCOLS,
@@ -326,6 +328,55 @@ export async function dispatch(
 				{ status: 200 },
 			);
 		}
+	}
+
+	// ── E-ROOMS P4 (#73) client presence/state-sync + data channel — GET(upgrade) /v1/realtime/rooms/:room/presence.
+	// INERT behind PRESENCE_ENABLED ([vars], default off → falls through to the generic route below, then the 501
+	// catch-all — UNCHANGED). When ON, the SAME gateway-trust chokepoint as every paid route gates it; org is the
+	// gateway-stamped x-wave-org, participant identity/role are gateway-stamped (query + x-wave-role, whitelisted).
+	// The WS upgrade is FORWARDED to the room's DO (keyed org:room) which OWNS the hibernatable socket + broadcasts.
+	const presMatch = url.pathname.match(PRESENCE_ROUTE);
+	if (presMatch && presenceEnabled(env)) {
+		const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
+		if (denied) return denied;
+		const org = request.headers.get("x-wave-org") ?? "";
+		if (!SAFE_ORG.test(org)) {
+			return Response.json(
+				{ error: "BAD_REQUEST", message: "missing or malformed org context (x-wave-org) — stamped by the gateway" },
+				{ status: 400 },
+			);
+		}
+		if ((request.headers.get("Upgrade") ?? "").toLowerCase() !== "websocket") {
+			return Response.json(
+				{ error: "UPGRADE_REQUIRED", message: "presence route requires a WebSocket upgrade" },
+				{ status: 426 },
+			);
+		}
+		if (!env.ROOM) {
+			return Response.json(
+				{ error: "REALTIME_NOT_CONFIGURED", message: "ROOM durable object binding is not configured" },
+				{ status: 503 },
+			);
+		}
+		const participantId = url.searchParams.get("participantId") ?? "";
+		if (!SAFE_SEGMENT.test(participantId)) {
+			return Response.json(
+				{ error: "BAD_REQUEST", message: "presence requires a valid participantId query param" },
+				{ status: 400 },
+			);
+		}
+		const role = ROLES.has(request.headers.get("x-wave-role") ?? "")
+			? (request.headers.get("x-wave-role") as string)
+			: "viewer";
+		const room = decodeURIComponent(presMatch[1]);
+		const id = env.ROOM.idFromName(`${org}:${room}`);
+		const stub = env.ROOM.get(id);
+		// Forward the upgrade to the DO with identity in the query; the DO owns the socket (hibernation) so a
+		// broadcast reaches every subscriber. Passing `request` as init preserves the Upgrade header + method.
+		const fwd = new URL("https://room/presence");
+		fwd.searchParams.set("participantId", participantId);
+		fwd.searchParams.set("role", role);
+		return stub.fetch(new Request(fwd.toString(), request));
 	}
 
 	const rtMatch = request.method === "POST" ? url.pathname.match(REALTIME_ROUTE) : null;

@@ -10,7 +10,8 @@
     "apis": [
       { "protocol": "webrtc-whip", "endpoint": "https://rt.wave.online/whip/{stream-key}", "auth": "wave-token-v1", "metered": true, "lifecycle": "planned", "spec": "docs/api/openapi.yaml" },
       { "protocol": "webrtc-whep", "endpoint": "https://rt.wave.online/whep/{slug}", "auth": "wave-token-v1", "metered": true, "lifecycle": "planned", "spec": "docs/api/openapi.yaml" },
-      { "protocol": "http", "capability": "health", "endpoint": "https://rt.wave.online/health", "auth": "none", "metered": false, "lifecycle": "alpha", "spec": "docs/api/openapi.yaml" }
+      { "protocol": "http", "capability": "health", "endpoint": "https://rt.wave.online/health", "auth": "none", "metered": false, "lifecycle": "alpha", "spec": "docs/api/openapi.yaml" },
+      { "protocol": "websocket", "capability": "presence", "endpoint": "https://rt.wave.online/v1/realtime/rooms/{room}/presence", "auth": "wave-token-v1", "metered": false, "lifecycle": "planned", "spec": "docs/api/openapi.yaml" }
     ]
   },
   "consumes": {
