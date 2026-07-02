@@ -255,6 +255,15 @@ describe("DO glue — flag gate + registry resolution + tapPublishFrame", () => 
     expect(tap.stats().seq).toBe(1); // unchanged
   });
 
+  it("tapPublishFrame is FAIL-OPEN — a throwing snapshot never propagates (media-safety > fan-out)", async () => {
+    const tap = new MediaTap();
+    const boom = async (): Promise<RoomState> => {
+      throw new Error("storage boom");
+    };
+    await expect(tapPublishFrame(tap, { MEDIA_TAP_ENABLED: "1" }, boom, "sess-1", "mic", BYTES, 3)).resolves.toBeUndefined();
+    expect(tap.stats().seq).toBe(0); // nothing published, no throw
+  });
+
   it("DEFAULT_HIGH_WATER is a sane positive bound", () => {
     expect(DEFAULT_HIGH_WATER).toBeGreaterThan(0);
   });

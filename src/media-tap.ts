@@ -283,6 +283,8 @@ export function resolveTapTrack(
  * DO frame-sink glue: publish one decoded frame into the tap IFF armed. Inert (returns immediately) when
  * MEDIA_TAP_ENABLED is falsy, so the RoomDO's recorder path is byte-identical until the tap is switched on. The
  * snapshot is read lazily (only when armed) to resolve the track's (participant,kind) from the registry SSOT.
+ * Fail-open: a fan-out defect (e.g. a snapshot read that throws) is swallowed — the tap is best-effort and must
+ * NEVER break the frame path (media-safety > fan-out), so any caller of feedRecorderFrame stays throw-free.
  */
 export async function tapPublishFrame(
   tap: MediaTap,
@@ -294,6 +296,10 @@ export async function tapPublishFrame(
   now: number,
 ): Promise<void> {
   if (!mediaTapEnabled(env)) return;
-  const meta = resolveTapTrack(await snapshot(), sessionId, trackName);
-  if (meta) tap.publish({ ...meta, sessionId, trackName, bytes: frame, ts: now });
+  try {
+    const meta = resolveTapTrack(await snapshot(), sessionId, trackName);
+    if (meta) tap.publish({ ...meta, sessionId, trackName, bytes: frame, ts: now });
+  } catch {
+    /* fail-open — media-tap fan-out never blocks or throws the frame path */
+  }
 }
