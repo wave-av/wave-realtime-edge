@@ -270,3 +270,64 @@ new_sqlite_classes = ["StreamBridgeContainer"]
 type = "plain_text"
 name = "FOUNDATION_VERSION"
 text = "scaffold"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════════
+# #136 (Canary C1) — STAGING CANARY worker. A SEPARATE worker (wave-realtime-edge-canary) that exercises the
+# raw-SFU CONTAINER recorder with AV1 + negotiation ON, WITHOUT touching the live prod worker. The top-level
+# [vars]/bindings above stay BYTE-IDENTICAL (RT_ENCODER stays "managed" = the proven #127 PULL recorder); this
+# block alone flips the container encode path, and ONLY for the canary worker.
+#
+# WRANGLER ENV SEMANTICS (verified, wrangler 4.100): an [env.X] block does NOT inherit top-level [vars] or
+# bindings ([[r2_buckets]]/[[kv_namespaces]]/[[durable_objects.bindings]]/[[containers]]) — each must be
+# RESTATED. [[migrations]] ARE inherited from the top level and MUST NOT be restated per-env (restating throws
+# a duplicate-tag error), so the canary reuses the top-level v1..v4 migrations as-is. We restate only what the
+# canary worker needs to BOOT + run the container recorder: the encode flags, the ROOM + RECORDER DOs, the
+# RECORDER container image, and a CANARY recordings bucket.
+#
+# workers_dev=true → the canary gets a *.workers.dev URL (NOT rt.wave.online); NO custom-domain route is added,
+# so it can never shadow the paid prod host. RT_RESIDENCY is intentionally NOT set (canary is single-region).
+[env.canary]
+name = "wave-realtime-edge-canary"
+workers_dev = true
+
+[env.canary.observability]
+enabled = true
+
+[env.canary.vars]
+# Same realtime config the worker needs to boot. RT_ENCODER="container" + RECORDER_TARGET="cf" route video
+# frames through the RecorderContainer (Path A); NEGOTIATION_ENABLED/AV1_DEFAULT arm the #86/#83 container
+# behaviours — these two are forwarded into the container process by RecorderContainer (recorder-container.ts).
+RTK_APP_ID = "6dee33e5-cd89-41e8-a81c-9a8cd48bb9c3"
+GATEWAY_BASE_URL = "https://api.wave.online"
+RT_RECORD = "1"
+RT_ENCODER = "container"
+RECORDER_TARGET = "cf"
+NEGOTIATION_ENABLED = "true"
+AV1_DEFAULT = "1"
+
+# Canary recordings bucket — a DISTINCT bucket so canary recordings never mix with prod. Created in the deploy
+# step (`wrangler r2 bucket create wave-realtime-recordings-canary`); --dry-run tolerates a not-yet-existing
+# bucket. RT_RESIDENCY is unset, so RT_RECORDINGS_ENAM/EU are NOT needed (and not restated) on the canary.
+[[env.canary.r2_buckets]]
+binding = "RT_RECORDINGS"
+bucket_name = "wave-realtime-recordings-canary"
+
+# meetingId→org map — restated (same namespace id is fine; canary shares the lookup map).
+[[env.canary.kv_namespaces]]
+binding = "RT_MEETING_ORG"
+id = "4acd6ec7b04546ba8767f2353d5394e8"
+
+# ROOM DO — restated so the canary worker boots (room.ts RoomDO; migrations v1 inherited from top level).
+[[env.canary.durable_objects.bindings]]
+name = "ROOM"
+class_name = "RoomDO"
+
+# RECORDER container DO — restated so `--env canary` resolves the container binding (migrations v2 inherited).
+[[env.canary.containers]]
+class_name = "RecorderContainer"
+image = "./containers/rt-encoder/Dockerfile"
+max_instances = 3
+
+[[env.canary.durable_objects.bindings]]
+name = "RECORDER"
+class_name = "RecorderContainer"
