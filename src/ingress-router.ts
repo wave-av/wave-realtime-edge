@@ -31,6 +31,9 @@
  *      COGS is measured and lands with each backend phase; the router must not assert a number it has not measured.
  */
 
+// Reuses the Plane-2 push-protocol SSOT rather than minting a parallel enum. This is a deliberate asymmetry with
+// the zero-import `egress-router.ts`: `ingest-bridge.js` (→ `whip.js` → `sfu.js`) declares only top-level
+// consts/regexes with no import-time side effects, so this module stays functionally pure and inert.
 import { INGEST_PROTOCOLS, type IngestProtocol } from "./ingest-bridge.js";
 
 /** The inbound source kinds wave-native ingests. Superset of the Plane-2 push protocols (`IngestProtocol`) plus the
@@ -94,14 +97,16 @@ export interface IngestJob {
 
 /** The router's verdict. Discriminated union so a malformed/uncoverable job carries a stable reason and never
  *  silently resolves to a backend (mirrors `EgressDecision` / the repo's `RegisterResult` no-throw contract).
- *  `protocol` is the container-bridge handoff (null for the WebRTC / URL-pull paths); `requiresSsrfGuard` is true
- *  iff the chosen path fetches a remote URL — a P4 backend MUST run the SSRF guard before fetch. */
+ *  `pushProtocol` is the source kind's underlying push protocol (rtmp/srt/rist/moq) or null (WebRTC / URL-pull) — it
+ *  names the TRANSPORT, independent of which backend was chosen (an rtmp/srt push still resolves to `cfStreamLive`,
+ *  yet carries `pushProtocol: "rtmp"/"srt"`). It is NOT a routing signal; branch on `backend`, never on this field.
+ *  `requiresSsrfGuard` is true iff the chosen path fetches a remote URL — a P4 backend MUST run the SSRF guard first. */
 export type IngestDecision =
   | {
       readonly ok: true;
       readonly backend: IngestBackend;
       readonly costRank: number;
-      readonly protocol: IngestProtocol | null;
+      readonly pushProtocol: IngestProtocol | null;
       readonly requiresSsrfGuard: boolean;
     }
   | { readonly ok: false; readonly reason: string };
@@ -192,7 +197,7 @@ export function ingressRoute(job: IngestJob): IngestDecision {
         ok: true,
         backend: tier.backend,
         costRank: tier.costRank,
-        protocol: pushProtocolOf(job.sourceKind),
+        pushProtocol: pushProtocolOf(job.sourceKind),
         requiresSsrfGuard: job.sourceKind === "urlPull",
       };
     exclusions.push(`${tier.backend}: ${why}`);

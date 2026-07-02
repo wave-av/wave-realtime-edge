@@ -32,25 +32,26 @@ describe("ingressRoute — cheapest capable plane first", () => {
       ok: true,
       backend: "cfCallsSfu",
       costRank: 0,
-      protocol: null,
+      pushProtocol: null,
       requiresSsrfGuard: false,
     });
   });
 
   it("RTMP push → cfStreamLive (free managed ingest, NOT the owned container)", () => {
     const d = ingressRoute(job("rtmpPush"));
-    expect(d).toMatchObject({ ok: true, backend: "cfStreamLive", costRank: 1, protocol: "rtmp" });
+    expect(d).toMatchObject({ ok: true, backend: "cfStreamLive", costRank: 1, pushProtocol: "rtmp" });
   });
 
   it("SRT push → cfStreamLive (caller-mode managed) over the also-capable container — cheapest-capable-first", () => {
     const d = ingressRoute(job("srtPush"));
     // the container tier can ALSO carry srt; the router must take the cheaper managed path.
-    expect(d).toMatchObject({ ok: true, backend: "cfStreamLive", protocol: "srt" });
+    // pushProtocol names the transport ("srt"), NOT the backend — cfStreamLive still wins the route.
+    expect(d).toMatchObject({ ok: true, backend: "cfStreamLive", pushProtocol: "srt" });
   });
 
   it("URL pull → cfStreamLive and flags requiresSsrfGuard (the only remote-fetch path)", () => {
     const d = ingressRoute(job("urlPull"));
-    expect(d).toMatchObject({ ok: true, backend: "cfStreamLive", protocol: null, requiresSsrfGuard: true });
+    expect(d).toMatchObject({ ok: true, backend: "cfStreamLive", pushProtocol: null, requiresSsrfGuard: true });
   });
 });
 
@@ -60,13 +61,13 @@ describe("ingressRoute — escalation to the container only on need", () => {
       ok: true,
       backend: "containerBridge",
       costRank: 2,
-      protocol: "rist",
+      pushProtocol: "rist",
       requiresSsrfGuard: false,
     });
   });
 
   it("MoQ push → containerBridge (CF Stream can't carry MoQ)", () => {
-    expect(ingressRoute(job("moqPush"))).toMatchObject({ ok: true, backend: "containerBridge", protocol: "moq" });
+    expect(ingressRoute(job("moqPush"))).toMatchObject({ ok: true, backend: "containerBridge", pushProtocol: "moq" });
   });
 });
 
