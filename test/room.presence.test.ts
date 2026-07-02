@@ -92,5 +92,10 @@ describe("RoomDO.fetch — presence intent", () => {
 		expect(state1).toBeTruthy();
 		expect((state1 as { version: number }).version).toBe(1); // bumped past the welcome's v0
 		expect((state1 as { view: { occupancy: number } }).view.occupancy).toBe(1);
+
+		// A second mutation bumps monotonically (v2) — the conflict-free ordering signal.
+		await do_.fetch(intent("join", { ctx: { org: "org-A", room: "room-1", participantId: "p2" }, role: "speaker" }));
+		const versions = serverWs.sent.map((s) => JSON.parse(s) as PresenceServerMsg).filter((f) => f.type === "state").map((f) => (f as { version: number }).version);
+		expect(versions).toEqual([1, 2]);
 	});
 });
