@@ -37,6 +37,13 @@ export type EgressLatency = "batch" | "nearRealTime" | "realTime";
 /** Output codec the job requires. wave-render emits H.264 only; HEVC/AV1 force the GPU tier. */
 export type EgressCodec = "h264" | "hevc" | "av1" | "vp8" | "vp9";
 
+/** Canonical allowed sets — the runtime guard lists behind the string-union types. A job may arrive from parsed
+ *  (untrusted) JSON where TS types are not enforced, so `validateEgressJob` checks membership against these before
+ *  the router decides (validate-untrusted-input-before-sink / configuration-validated-at-load). */
+export const EGRESS_OUTPUTS: readonly EgressOutput[] = ["record", "simulcast"];
+export const EGRESS_LATENCIES: readonly EgressLatency[] = ["batch", "nearRealTime", "realTime"];
+export const EGRESS_CODECS: readonly EgressCodec[] = ["h264", "hevc", "av1", "vp8", "vp9"];
+
 /** A typed egress job — the full set of facts the router decides on. Resolution is explicit px so the envelope
  *  check is unambiguous. All fields required except the optional cost cap. */
 export interface EgressJob {
@@ -133,10 +140,16 @@ export const EGRESS_ROUTING_TABLE: readonly EgressTier[] = [
 /** Validate a job shape before routing. Returns a stable reason string when the job is malformed, else null.
  *  (configuration-validated-at-load: catch a bad job at the boundary, never route on garbage.) */
 export function validateEgressJob(job: EgressJob): string | null {
+  if (typeof job.needsCompositing !== "boolean")
+    return `needsCompositing must be a boolean (got ${typeof job.needsCompositing})`;
   if (!Number.isInteger(job.sourceCount) || job.sourceCount < 1)
     return `sourceCount must be an integer ≥1 (got ${job.sourceCount})`;
   if (!Number.isFinite(job.width) || job.width <= 0) return `width must be >0 (got ${job.width})`;
   if (!Number.isFinite(job.height) || job.height <= 0) return `height must be >0 (got ${job.height})`;
+  if (!EGRESS_OUTPUTS.includes(job.output)) return `output must be one of ${EGRESS_OUTPUTS.join("|")} (got ${job.output})`;
+  if (!EGRESS_LATENCIES.includes(job.latency))
+    return `latency must be one of ${EGRESS_LATENCIES.join("|")} (got ${job.latency})`;
+  if (!EGRESS_CODECS.includes(job.codec)) return `codec must be one of ${EGRESS_CODECS.join("|")} (got ${job.codec})`;
   if (job.maxCostRank !== undefined && (!Number.isInteger(job.maxCostRank) || job.maxCostRank < 0))
     return `maxCostRank must be an integer ≥0 (got ${job.maxCostRank})`;
   return null;

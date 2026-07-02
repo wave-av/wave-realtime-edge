@@ -120,7 +120,35 @@ describe("validateEgressJob — reject malformed jobs at the boundary", () => {
   });
 });
 
+describe("validateEgressJob — reject out-of-set enum fields (untrusted/parsed input)", () => {
+  it("a codec outside the allowed set is rejected before routing (TS types don't guard parsed JSON)", () => {
+    const bad = { ...job(), codec: "prores" } as unknown as EgressJob;
+    expect(validateEgressJob(bad)).toMatch(/codec must be one of/);
+    expect(egressRoute(bad).ok).toBe(false);
+  });
+
+  it("an out-of-set output/latency is rejected", () => {
+    expect(validateEgressJob({ ...job(), output: "stream" } as unknown as EgressJob)).toMatch(/output must be one of/);
+    expect(validateEgressJob({ ...job(), latency: "instant" } as unknown as EgressJob)).toMatch(/latency must be one of/);
+  });
+
+  it("a non-boolean needsCompositing is rejected", () => {
+    expect(validateEgressJob({ ...job(), needsCompositing: "yes" } as unknown as EgressJob)).toMatch(/needsCompositing/);
+  });
+});
+
 describe("routing table integrity", () => {
+  it("each tier's capability predicate is TOTAL and self-consistent (independent of walk order)", () => {
+    const byBackend = Object.fromEntries(EGRESS_ROUTING_TABLE.map((t) => [t.backend, t]));
+    // cfStream can never composite; the composite tiers never claim a no-composite job (it belongs to passthrough).
+    expect(byBackend.cfStream!.capable(job({ needsCompositing: true }))).not.toBeNull();
+    expect(byBackend.cfStream!.capable(job({ needsCompositing: false }))).toBeNull();
+    expect(byBackend.waveRender!.capable(job({ needsCompositing: false }))).not.toBeNull();
+    expect(byBackend.runpodNvenc!.capable(job({ needsCompositing: false }))).not.toBeNull();
+    // runpod is the backstop: it accepts ANY compositing job.
+    expect(byBackend.runpodNvenc!.capable(job({ needsCompositing: true, sourceCount: 999, codec: "av1" }))).toBeNull();
+  });
+
   it("cost ranks are strictly ascending in table order (cheapest first)", () => {
     const ranks = EGRESS_ROUTING_TABLE.map((t) => t.costRank);
     for (let i = 1; i < ranks.length; i++) expect(ranks[i]).toBeGreaterThan(ranks[i - 1]);
