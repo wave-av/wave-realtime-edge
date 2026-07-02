@@ -12,6 +12,7 @@ import type { ParticipantSessionUsage, MeterEmitEnv } from "./metering.js";
 import type { EventEmitEnv } from "./event-emitter.js";
 import type { EncoderKind, RecordingEncoder } from "./encoders/encoder.js";
 import { RoomRecording } from "./room-recording.js";
+import { MediaTap, tapPublishFrame } from "./media-tap.js";
 import {
   acceptPresenceSocket,
   broadcastPresence,
@@ -559,6 +560,7 @@ export interface RoomDOEnv {
   CF_CALLS_APP_SECRET?: string;
   GATEWAY_BASE_URL?: string;
   WAVE_SERVICE_TOKEN?: string;
+  MEDIA_TAP_ENABLED?: string | boolean; // #74 — arms MediaTap fan-out; default off = inert (prod byte-identical)
   // ── LK-rip #46 SFU event emitter (DORMANT until cutover). DO forwards to Signaling → WSC Argus
   // ingest ONLY when WAVE_REALTIME_EVENTS_EMIT="1" AND the shared HMAC secret is set (else inert). ──
   WAVE_REALTIME_EVENTS_EMIT?: string; // "1" arms; absent/anything-else → inert
@@ -594,6 +596,7 @@ export class RoomDO {
   private readonly core: RoomCore;
   private readonly env: RoomDOEnv;
   private readonly recording: RoomRecording;
+  readonly mediaTap = new MediaTap(); // #74: the room's single subscribe surface; publishes only when armed
   private readonly doState: DurableObjectStateLike;
   /** Monotonic presence broadcast version (conflict-free client ordering). Seeded lazily from storage so it
    *  survives a DO eviction; incremented per broadcast. Null until first read. */
@@ -625,9 +628,11 @@ export class RoomDO {
   ban(participantId: string) { return this.core.ban(participantId); }
   endRoom() { return this.core.endRoom(); }
   listWaiting() { return this.core.listWaiting(); }
-  /** RT-R9: feed ONE decoded WS media frame to the tap for (sessionId, trackName). DORMANT for managed. */
-  feedRecorderFrame(sessionId: string, trackName: string, frame: Uint8Array) {
-    return this.recording.feedFrame(sessionId, trackName, frame);
+  /** Sink ONE decoded WS media frame: the recording tap (RT-R9, DORMANT for managed) AND the room's MediaTap
+   *  fan-out (#74, inert until MEDIA_TAP_ENABLED). Both additive + fail-open. */
+  async feedRecorderFrame(sessionId: string, trackName: string, frame: Uint8Array): Promise<void> {
+    await this.recording.feedFrame(sessionId, trackName, frame);
+    await tapPublishFrame(this.mediaTap, this.env, () => this.core.snapshot(), sessionId, trackName, frame, Date.now());
   }
 
   /**
@@ -647,7 +652,7 @@ export class RoomDO {
         const sessionId = u.searchParams.get("sessionId") ?? "";
         const trackName = u.searchParams.get("trackName") ?? "";
         const buf = new Uint8Array(await request.arrayBuffer());
-        if (sessionId && trackName && buf.length > 0) await this.recording.feedFrame(sessionId, trackName, buf);
+        if (sessionId && trackName && buf.length > 0) await this.feedRecorderFrame(sessionId, trackName, buf);
       } catch {
         /* fail-open */
       }

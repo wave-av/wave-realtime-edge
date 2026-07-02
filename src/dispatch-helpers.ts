@@ -36,6 +36,10 @@ export interface Env extends EncoderEnv, ResidencySinkEnv, IngestBridgeRuntimeEn
 	// GET /v1/realtime/rooms/:room/presence is inert (falls through to the 501 catch-all, UNCHANGED). Truthy
 	// ("1"/"true") → the WS-upgrade presence surface is served (the DO owns the hibernatable socket).
 	PRESENCE_ENABLED?: string | boolean;
+	// E-MEDIA-TAP (#74) one room-subscribe surface flag ([vars], default off). Falsy/absent → the RoomDO builds
+	// the MediaTap but publishes NO frames into it (prod byte-identical). Truthy ("1"/"true") → each decoded
+	// frame the DO sinks also fans out to authorized tap consumers (egress #75 + #85 perception #76).
+	MEDIA_TAP_ENABLED?: string | boolean;
 	// B3 (#98) WHIP v1 ingest flag ([vars], default off). Falsy/absent → the /v1/whip/* surface is inert and
 	// the 501 catch-all is unchanged. Truthy ("1"/"true") → the WHIP listener (src/whip.ts) handles /v1/whip/*.
 	WHIP_INGEST_ENABLED?: string | boolean;
