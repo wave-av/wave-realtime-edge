@@ -5,7 +5,7 @@ import { describe, it, expect, vi } from "vitest";
 import { Signaling } from "../../src/signaling.js";
 import type { RecordingHook } from "../../src/signaling.js";
 import { RoomCore } from "../../src/room.js";
-import { RoomRecording } from "../../src/room.js";
+import { RoomRecording } from "../../src/room-recording.js";
 import type { RoomStorage } from "../../src/room.js";
 import type { EncoderHandle, RecordingEncoder, RecordingSession } from "../../src/encoders/encoder.js";
 

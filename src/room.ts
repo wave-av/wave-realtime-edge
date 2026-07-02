@@ -10,8 +10,14 @@ import { Signaling } from "./signaling.js";
 import type { SignalContext, PublishTrack } from "./signaling.js";
 import type { ParticipantSessionUsage, MeterEmitEnv } from "./metering.js";
 import type { EventEmitEnv } from "./event-emitter.js";
-import { selectEncoder } from "./encoders/factory.js";
-import type { EncoderEnv, EncoderHandle, EncoderKind, RecordingEncoder } from "./encoders/encoder.js";
+import type { EncoderKind, RecordingEncoder } from "./encoders/encoder.js";
+import { RoomRecording } from "./room-recording.js";
+import {
+  acceptPresenceSocket,
+  broadcastPresence,
+  onPresenceMessage,
+  type PresenceDOState,
+} from "./presence.js";
 
 /** CF Realtime GCs a track after 30s of inactivity (design §4). Registry reconcile uses this. */
 export const TRACK_GC_MS = 30_000;
@@ -534,9 +540,13 @@ export class RoomCore {
   }
 }
 
-/** Minimal DO runtime shape (avoids a hard dependency on cloudflare:workers in this skeleton). */
+/** Minimal DO runtime shape (avoids a hard dependency on cloudflare:workers in this skeleton). The
+ *  hibernation WebSocket API is OPTIONAL so tests construct a RoomDO with just storage; presence (P4) uses
+ *  it only when the live DO runtime provides it, and fails closed (503) otherwise. */
 interface DurableObjectStateLike {
   storage: RoomStorage;
+  acceptWebSocket?(ws: WebSocket, tags?: string[]): void;
+  getWebSockets?(tag?: string): WebSocket[];
 }
 
 /**
@@ -568,7 +578,8 @@ export interface RoomDOEnv {
   __recordingEncoder?: RecordingEncoder;
 }
 
-/** The realtime intents the worker entry forwards to the DO's fetch() (last path segment). */
+/** The realtime intents the worker entry forwards to the DO's fetch() (last path segment). `presence` is a
+ *  WebSocket upgrade (E-ROOMS P4), not a JSON intent — it is handled before the JSON body is parsed. */
 type RoomIntent = "join" | "publish" | "subscribe" | "renegotiate" | "leave";
 
 /**
@@ -579,108 +590,20 @@ type RoomIntent = "join" | "publish" | "subscribe" | "renegotiate" | "leave";
  * gives per-room serialized state + per-org isolation (the DO id is keyed `${org}:${room}` by the worker).
  * Registered in wrangler config (ROOM binding + v1 migration).
  */
-/**
- * RT-R9 — per-DO raw-SFU recording orchestrator. Holds the lazily-built recording encoder + one EncoderHandle
- * per SFU sessionId, and persists each handle's hibernation meta (handle.toMeta()) so a DO eviction mid-session
- * can resume. DORMANT for the live "managed" path (its handle has no onPublish + a null toMeta — nothing held);
- * only an ◆-armed RT_ENCODER="container" opens real taps. Every method is fail-open: a recording error NEVER
- * propagates up the publish/leave path (media-safety > recording, design §4).
- */
-export class RoomRecording {
-  private encoder: RecordingEncoder | null = null;
-  /** sessionId → live EncoderHandle (one raw-SFU recording per participant SFU session). */
-  private readonly handles = new Map<string, EncoderHandle>();
-
-  constructor(
-    private readonly env: RoomDOEnv,
-    private readonly storage: RoomStorage,
-  ) {}
-
-  private static metaKey(sessionId: string): string {
-    return `rt:recorder:${sessionId}`;
-  }
-
-  /** Lazily construct the encoder (selectEncoder) — DisarmedEncoder unless RT_RECORD="1". Injectable for tests. */
-  private getEncoder(): RecordingEncoder {
-    if (!this.encoder) {
-      this.encoder = this.env.__recordingEncoder ?? selectEncoder(this.env as unknown as EncoderEnv);
-    }
-    return this.encoder;
-  }
-
-  /**
-   * A track published in `org`'s room for participant SFU `sessionId`. Begins the recording handle for that
-   * session on first publish, then forwards onPublish(trackName,kind). Persists the handle's hibernation meta.
-   * Fail-open: any error is swallowed (recording is best-effort, never blocks the publish).
-   */
-  async onPublish(org: string, sessionId: string, room: string, trackName: string, kind: TrackKind): Promise<void> {
-    try {
-      let handle = this.handles.get(sessionId);
-      if (!handle) {
-        const begun = await this.getEncoder().begin({ org, room, sessionId });
-        if (!begun) return; // disarmed / unconfigured → records nothing (loud-warned inside the encoder)
-        handle = begun;
-        this.handles.set(sessionId, handle);
-      }
-      if (handle.onPublish) await handle.onPublish(trackName, kind);
-      await this.persist(sessionId, handle);
-    } catch {
-      /* fail-open — recording never blocks publish */
-    }
-  }
-
-  /** Feed ONE decoded WS media frame to the tap for (sessionId, trackName) — used by the Worker recorder route. */
-  async feedFrame(sessionId: string, trackName: string, frame: Uint8Array): Promise<void> {
-    try {
-      const handle = this.handles.get(sessionId);
-      // ContainerHandle exposes its taps; other handles (managed) hold no taps → frame is a no-op.
-      const taps = (handle as { tapsByTrack?: ReadonlyMap<string, { onFrame(f: Uint8Array): Promise<void> }> })
-        ?.tapsByTrack;
-      const tap = taps?.get(trackName);
-      if (tap) await tap.onFrame(frame);
-    } catch {
-      /* fail-open */
-    }
-  }
-
-  /** Session end (leave/endRoom): finalize the handle for `sessionId`, clear its persisted meta. Fail-open. */
-  async finalize(sessionId: string): Promise<void> {
-    try {
-      const handle = this.handles.get(sessionId);
-      if (!handle) return;
-      await handle.finalize();
-    } catch {
-      /* fail-open — a finalize error never throws the leave down */
-    } finally {
-      this.handles.delete(sessionId);
-      try {
-        await this.storage.put(RoomRecording.metaKey(sessionId), null);
-      } catch {
-        /* best-effort */
-      }
-    }
-  }
-
-  /** Persist a handle's hibernation snapshot so a DO wake can resume (null meta → nothing to hold). */
-  private async persist(sessionId: string, handle: EncoderHandle): Promise<void> {
-    try {
-      const meta = handle.toMeta();
-      if (meta != null) await this.storage.put(RoomRecording.metaKey(sessionId), meta);
-    } catch {
-      /* best-effort */
-    }
-  }
-}
-
 export class RoomDO {
   private readonly core: RoomCore;
   private readonly env: RoomDOEnv;
   private readonly recording: RoomRecording;
+  private readonly doState: DurableObjectStateLike;
+  /** Monotonic presence broadcast version (conflict-free client ordering). Seeded lazily from storage so it
+   *  survives a DO eviction; incremented per broadcast. Null until first read. */
+  private presenceVer: number | null = null;
 
   constructor(state: DurableObjectStateLike, env?: RoomDOEnv) {
     this.core = new RoomCore(state.storage);
     this.env = env ?? {};
     this.recording = new RoomRecording(this.env, state.storage);
+    this.doState = state;
   }
 
   ensureRoom(config: RoomConfig) { return this.core.ensureRoom(config); }
@@ -715,7 +638,7 @@ export class RoomDO {
    * (fail-open inside metering.ts). The DO never holds media — only state + orchestration.
    */
   async fetch(request: Request): Promise<Response> {
-    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent | "recorder-frame";
+    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent | "recorder-frame" | "presence";
     // RT-R9: the Worker recorder route forwards one decoded WS media frame as a raw binary POST. DORMANT for
     // managed (feedFrame is a no-op when no container tap is held). Fail-open: always 200/204, never throws.
     if (intent === "recorder-frame") {
@@ -730,6 +653,12 @@ export class RoomDO {
       }
       return new Response(null, { status: 204 });
     }
+    // E-ROOMS P4 (#73): client presence/state-sync + data channel. The worker forwards the WS upgrade here
+    // (identity in the query, gateway-validated) and the DO OWNS the hibernatable socket. Handled before the
+    // JSON body parse — an upgrade GET carries no body.
+    if (intent === "presence") {
+      return this.acceptPresence(request);
+    }
     let body: Record<string, unknown> = {};
     try {
       body = (await request.json()) as Record<string, unknown>;
@@ -741,16 +670,16 @@ export class RoomDO {
     try {
       const signaling = new Signaling(this.core, this.buildSfu(), this.meterEnv(), this.recording, this.eventEnv());
       switch (intent) {
-        case "join":
-          return Response.json(
-            await signaling.join(ctx!, { role: body.role as Role | undefined, offer: body.offer as SessionDescription | undefined }),
-            { status: 200 },
-          );
-        case "publish":
-          return Response.json(
-            await signaling.publishTrack(ctx!, { tracks: body.tracks as PublishTrack[], offer: body.offer as SessionDescription }),
-            { status: 200 },
-          );
+        case "join": {
+          const res = await signaling.join(ctx!, { role: body.role as Role | undefined, offer: body.offer as SessionDescription | undefined });
+          await this.emitPresence();
+          return Response.json(res, { status: 200 });
+        }
+        case "publish": {
+          const res = await signaling.publishTrack(ctx!, { tracks: body.tracks as PublishTrack[], offer: body.offer as SessionDescription });
+          await this.emitPresence();
+          return Response.json(res, { status: 200 });
+        }
         case "subscribe":
           return Response.json(
             await signaling.subscribeTrack(ctx!, { trackName: String(body.trackName ?? "") }),
@@ -763,6 +692,7 @@ export class RoomDO {
           );
         case "leave":
           await signaling.leave(ctx!);
+          await this.emitPresence();
           return Response.json({ ok: true }, { status: 200 });
         default:
           return Response.json({ error: "BAD_REQUEST", message: `unknown realtime intent: ${intent}` }, { status: 400 });
@@ -774,6 +704,71 @@ export class RoomDO {
       const message = (e as Error)?.message ?? "unexpected error";
       return Response.json({ error: code, message }, { status });
     }
+  }
+
+  // ── E-ROOMS P4 (#73): presence / state-sync / data channel over a hibernatable WebSocket ──
+
+  private static readonly PRESENCE_VER_KEY = "presence:ver";
+
+  /** Complete a presence WS upgrade: the DO owns the hibernatable socket (a broadcast reaches every subscriber
+   *  + the socket survives eviction). Fails closed (503) without the hibernation API. Identity is in the
+   *  gateway-validated query (participantId + whitelisted role); re-validated here (never trust transport). */
+  private async acceptPresence(request: Request): Promise<Response> {
+    if (!this.doState.acceptWebSocket || !this.doState.getWebSockets) {
+      return Response.json(
+        { error: "REALTIME_NOT_CONFIGURED", message: "presence requires a Durable Object runtime" },
+        { status: 503 },
+      );
+    }
+    const u = new URL(request.url);
+    const participantId = u.searchParams.get("participantId") ?? "";
+    if (!participantId) {
+      return Response.json({ error: "BAD_REQUEST", message: "presence requires participantId" }, { status: 400 });
+    }
+    const roleRaw = u.searchParams.get("role") ?? "viewer";
+    const role: Role = roleRaw === "host" || roleRaw === "speaker" || roleRaw === "viewer" ? roleRaw : "viewer";
+    const snapshot = await this.core.snapshot();
+    return acceptPresenceSocket(this.doState as PresenceDOState, { participantId, role }, snapshot, await this.presenceVersion());
+  }
+
+  /** Hibernation handler — the runtime calls this per inbound frame on a presence socket. Delegates to the
+   *  pure hub (ping→pong, data→fan-out to others, invalid→typed error + abuse guard). Fully guarded: a
+   *  handler that throws would error the live socket, so a defect here must never escape. */
+  webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
+    try {
+      onPresenceMessage(this.doState as PresenceDOState, ws, message);
+    } catch {
+      /* a presence-message defect must never crash the socket / the live media the DO also serves */
+    }
+  }
+
+  /** Broadcast the authoritative view to every presence subscriber after a room mutation. No-op when the
+   *  runtime has no hibernation API (tests) — presence is purely additive to the existing intents. */
+  private async emitPresence(): Promise<void> {
+    if (!this.doState.getWebSockets) return;
+    const snapshot = await this.core.snapshot();
+    broadcastPresence(this.doState as PresenceDOState, snapshot, await this.bumpPresenceVersion());
+  }
+
+  /** Seed the version from storage exactly once (survives a DO eviction) — the only await in the version path. */
+  private async seedPresenceVersion(): Promise<void> {
+    if (this.presenceVer == null) this.presenceVer = (await this.doState.storage.get<number>(RoomDO.PRESENCE_VER_KEY)) ?? 0;
+  }
+
+  /** Current monotonic version (welcome uses it as-is). */
+  private async presenceVersion(): Promise<number> {
+    await this.seedPresenceVersion();
+    return this.presenceVer ?? 0;
+  }
+
+  /** Increment + persist the version. The read-modify-write is synchronous (no await between read and write),
+   *  so two concurrent broadcasts can never collide on the same version. */
+  private async bumpPresenceVersion(): Promise<number> {
+    await this.seedPresenceVersion();
+    const next = (this.presenceVer ?? 0) + 1;
+    this.presenceVer = next;
+    await this.doState.storage.put(RoomDO.PRESENCE_VER_KEY, next);
+    return next;
   }
 
   /** Build the SFU client from env; throws SfuError 503 NOT_CONFIGURED when app creds are unset. */
