@@ -154,6 +154,7 @@ function isBlockedIpv6(g: number[]): boolean {
   if ((g[0] & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
   if ((g[0] & 0xff00) === 0xff00) return true; // ff00::/8 multicast
   if (g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0xffff) return isBlockedIpv4(embeddedV4()); // ::ffff:0:0/96 mapped
+  if (g[0] === 0x0064 && g[1] === 0xff9b && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0) return isBlockedIpv4(embeddedV4()); // 64:ff9b::/96 NAT64 well-known prefix → embedded IPv4
   if (firstSixZero && (g[6] !== 0 || g[7] > 1)) return isBlockedIpv4(embeddedV4()); // ::a.b.c.d IPv4-compatible (deprecated)
   return false;
 }
@@ -163,16 +164,34 @@ const BLOCKED_HOST_NAMES = new Set(["localhost", "metadata", "metadata.google.in
 /** Name suffixes that denote a private/loopback zone (mDNS `.local`, private `.internal`, `.localhost` TLD). */
 const BLOCKED_HOST_SUFFIXES = [".local", ".internal", ".localhost"];
 
+/** Canonicalize a host string through the WHATWG host parser — the SAME normalization a URL-based dialer (and
+ *  `guardPullUrl`) applies — so an alternate IPv4 notation (decimal `2130706433`, hex `0x7f000001`, octal
+ *  `0177.0.0.1`, shorthand `127.1`) or a non-canonical IPv6 form resolves to its canonical address, and the range
+ *  check below cannot be evaded by an unusual spelling that the OS resolver would still map to an internal target.
+ *  Returns the bracket-stripped canonical host, or null if it is not a parseable host (fail-closed → the caller
+ *  rejects it). An IPv6 literal is bracketed for the parser, then unbracketed on return for numeric parsing. */
+function normalizeHost(host: string): string | null {
+  const needsBrackets = host.includes(":") && !host.startsWith("[");
+  try {
+    const hn = new URL(`http://${needsBrackets ? `[${host}]` : host}`).hostname;
+    return hn.startsWith("[") && hn.endsWith("]") ? hn.slice(1, -1) : hn;
+  } catch {
+    return null;
+  }
+}
+
 /** Guard one caller-supplied host the container may DIAL OUT to. Returns a stable reason string when the host is an
- *  internal/loopback/link-local/metadata/CGNAT target (IP literal or known-internal name), else null (safe as far as
- *  an offline check can tell — the ARM slice re-guards the DNS-resolved address to close the rebinding gap). An IPv6
- *  literal is range-checked by known-bad prefix; a `::ffff:`-mapped or trailing embedded IPv4 is unwrapped and
- *  v4-checked. */
+ *  internal/loopback/link-local/metadata/CGNAT target (IP literal — in ANY notation — or known-internal name), else
+ *  null (safe as far as an offline check can tell — the ARM slice re-guards the DNS-resolved address to close the
+ *  rebinding gap). The host is first canonicalized via {@link normalizeHost} so alternate IPv4/IPv6 spellings cannot
+ *  bypass the ranges; an IPv6 literal is then parsed to numeric groups and a `::ffff:`/embedded IPv4 is v4-checked. */
 export function guardIngestHost(host: string): string | null {
   if (typeof host !== "string" || host.length === 0) return "inbound host is empty";
-  // Strip an IPv6 zone id (`%eth0`) and brackets before literal parsing.
-  const h = host.trim().toLowerCase().split("%")[0].replace(/^\[/, "").replace(/\]$/, "");
-  if (h.length === 0) return "inbound host is empty";
+  // Strip an IPv6 zone id (`%eth0`) and brackets, then canonicalize alt-notations through the WHATWG host parser.
+  const stripped = host.trim().toLowerCase().split("%")[0].replace(/^\[/, "").replace(/\]$/, "");
+  if (stripped.length === 0) return "inbound host is empty";
+  const h = normalizeHost(stripped);
+  if (h === null) return `inbound host ${host} is not a valid host`;
 
   const v4 = parseIpv4(h);
   if (v4) return isBlockedIpv4(v4) ? `inbound host ${host} resolves to a blocked (internal/reserved) address` : null;

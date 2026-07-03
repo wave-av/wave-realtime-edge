@@ -162,6 +162,12 @@ describe("guardIngestHost / isSafeRemoteHost — the SSRF host guard", () => {
       expect(isSafeRemoteHost(bad)).toBe(false);
   });
 
+  it("blocks ALTERNATE IPv4 notations that resolve to an internal address (decimal/hex/octal/shorthand)", () => {
+    // These evade naive dotted-quad matching but a URL-based dialer / OS resolver maps them to 127.0.0.1 / 10.x etc.
+    for (const bad of ["2130706433", "0x7f000001", "0177.0.0.1", "127.1", "127.0.1", "0x0a000001", "0"])
+      expect(isSafeRemoteHost(bad)).toBe(false);
+  });
+
   it("blocks IPv6 loopback / ULA / link-local / multicast + mapped-IPv4-internal", () => {
     for (const bad of ["::1", "::", "fc00::1", "fd12:3456::1", "fe80::1", "ff02::1", "::ffff:127.0.0.1", "[fd00::1]"])
       expect(isSafeRemoteHost(bad)).toBe(false);
@@ -177,13 +183,15 @@ describe("guardIngestHost / isSafeRemoteHost — the SSRF host guard", () => {
       "fe80::1%eth0", // link-local with a zone id
       "::ffff:10.0.0.1", // mapped IPv4 → private
       "::ffff:169.254.169.254", // mapped IPv4 → cloud metadata
+      "64:ff9b::7f00:1", // NAT64 well-known prefix embedding 127.0.0.1
+      "64:ff9b::10.0.0.1", // NAT64 embedding a private IPv4
     ])
       expect(isSafeRemoteHost(bad)).toBe(false);
   });
 
   it("rejects a malformed IPv6 literal (can't prove it safe → refuse)", () => {
-    expect(guardIngestHost("1::2::3")).toMatch(/not a valid IPv6/);
-    expect(guardIngestHost("fe80:::1")).toMatch(/not a valid IPv6/);
+    expect(guardIngestHost("1::2::3")).toMatch(/not a valid/);
+    expect(guardIngestHost("fe80:::1")).toMatch(/not a valid/);
   });
 
   it("allows public IPv4 / IPv6 / DNS names (rebinding recheck is the ARM slice's job)", () => {
