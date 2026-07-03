@@ -20,9 +20,13 @@ import type { ToolDefinition, CompletionEvent } from "./agent-tools.js";
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
-/** Default Claude model routed through the gateway. Sonnet = the sensible voice default (latency/cost); Opus is
- *  selectable via VOICE_AGENT_LLM_MODEL per the design's Opus/Sonnet choice. */
-export const DEFAULT_VOICE_LLM_MODEL = "claude-sonnet-4-6";
+/** Default Claude model routed through the gateway. Sonnet = the sensible voice default (latency/cost); a larger
+ *  model (e.g. Opus) is selectable via VOICE_AGENT_LLM_MODEL per the design's Opus/Sonnet choice.
+ *  #118 flip (2026-07-03): migrated sonnet-4-6 → sonnet-5, the supported sonnet tier. Measured A/B on the
+ *  voice-LLM surface (wave-eval e1-voice-llm-ab, staging run 0e51451c): sonnet-5 judge_quality 0.976 vs
+ *  sonnet-4-6 0.968 — no regression, and 4-6 is deprecated. Same input/output pricing ($3/$15 per M).
+ *  Reversible: set env VOICE_AGENT_LLM_MODEL to pin any model without a redeploy. */
+export const DEFAULT_VOICE_LLM_MODEL = "claude-sonnet-5";
 /** ElevenLabs streaming output format — pcm_48000 = 16-bit LE PCM @ 48 kHz, exactly the ingest path's codec. */
 export const ELEVENLABS_OUTPUT_FORMAT = "pcm_48000";
 
