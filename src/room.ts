@@ -12,157 +12,27 @@ import type { ParticipantSessionUsage, MeterEmitEnv } from "./metering.js";
 import type { EventEmitEnv } from "./event-emitter.js";
 import type { EncoderKind, RecordingEncoder } from "./encoders/encoder.js";
 import { RoomRecording } from "./room-recording.js";
-import { MediaTap, tapPublishFrame } from "./media-tap.js";
+import { MediaTap, tapPublishFrame, mediaTapEnabled } from "./media-tap.js";
+import type { TapConsumerHandle, TapFrame } from "./media-tap.js";
+import { startAgentRead, type AgentReadTarget, type AgentFrameSink } from "./agent-media-consumer.js";
+import { buildTurnLoopSink, type TurnLoopDriver } from "./agent-turn-sink.js";
 import {
   acceptPresenceSocket,
   broadcastPresence,
   onPresenceMessage,
   type PresenceDOState,
 } from "./presence.js";
+import {
+  POLICY_DEFAULTS, ROOM_TYPES, isRoomType, STATE_KEY, ROLE_DEFAULT_PERMS, emptyState, normalizeState,
+  TRACK_GC_MS, DEFAULT_ROOM_TTL_MS,
+  type Role, type RoomType, type AdmissionPolicy, type WaitingEntry, type WaitingResult, type Permissions,
+  type Participant, type TrackKind, type RoomTrack, type RoomConfig, type RoomState, type RoomStorage,
+} from "./room-state.js";
 
-/** CF Realtime GCs a track after 30s of inactivity (design §4). Registry reconcile uses this. */
-export const TRACK_GC_MS = 30_000;
-/** Default room lifetime once empty/idle, after which the room is expired. */ export const DEFAULT_ROOM_TTL_MS = 30 * 60_000; // 30 min
-
-export type Role = "host" | "speaker" | "viewer";
-
-// ── P5.2-auth: per-room-type admission policy ────────────────────────────────────────────────────
-
-export type RoomType = "meeting" | "webinar" | "event" | "breakout";
-
-export interface AdmissionPolicy {
-  /** "knock" → all non-host joiners wait for approval; "auto" → admitted immediately. */
-  mode: "knock" | "auto";
-  /** When true, new joins are refused with 423 ROOM_LOCKED until unlock(). */
-  locked: boolean;
-  /** Maximum participant count; null = unlimited. Excess joins → 429 ROOM_FULL. */
-  capacity: number | null;
-  /** Role assigned when no explicit role is requested. */
-  defaultRole: Role;
-  /** Whether anonymous (no WAVE account) participants are allowed. */
-  allowAnonymous: boolean;
-}
-
-const POLICY_DEFAULTS: Record<RoomType, AdmissionPolicy> = {
-  meeting:  { mode: "knock", locked: false, capacity: null,  defaultRole: "speaker", allowAnonymous: false },
-  webinar:  { mode: "auto",  locked: false, capacity: null,  defaultRole: "viewer",  allowAnonymous: true  },
-  event:    { mode: "auto",  locked: false, capacity: 10000, defaultRole: "viewer",  allowAnonymous: true  },
-  breakout: { mode: "auto",  locked: false, capacity: null,  defaultRole: "viewer",  allowAnonymous: false },
-};
-
-/** The set of known room types — used to validate a `type` before it sets a policy (no empty policies). */
-export const ROOM_TYPES = Object.keys(POLICY_DEFAULTS) as RoomType[];
-export function isRoomType(t: unknown): t is RoomType {
-  return typeof t === "string" && (ROOM_TYPES as string[]).includes(t);
-}
-
-/** A participant waiting for admission (knock rooms). No SFU session is minted yet. */
-export interface WaitingEntry {
-  participantId: string;
-  role: Role;
-  requestedAt: number;
-}
-
-/** Sentinel returned by joinRoom when the participant is placed in the waiting room. */
-export interface WaitingResult {
-  waiting: true;
-  participantId: string;
-}
-
-/** Per-participant grants. Kept minimal here; auth/scope enforcement is P5.2. */
-export interface Permissions {
-  canPublish: boolean;
-  canSubscribe: boolean;
-}
-
-export interface Participant {
-  participantId: string;
-  /** CF Realtime SFU session id for this participant (opaque). */
-  sessionId: string;
-  role: Role;
-  permissions: Permissions;
-  joinedAt: number;
-  /** Sticky: set true the first time the participant publishes an AUDIO track (P5.3 metering tier). */
-  publishedAudio?: boolean;
-  /** Sticky: set true the first time the participant publishes a VIDEO track (P5.3 metering tier). */
-  publishedVideo?: boolean;
-}
-
-export type TrackKind = "audio" | "video";
-
-/** A track in the room registry, keyed by CF Realtime trackName, owned by a participant's session. */
-export interface RoomTrack {
-  trackName: string;
-  sessionId: string;
-  participantId: string;
-  kind: TrackKind;
-  /** Last time the publisher was seen active; reconcile() GCs tracks idle > TRACK_GC_MS. */
-  lastSeenAt: number;
-}
-
-/** Immutable room binding. `org` binds the room to a single org (invariant: per-org isolation). */
-export interface RoomConfig {
-  roomId: string;
-  org: string;
-  ttlMs?: number;
-  /** Optional room type — sets the admission policy on first bind. */
-  type?: RoomType;
-}
-
-export interface RoomState {
-  config: RoomConfig | null;
-  participants: Record<string, Participant>;
-  tracks: Record<string, RoomTrack>;
-  /** Set when the room becomes empty; room expires at emptyAt + ttl. Null while occupied. */
-  emptyAt: number | null;
-  // ── P5.2-auth admission fields ──────────────────────────────────────────────────────────────
-  /** Active admission policy. Null until ensureRoom sets it (no type → no policy enforcement). */
-  policy: AdmissionPolicy | null;
-  /** Participants waiting for admission (knock mode). Keyed by participantId. */
-  waiting: Record<string, WaitingEntry>;
-  /** Permanently banned participant ids. A banned pid is denied immediately on join. */
-  banned: string[];
-  /**
-   * Participants a host has admitted from the waiting room but who have not yet been seated (their
-   * retry join is still in flight). An admitted pid bypasses the knock check exactly once — the marker
-   * is consumed when joinRoom seats them. Without this, a knock-mode admissionCheck re-queues the SAME
-   * admitted participant forever (admit → retry → waiting → …).
-   */
-  admitted: string[];
-}
-
-/** Minimal storage surface (subset of DurableObjectStorage) — injectable for tests. */
-export interface RoomStorage {
-  get<T>(key: string): Promise<T | undefined>;
-  put<T>(key: string, value: T): Promise<void>;
-}
-
-const STATE_KEY = "room:state";
-const ROLE_DEFAULT_PERMS: Record<Role, Permissions> = {
-  host: { canPublish: true, canSubscribe: true },
-  speaker: { canPublish: true, canSubscribe: true },
-  viewer: { canPublish: false, canSubscribe: true },
-};
-
-function emptyState(): RoomState {
-  return { config: null, participants: {}, tracks: {}, emptyAt: Date.now(), policy: null, waiting: {}, banned: [], admitted: [] };
-}
-
-/**
- * Normalize a loaded state record so code added after the original schema can rely on the admission
- * fields being present. Records written before this change lack policy/waiting/banned/admitted; without
- * this, `s.banned.includes(...)` / `delete s.waiting[...]` / `s.admitted.includes(...)` throw. Mutates
- * and returns the same object (so the cached instance is normalized too).
- */
-function normalizeState(s: RoomState): RoomState {
-  if (s.policy === undefined) s.policy = null;
-  if (!s.waiting) s.waiting = {};
-  if (!Array.isArray(s.banned)) s.banned = [];
-  if (!Array.isArray(s.admitted)) s.admitted = [];
-  if (!s.participants) s.participants = {};
-  if (!s.tracks) s.tracks = {};
-  return s;
-}
+// The room data model (types + admission-policy defaults + pure state helpers) lives in room-state.ts — split
+// out so this file stays under the file-size gate. Re-exported here so every existing importer of `./room.js`
+// (signaling.ts, tests, …) is unaffected. See room-state.ts for the definitions.
+export * from "./room-state.js";
 
 /**
  * RoomCore — the testable state machine, decoupled from the DO runtime. The DurableObject wrapper
@@ -597,6 +467,11 @@ export class RoomDO {
   private readonly env: RoomDOEnv;
   private readonly recording: RoomRecording;
   readonly mediaTap = new MediaTap(); // #74: the room's single subscribe surface; publishes only when armed
+  /** #76 P2 (arch A): the co-located agent read drain handle, per target track. Null until an `agent-bind`
+   *  intent arms it (MEDIA_TAP_ENABLED gated) → the agent reads via THIS tap, not a 2nd SFU subscription.
+   *  Additive + inert; does NOT touch the live AgentSessionDO echo/speak path (#78 removes that later). */
+  private agentReadHandle: TapConsumerHandle | null = null;
+  private agentReadFrames = 0; // receipt counter: frames the co-located agent read has drained
   private readonly doState: DurableObjectStateLike;
   /** Monotonic presence broadcast version (conflict-free client ordering). Seeded lazily from storage so it
    *  survives a DO eviction; incremented per broadcast. Null until first read. */
@@ -636,6 +511,49 @@ export class RoomDO {
   }
 
   /**
+   * #76 P2/P3 (arch A) — arm the co-located agent media-READ off this room's MediaTap. Registers an in-process
+   * MediaConsumer selecting the agent's target participant track and drains it. Returns whether the read was
+   * armed (false when MEDIA_TAP_ENABLED is off → prod byte-identical). Idempotent: a re-bind closes the prior
+   * drain first (one read per room).
+   *
+   * The SINK is chosen by whether a turn-loop `driver` is injected (P3, agent-turn-sink.ts):
+   *   • driver present → `buildTurnLoopSink(driver)` drains tapped frames into the real VAD→STT→LLM→TTS loop.
+   *   • driver absent  → the P2 counting RECEIPT (count + log) — proves the read is live without a turn-loop.
+   * The agent-bind control-plane path injects NO driver today (→ counting receipt), so prod is byte-identical;
+   * supplying a live driver (built by `buildRoomTurnLoopDriver` off a live ingest socket + enriched bind config)
+   * is the ◆-arm slice. Either way the tap wiring below is identical — the sink is the only thing that swaps.
+   *
+   * This is purely the agent's WATCH input. The agent's speak/TTS-out path is the driver's ingest socket (arch A:
+   * a RoomDO-owned ingest adapter). This method does NOT touch the live AgentSessionDO echo path — that is #78
+   * decommission, after parity is proven.
+   */
+  armAgentRead(target: AgentReadTarget, driver?: TurnLoopDriver): boolean {
+    const armed = mediaTapEnabled(this.env);
+    // Close any prior drain (idempotent rebind) before (re)registering.
+    this.agentReadHandle?.close();
+    this.agentReadHandle = null;
+    const sink: AgentFrameSink = driver
+      ? buildTurnLoopSink(driver) // P3: real turn-loop
+      : {
+          // P2 receipt — proves the agent read is live off the tap. NO turn-loop (no driver injected).
+          onFrame: (frame: TapFrame) => {
+            this.agentReadFrames++;
+            if (this.agentReadFrames === 1 || this.agentReadFrames % 250 === 0) {
+              console.log(JSON.stringify({
+                msg: "agent-read-frame", agentId: target.agentId, track: target.participantTrackName,
+                seq: frame.seq, count: this.agentReadFrames,
+              }));
+            }
+          },
+        };
+    this.agentReadHandle = startAgentRead(this.mediaTap, target, sink, armed);
+    return this.agentReadHandle !== null;
+  }
+
+  /** Frames the co-located agent read has drained (test/receipt visibility). */
+  get agentReadFrameCount(): number { return this.agentReadFrames; }
+
+  /**
    * Control-plane surface. The worker forwards `POST .../<intent>` here with a JSON body carrying the
    * already-validated context (org/room/participantId) + the intent payload. Builds the SfuClient lazily
    * (so an unconfigured app fails closed only when an intent actually needs the SFU), runs Signaling, and
@@ -643,7 +561,27 @@ export class RoomDO {
    * (fail-open inside metering.ts). The DO never holds media — only state + orchestration.
    */
   async fetch(request: Request): Promise<Response> {
-    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent | "recorder-frame" | "presence";
+    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent | "recorder-frame" | "presence" | "agent-bind";
+    // #76 P2 (arch A): fold the agent's media-READ onto this room's single MediaTap. The AGENT dispatch
+    // (/bind) additionally forwards the SAME AgentSessionConfig here when MEDIA_TAP_ENABLED is armed, so the
+    // RoomDO registers an IN-PROCESS MediaConsumer for the agent's target track — no 2nd SFU subscription, no
+    // cross-DO frame transport. INERT when unarmed (armAgentRead no-ops → prod byte-identical). ADDITIVE: the
+    // live AgentSessionDO echo/speak path is untouched (#78 decommissions it after parity is proven).
+    if (intent === "agent-bind") {
+      try {
+        const u = new URL(request.url);
+        const agentId = u.searchParams.get("agentId") ?? "";
+        const participantTrackName = u.searchParams.get("participantTrackName") ?? "";
+        if (agentId && participantTrackName) {
+          const armed = this.armAgentRead({ agentId, participantTrackName });
+          return Response.json({ ok: true, armed }, { status: 200 });
+        }
+        return Response.json({ error: "BAD_REQUEST", message: "agent-bind requires agentId and participantTrackName" }, { status: 400 });
+      } catch {
+        // fail-open: an agent-read arm defect must never break the room control plane or the live media path.
+        return Response.json({ ok: true, armed: false }, { status: 200 });
+      }
+    }
     // RT-R9: the Worker recorder route forwards one decoded WS media frame as a raw binary POST. DORMANT for
     // managed (feedFrame is a no-op when no container tap is held). Fail-open: always 200/204, never throws.
     if (intent === "recorder-frame") {

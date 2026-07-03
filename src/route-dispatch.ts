@@ -23,6 +23,7 @@ import { maybeHandleIngestBridge, scheduledIngestReconcile } from "./ingest-brid
 // Task #81 (LK-rip Phase 6b) — voice-agent runtime. INERT behind VOICE_AGENT_PROVIDER==="wave": every new
 // route/DO behavior is gated by voiceAgentEnabled(env); absent/anything-else → the 501 catch-all is unchanged.
 import { voiceAgentEnabled, type AgentSessionConfig } from "./agent-session";
+import { mediaTapEnabled } from "./media-tap";
 // E3.P2/P4 (#127) — data-residency sink wiring (used only when RT_RESIDENCY is on). residency-rt.ts stays PURE.
 import { captureSessionZone } from "./residency-sink";
 // #82/#114 EX P2/P3 — cascade relay wiring (used only when RT_CASCADE is on). cascade.ts stays PURE; the
@@ -618,6 +619,20 @@ export async function dispatch(
 			const id = env.AGENT_SESSION.idFromName(doKey);
 			const stub = env.AGENT_SESSION.get(id);
 			const method = adMatch[1] === "info" ? "GET" : "POST";
+			// #76 P2 (arch A): additionally fold the agent's media-READ onto the room's single MediaTap. When
+			// MEDIA_TAP_ENABLED is armed, tell the SAME-keyed ROOM DO to register an in-process MediaConsumer
+			// for the agent's target track — no 2nd SFU subscription, no cross-DO frame transport. Fire-and-
+			// forget + fail-open: NEVER affects the /bind response or the live AgentSessionDO echo path. INERT
+			// when the flag is off (mediaTapEnabled false → no call at all).
+			const agentTrack = typeof cfg.participantTrackName === "string" ? cfg.participantTrackName : "";
+			if (adMatch[1] === "bind" && mediaTapEnabled(env) && env.ROOM && SAFE_SEGMENT.test(agentId) && SAFE_SEGMENT.test(agentTrack)) {
+				const roomId = env.ROOM.idFromName(doKey);
+				const roomStub = env.ROOM.get(roomId);
+				const fold = roomStub
+					.fetch(new Request(`https://room/agent-bind?agentId=${encodeURIComponent(agentId)}&participantTrackName=${encodeURIComponent(agentTrack)}`, { method: "POST" }))
+					.catch(() => {});
+				if (ctx) ctx.waitUntil(fold);
+			}
 			return stub.fetch(new Request(`https://agent/${adMatch[1]}`, {
 				method,
 				headers: { "content-type": "application/json" },
