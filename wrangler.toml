@@ -125,7 +125,11 @@ EGRESS_ROUTER_ENABLED = "0"  # INERT — #75 P2/P3/P4 backends built; arming is 
 # CF_STREAM_API_TOKEN is a wrangler SECRET — `wrangler secret put CF_STREAM_API_TOKEN` (CF account token w/ Stream
 # scope; Doppler wave/prd). CF_STREAM_CUSTOMER_CODE builds the RTMPS/SRT ingest endpoint URLs (non-secret [vars] or
 # secret). Unset → the concrete client cannot create live inputs (the backend stays inert regardless).
-INGRESS_ROUTER_ENABLED = "0"  # INERT — #77 P2 backend built; arming is a ◆ Jake crossing (ARM slice wires the entrypoint)
+# The SECOND backend is WHIP/WebRTC (#77 P3, src/ingress-whip-sfu.ts) — the most-direct tier (cfCallsSfu): native WHIP
+# publishes straight into the SFU (the existing whip.ts surface), no transcode/managed hop/container. Shares THIS flag.
+# Its ARM slice negotiates the WHIP publish via the CF Calls app pair the whip.ts surface already uses: CF_CALLS_APP_ID
+# (non-secret) + CF_CALLS_APP_SECRET (a wrangler SECRET — `wrangler secret put CF_CALLS_APP_SECRET`, Doppler wave/prd).
+INGRESS_ROUTER_ENABLED = "0"  # INERT — #77 P2+P3 backends built; arming is a ◆ Jake crossing (ARM slice wires the entrypoint)
 
 # ── B1 (#91-a) — CF Stream Live → SFU bridge control plane (POST /v1/stream/bridge/webhook). DEFAULT OFF. ──
 # STREAM_BRIDGE_ENABLED gates the self-authenticating CF Stream webhook receiver (src/stream-bridge.ts). Absent/
