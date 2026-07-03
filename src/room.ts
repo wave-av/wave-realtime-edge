@@ -15,6 +15,7 @@ import { RoomRecording } from "./room-recording.js";
 import { MediaTap, tapPublishFrame, mediaTapEnabled } from "./media-tap.js";
 import type { TapConsumerHandle, TapFrame } from "./media-tap.js";
 import { startAgentRead, type AgentReadTarget, type AgentFrameSink } from "./agent-media-consumer.js";
+import { buildTurnLoopSink, type TurnLoopDriver } from "./agent-turn-sink.js";
 import {
   acceptPresenceSocket,
   broadcastPresence,
@@ -643,32 +644,41 @@ export class RoomDO {
   }
 
   /**
-   * #76 P2 (arch A) — arm the co-located agent media-READ off this room's MediaTap. Registers an in-process
+   * #76 P2/P3 (arch A) — arm the co-located agent media-READ off this room's MediaTap. Registers an in-process
    * MediaConsumer selecting the agent's target participant track and drains it. Returns whether the read was
    * armed (false when MEDIA_TAP_ENABLED is off → prod byte-identical). Idempotent: a re-bind closes the prior
-   * drain first (one read per room). The sink here is the P2 receipt (count + log a drained frame); the P3
-   * VAD→STT→LLM→TTS turn-loop is a DEFERRED step that swaps in a richer sink WITHOUT re-touching this wiring.
+   * drain first (one read per room).
    *
-   * This is purely the agent's WATCH input. The agent's speak/TTS-out path is separate and unchanged. This
-   * method does NOT touch the live AgentSessionDO echo path — that is #78 decommission, after parity is proven.
+   * The SINK is chosen by whether a turn-loop `driver` is injected (P3, agent-turn-sink.ts):
+   *   • driver present → `buildTurnLoopSink(driver)` drains tapped frames into the real VAD→STT→LLM→TTS loop.
+   *   • driver absent  → the P2 counting RECEIPT (count + log) — proves the read is live without a turn-loop.
+   * The agent-bind control-plane path injects NO driver today (→ counting receipt), so prod is byte-identical;
+   * supplying a live driver (built by `buildRoomTurnLoopDriver` off a live ingest socket + enriched bind config)
+   * is the ◆-arm slice. Either way the tap wiring below is identical — the sink is the only thing that swaps.
+   *
+   * This is purely the agent's WATCH input. The agent's speak/TTS-out path is the driver's ingest socket (arch A:
+   * a RoomDO-owned ingest adapter). This method does NOT touch the live AgentSessionDO echo path — that is #78
+   * decommission, after parity is proven.
    */
-  armAgentRead(target: AgentReadTarget): boolean {
+  armAgentRead(target: AgentReadTarget, driver?: TurnLoopDriver): boolean {
     const armed = mediaTapEnabled(this.env);
     // Close any prior drain (idempotent rebind) before (re)registering.
     this.agentReadHandle?.close();
     this.agentReadHandle = null;
-    const sink: AgentFrameSink = {
-      onFrame: (frame: TapFrame) => {
-        this.agentReadFrames++;
-        // Receipt only in P2 — proves the agent read is live off the tap. NO turn-loop yet (P3, deferred).
-        if (this.agentReadFrames === 1 || this.agentReadFrames % 250 === 0) {
-          console.log(JSON.stringify({
-            msg: "agent-read-frame", agentId: target.agentId, track: target.participantTrackName,
-            seq: frame.seq, count: this.agentReadFrames,
-          }));
-        }
-      },
-    };
+    const sink: AgentFrameSink = driver
+      ? buildTurnLoopSink(driver) // P3: real turn-loop
+      : {
+          // P2 receipt — proves the agent read is live off the tap. NO turn-loop (no driver injected).
+          onFrame: (frame: TapFrame) => {
+            this.agentReadFrames++;
+            if (this.agentReadFrames === 1 || this.agentReadFrames % 250 === 0) {
+              console.log(JSON.stringify({
+                msg: "agent-read-frame", agentId: target.agentId, track: target.participantTrackName,
+                seq: frame.seq, count: this.agentReadFrames,
+              }));
+            }
+          },
+        };
     this.agentReadHandle = startAgentRead(this.mediaTap, target, sink, armed);
     return this.agentReadHandle !== null;
   }
