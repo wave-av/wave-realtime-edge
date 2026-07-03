@@ -87,6 +87,20 @@ WHEP_EGRESS_ENABLED = "1"   # ◆ ARMED 2026-07-01 (Jake-named: "activate the WH
 # isolation reuses the `stream-input-org:{uid}` KV map (src/stream-bridge.ts).
 USE_CLOUDFLARE_STREAM = "1"  # ◆ ARMED 2026-07-01 — CF Stream WebRTC playback backend live
 
+# ── #75 E-EGRESS-ROUTER — routed egress. DEFAULT OFF / FULLY INERT. ──
+# EGRESS_ROUTER_ENABLED gates whether the RoomDO instantiates a routed-egress MediaConsumer (#74 tap) and drives it
+# through egressRoute (#75 P1). Absent/"0" → NO egress consumer is attached: the tap fans out to nothing new and the
+# room path is BYTE-IDENTICAL to today. The first backend is wave-render (#75 P2, src/egress-wave-render.ts) — it
+# composites the room view into a branded still via the wave-render origin. Flipping this to "1" on a live env is a
+# Jake-named ◆ crossing (NEW LIVE EGRESS activation), and depends on the ARM slice wiring the consumer into the
+# RoomDO + the concrete wave-render HTTP client. Preconditions for go-live: MEDIA_TAP_ENABLED armed (the tap must
+# publish frames), WAVE_RENDER_URL bound, and the WAVE_INTERNAL_RENDER_TOKEN secret provisioned (below). Until then
+# the backend module ships but is never instantiated — inert.
+# WAVE_RENDER_URL — wave-render origin base URL (public, non-secret; bound at the ARM slice, NOT a credential).
+# WAVE_INTERNAL_RENDER_TOKEN is a wrangler SECRET — `wrangler secret put WAVE_INTERNAL_RENDER_TOKEN` (Doppler
+# wave/prd). Unset → the wave-render client presents no bearer and the origin fails it closed (UNTRUSTED → 402).
+EGRESS_ROUTER_ENABLED = "0"  # INERT — #75 P2 backend built; arming is a ◆ Jake crossing (ARM slice wires the RoomDO)
+
 # ── B1 (#91-a) — CF Stream Live → SFU bridge control plane (POST /v1/stream/bridge/webhook). DEFAULT OFF. ──
 # STREAM_BRIDGE_ENABLED gates the self-authenticating CF Stream webhook receiver (src/stream-bridge.ts). Absent/
 # "0" → the route falls through to the honest 501 catch-all, UNCHANGED — the whole bridge is inert. The webhook
