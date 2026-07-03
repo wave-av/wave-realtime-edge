@@ -132,6 +132,10 @@ describe("isValidRtmpDestination + buildPassthroughJob + defaults", () => {
     expect(isValidRtmpDestination("not a url")).toBe(false);
     expect(isValidRtmpDestination("")).toBe(false);
     expect(isValidRtmpDestination(undefined)).toBe(false);
+    // Hostless opaque rtmp: URLs parse with protocol rtmp: but an empty hostname — must be rejected.
+    expect(isValidRtmpDestination("rtmp:foo")).toBe(false);
+    expect(isValidRtmpDestination("rtmp:")).toBe(false);
+    expect(isValidRtmpDestination("rtmp:///nohost")).toBe(false);
   });
 
   it("buildPassthroughJob is always needsCompositing:false (passthrough), carrying config + sourceCount", () => {

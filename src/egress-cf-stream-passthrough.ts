@@ -107,8 +107,10 @@ export function buildPassthroughJob(config: CfStreamEgressConfig, sourceCount: n
   };
 }
 
-/** True iff `dest` is a well-formed rtmp/rtmps URL — the only schemes a simulcast may push to. A non-URL or a
- *  non-RTMP scheme (http, file, etc.) returns false, so the destination is refused before it reaches CF Stream. */
+/** True iff `dest` is a well-formed rtmp/rtmps URL WITH a host — the only shape a simulcast may push to. A non-URL, a
+ *  non-RTMP scheme (http, file, etc.), or a hostless opaque `rtmp:` URL (`rtmp:foo`, `rtmp:`, `rtmp:///x` all parse
+ *  with an empty hostname because rtmp is a non-special scheme) returns false, so a malformed/hostless destination is
+ *  refused before it reaches CF Stream. */
 export function isValidRtmpDestination(dest: string | undefined): dest is string {
   if (typeof dest !== "string" || dest.length === 0) return false;
   let url: URL;
@@ -117,7 +119,7 @@ export function isValidRtmpDestination(dest: string | undefined): dest is string
   } catch {
     return false;
   }
-  return url.protocol === "rtmp:" || url.protocol === "rtmps:";
+  return (url.protocol === "rtmp:" || url.protocol === "rtmps:") && url.hostname.length > 0;
 }
 
 /** The default provisioner id. */
