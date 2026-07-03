@@ -12,7 +12,9 @@ import type { ParticipantSessionUsage, MeterEmitEnv } from "./metering.js";
 import type { EventEmitEnv } from "./event-emitter.js";
 import type { EncoderKind, RecordingEncoder } from "./encoders/encoder.js";
 import { RoomRecording } from "./room-recording.js";
-import { MediaTap, tapPublishFrame } from "./media-tap.js";
+import { MediaTap, tapPublishFrame, mediaTapEnabled } from "./media-tap.js";
+import type { TapConsumerHandle, TapFrame } from "./media-tap.js";
+import { startAgentRead, type AgentReadTarget, type AgentFrameSink } from "./agent-media-consumer.js";
 import {
   acceptPresenceSocket,
   broadcastPresence,
@@ -597,6 +599,11 @@ export class RoomDO {
   private readonly env: RoomDOEnv;
   private readonly recording: RoomRecording;
   readonly mediaTap = new MediaTap(); // #74: the room's single subscribe surface; publishes only when armed
+  /** #76 P2 (arch A): the co-located agent read drain handle, per target track. Null until an `agent-bind`
+   *  intent arms it (MEDIA_TAP_ENABLED gated) → the agent reads via THIS tap, not a 2nd SFU subscription.
+   *  Additive + inert; does NOT touch the live AgentSessionDO echo/speak path (#78 removes that later). */
+  private agentReadHandle: TapConsumerHandle | null = null;
+  private agentReadFrames = 0; // receipt counter: frames the co-located agent read has drained
   private readonly doState: DurableObjectStateLike;
   /** Monotonic presence broadcast version (conflict-free client ordering). Seeded lazily from storage so it
    *  survives a DO eviction; incremented per broadcast. Null until first read. */
@@ -636,6 +643,40 @@ export class RoomDO {
   }
 
   /**
+   * #76 P2 (arch A) — arm the co-located agent media-READ off this room's MediaTap. Registers an in-process
+   * MediaConsumer selecting the agent's target participant track and drains it. Returns whether the read was
+   * armed (false when MEDIA_TAP_ENABLED is off → prod byte-identical). Idempotent: a re-bind closes the prior
+   * drain first (one read per room). The sink here is the P2 receipt (count + log a drained frame); the P3
+   * VAD→STT→LLM→TTS turn-loop is a DEFERRED step that swaps in a richer sink WITHOUT re-touching this wiring.
+   *
+   * This is purely the agent's WATCH input. The agent's speak/TTS-out path is separate and unchanged. This
+   * method does NOT touch the live AgentSessionDO echo path — that is #78 decommission, after parity is proven.
+   */
+  armAgentRead(target: AgentReadTarget): boolean {
+    const armed = mediaTapEnabled(this.env);
+    // Close any prior drain (idempotent rebind) before (re)registering.
+    this.agentReadHandle?.close();
+    this.agentReadHandle = null;
+    const sink: AgentFrameSink = {
+      onFrame: (frame: TapFrame) => {
+        this.agentReadFrames++;
+        // Receipt only in P2 — proves the agent read is live off the tap. NO turn-loop yet (P3, deferred).
+        if (this.agentReadFrames === 1 || this.agentReadFrames % 250 === 0) {
+          console.log(JSON.stringify({
+            msg: "agent-read-frame", agentId: target.agentId, track: target.participantTrackName,
+            seq: frame.seq, count: this.agentReadFrames,
+          }));
+        }
+      },
+    };
+    this.agentReadHandle = startAgentRead(this.mediaTap, target, sink, armed);
+    return this.agentReadHandle !== null;
+  }
+
+  /** Frames the co-located agent read has drained (test/receipt visibility). */
+  get agentReadFrameCount(): number { return this.agentReadFrames; }
+
+  /**
    * Control-plane surface. The worker forwards `POST .../<intent>` here with a JSON body carrying the
    * already-validated context (org/room/participantId) + the intent payload. Builds the SfuClient lazily
    * (so an unconfigured app fails closed only when an intent actually needs the SFU), runs Signaling, and
@@ -643,7 +684,27 @@ export class RoomDO {
    * (fail-open inside metering.ts). The DO never holds media — only state + orchestration.
    */
   async fetch(request: Request): Promise<Response> {
-    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent | "recorder-frame" | "presence";
+    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent | "recorder-frame" | "presence" | "agent-bind";
+    // #76 P2 (arch A): fold the agent's media-READ onto this room's single MediaTap. The AGENT dispatch
+    // (/bind) additionally forwards the SAME AgentSessionConfig here when MEDIA_TAP_ENABLED is armed, so the
+    // RoomDO registers an IN-PROCESS MediaConsumer for the agent's target track — no 2nd SFU subscription, no
+    // cross-DO frame transport. INERT when unarmed (armAgentRead no-ops → prod byte-identical). ADDITIVE: the
+    // live AgentSessionDO echo/speak path is untouched (#78 decommissions it after parity is proven).
+    if (intent === "agent-bind") {
+      try {
+        const u = new URL(request.url);
+        const agentId = u.searchParams.get("agentId") ?? "";
+        const participantTrackName = u.searchParams.get("participantTrackName") ?? "";
+        if (agentId && participantTrackName) {
+          const armed = this.armAgentRead({ agentId, participantTrackName });
+          return Response.json({ ok: true, armed }, { status: 200 });
+        }
+        return Response.json({ error: "BAD_REQUEST", message: "agent-bind requires agentId and participantTrackName" }, { status: 400 });
+      } catch {
+        // fail-open: an agent-read arm defect must never break the room control plane or the live media path.
+        return Response.json({ ok: true, armed: false }, { status: 200 });
+      }
+    }
     // RT-R9: the Worker recorder route forwards one decoded WS media frame as a raw binary POST. DORMANT for
     // managed (feedFrame is a no-op when no container tap is held). Fail-open: always 200/204, never throws.
     if (intent === "recorder-frame") {
