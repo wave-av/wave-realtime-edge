@@ -106,7 +106,12 @@ USE_CLOUDFLARE_STREAM = "1"  # ◆ ARMED 2026-07-01 — CF Stream WebRTC playbac
 # RUNPOD_API_TOKEN is a wrangler SECRET — `wrangler secret put RUNPOD_API_TOKEN` (Doppler wave/prd). Unset → the
 # RunPod client cannot authenticate and the encode fails closed. NO list/$/min price ships — a throughput bench (real
 # GPU-seconds per encoded minute) precedes any pricing, per the measure-before-benching rule.
-EGRESS_ROUTER_ENABLED = "0"  # INERT — #75 P2+P3 backends built; arming is a ◆ Jake crossing (ARM slice wires the RoomDO)
+# The THIRD backend is CF Stream passthrough (#75 P4, src/egress-cf-stream-passthrough.ts) — the cheapest tier: record
+# or RTMP-simulcast a track AS-IS (no compositing/encode). A one-shot provisioner (not a tap consumer); a simulcast's
+# external rtmp/rtmps destination is scheme-validated before the sink. Shares THIS flag. Its ARM slice reuses the CF
+# Stream scope: CF_STREAM_API_TOKEN is a wrangler SECRET — `wrangler secret put CF_STREAM_API_TOKEN` (Doppler wave/prd;
+# same token the #77 ingress backend documents) — used to create CF Stream recordings / live outputs.
+EGRESS_ROUTER_ENABLED = "0"  # INERT — #75 P2/P3/P4 backends built; arming is a ◆ Jake crossing (ARM slice wires the RoomDO)
 
 # ── #77 E-INGRESS — routed ingest. DEFAULT OFF / FULLY INERT. ──
 # INGRESS_ROUTER_ENABLED gates whether the ingest entrypoint provisions inbound sources through ingressRoute (#77 P1)
