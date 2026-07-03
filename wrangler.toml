@@ -129,7 +129,14 @@ EGRESS_ROUTER_ENABLED = "0"  # INERT — #75 P2/P3/P4 backends built; arming is 
 # publishes straight into the SFU (the existing whip.ts surface), no transcode/managed hop/container. Shares THIS flag.
 # Its ARM slice negotiates the WHIP publish via the CF Calls app pair the whip.ts surface already uses: CF_CALLS_APP_ID
 # (non-secret) + CF_CALLS_APP_SECRET (a wrangler SECRET — `wrangler secret put CF_CALLS_APP_SECRET`, Doppler wave/prd).
-INGRESS_ROUTER_ENABLED = "0"  # INERT — #77 P2+P3 backends built; arming is a ◆ Jake crossing (ARM slice wires the entrypoint)
+# The THIRD backend is the container bridge (#77 P4, src/ingress-container-bridge.ts) — the most-owned-compute tier
+# (containerBridge): the router-facing adapter over the EXISTING Plane-2 control plane (ingest-bridge.ts, F #55) that
+# starts a per-protocol container leg (rist/moq backstop + self-hosted rtmp/srt) → WHIP-publishes into the SFU. Shares
+# THIS flag; its container bindings (SRT_BRIDGE/RIST_BRIDGE/RTMPS_BRIDGE/MOQ_BRIDGE) live in the ingest-bridge runtime
+# env and stay COMMENTED until each leg's own go-live (absent → fail-closed 501). It adds the SSRF guard (guardIngestHost
+# /guardPullUrl) the router deferred to P4 — an untrusted inbound host the container may dial is rejected if it targets
+# an internal/loopback/link-local/metadata/CGNAT(tailnet) address before the container-start sink.
+INGRESS_ROUTER_ENABLED = "0"  # INERT — #77 P2+P3+P4 backends built (ingress backend set complete); arming is a ◆ Jake crossing (ARM slice wires the entrypoint)
 
 # ── B1 (#91-a) — CF Stream Live → SFU bridge control plane (POST /v1/stream/bridge/webhook). DEFAULT OFF. ──
 # STREAM_BRIDGE_ENABLED gates the self-authenticating CF Stream webhook receiver (src/stream-bridge.ts). Absent/
