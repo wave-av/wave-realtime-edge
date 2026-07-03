@@ -101,6 +101,20 @@ USE_CLOUDFLARE_STREAM = "1"  # ◆ ARMED 2026-07-01 — CF Stream WebRTC playbac
 # wave/prd). Unset → the wave-render client presents no bearer and the origin fails it closed (UNTRUSTED → 402).
 EGRESS_ROUTER_ENABLED = "0"  # INERT — #75 P2 backend built; arming is a ◆ Jake crossing (ARM slice wires the RoomDO)
 
+# ── #77 E-INGRESS — routed ingest. DEFAULT OFF / FULLY INERT. ──
+# INGRESS_ROUTER_ENABLED gates whether the ingest entrypoint provisions inbound sources through ingressRoute (#77 P1)
+# instead of the legacy single path. Absent/"0" → NO routed provisioning happens: ingress is BYTE-IDENTICAL to today.
+# The first backend is CF Stream Live (#77 P2, src/ingress-cf-stream-live.ts) — it provisions a CF Stream Live input
+# (free managed RTMP/SRT push + URL pull) and writes the `stream-input-org:${uid}` → org binding the Plane-1 receiver
+# (stream-bridge.ts) requires. Flipping this to "1" on a live env is a Jake-named ◆ crossing (NEW routed-ingest
+# provisioning), and depends on the ARM slice wiring provisioning into the ingest entrypoint + the concrete CF Stream
+# Live client. Preconditions: STREAM_BRIDGE_ENABLED armed (the receiver, already "1") + CF_STREAM_API_TOKEN provisioned
+# (below). Until then the backend module ships but is never instantiated — inert.
+# CF_STREAM_API_TOKEN is a wrangler SECRET — `wrangler secret put CF_STREAM_API_TOKEN` (CF account token w/ Stream
+# scope; Doppler wave/prd). CF_STREAM_CUSTOMER_CODE builds the RTMPS/SRT ingest endpoint URLs (non-secret [vars] or
+# secret). Unset → the concrete client cannot create live inputs (the backend stays inert regardless).
+INGRESS_ROUTER_ENABLED = "0"  # INERT — #77 P2 backend built; arming is a ◆ Jake crossing (ARM slice wires the entrypoint)
+
 # ── B1 (#91-a) — CF Stream Live → SFU bridge control plane (POST /v1/stream/bridge/webhook). DEFAULT OFF. ──
 # STREAM_BRIDGE_ENABLED gates the self-authenticating CF Stream webhook receiver (src/stream-bridge.ts). Absent/
 # "0" → the route falls through to the honest 501 catch-all, UNCHANGED — the whole bridge is inert. The webhook
