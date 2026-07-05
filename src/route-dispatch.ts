@@ -19,6 +19,9 @@ import { maybeHandleStreamBridge, scheduledStreamReconcile } from "./stream-brid
 // #88 M2 — Zoom RTMS webhook receiver (control-only). INERT behind WAVE_ZOOM_RTMS ([vars], default off →
 // the 501 catch-all is unchanged). Self-verifies x-zm-signature; the outbound media WS dial-out is a ◆ follow-up.
 import { maybeHandleZoomRtms } from "./zoom-rtms-bridge";
+// #88 M2 — the outbound media DO seams + the SFU ingest-WS forward live in the DO module; route-dispatch only
+// delegates (keeps this file under the 800-line gate). INERT unless WAVE_ZOOM_RTMS is armed.
+import { zoomRtmsSeams, maybeHandleZoomRtmsIngest } from "./zoom-rtms-bridge-do";
 // F (#55) — Direct (Plane-2) any-protocol ingest → SFU bridge CONTROL PLANE. INERT behind INGEST_BRIDGE_ENABLED
 // + per-protocol container binding. worker.ts only DELEGATES; matching/auth/dispatch lives in src/ingest-bridge.ts
 // (+ any-protocol-ingest-frozen-contract). Sibling of the Plane-1 cf-stream bridge; gateway-forwarded start trigger.
@@ -578,11 +581,15 @@ export async function dispatch(
 	const sbRes = await maybeHandleStreamBridge(request, env, ctx);
 	if (sbRes) return sbRes;
 
-	// ── #88 M2 Zoom RTMS → WAVE bridge — POST /zoom/rtms. INERT behind WAVE_ZOOM_RTMS (null → falls through
-	// to the 501 catch-all). Self-auth (x-zm-signature HMAC), control-only: verifies + acks lifecycle webhooks
-	// and answers url_validation. The outbound media WS dial-out is the ◆ follow-up slice (default seam = no-op). ──
-	const zoomRtmsRes = await maybeHandleZoomRtms(request, env, ctx);
+	// ── #88 M2 Zoom RTMS → WAVE bridge — POST /zoom/rtms (control) + /zoom/rtms/ingest (SFU pull). INERT behind
+	// WAVE_ZOOM_RTMS (null → 501 catch-all unchanged). Self-auth (x-zm-signature HMAC); a verified rtms_started/
+	// stopped is routed to the meeting-keyed ZoomRtmsBridgeDO via zoomRtmsSeams (start dials Zoom + publishes into
+	// the mapped room; stop tears it down). Unbound DO → no-op seams (still INERT). The dial-out arm is a ◆. ──
+	const { onRtmsStarted: onZoomStarted, onRtmsStopped: onZoomStopped } = zoomRtmsSeams(env);
+	const zoomRtmsRes = await maybeHandleZoomRtms(request, env, ctx, onZoomStarted, onZoomStopped);
 	if (zoomRtmsRes) return zoomRtmsRes;
+	const zoomIngestRes = await maybeHandleZoomRtmsIngest(request, env, gatewayGate);
+	if (zoomIngestRes) return zoomIngestRes;
 
 	// ── F (#55) Plane-2 direct any-protocol ingest → SFU bridge — POST /v1/ingest/{proto}/session +
 	// DELETE /v1/ingest/{proto}/session/{room}. INERT behind INGEST_BRIDGE_ENABLED (null → 501 catch-all).

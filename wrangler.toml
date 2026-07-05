@@ -320,12 +320,31 @@ class_name = "AgentSessionDO"
 tag = "v3"
 new_sqlite_classes = ["AgentSessionDO"]
 
-# ── #91 B2 — StreamBridgeContainer DO migration. MUST be the LAST/highest migration tag so wrangler applies
-# it as the delta after the live v3 tag (migrations are applied in array order). Its [[containers]] +
-# [[durable_objects.bindings]] are declared above (binding order is irrelevant; only migration tag order is).
+# ── #88 M2 — Zoom RTMS → WAVE media bridge Durable Object (zoom-rtms-bridge-do.ts ZoomRtmsBridgeDO) ──
+# One DO instance per Zoom meeting (idFromName(meeting_uuid)). Owns the outbound Zoom signaling+media WS legs
+# and the SFU-facing ingest sink socket; RtmsBridgeCore pumps rtmsAudioToSfuPcm into the mapped wave room.
+# Exported from src/worker.ts so this binding + migration resolve on deploy. SQLite-backed (new_sqlite_classes)
+# per the storage-governed default. FULLY INERT until WAVE_ZOOM_RTMS is truthy: the /zoom/rtms webhook seam +
+# the /zoom/rtms/ingest route (route-dispatch.ts) are gated by zoomRtmsEnabled(env), so with the flag off (the
+# default) NOTHING routes here — the binding only exists so the migration can deploy. Even armed it fails CLOSED
+# without ZOOM_APPS_CLIENT_ID/SECRET (wrangler SECRETS) + a meeting→room entry in RT_MEETING_ORG. Arming the
+# flag + provisioning those secrets + the live-meeting proof is a ◆ Jake-named crossing.
+[[durable_objects.bindings]]
+name = "ZOOM_RTMS_BRIDGE"
+class_name = "ZoomRtmsBridgeDO"
+
+# ── #91 B2 — StreamBridgeContainer DO migration. Applied as a delta after the live v3 tag (migrations run in
+# array order). Its [[containers]] + [[durable_objects.bindings]] are declared above (binding order is
+# irrelevant; only migration tag order is). v4 MUST stay ahead of v5 below.
 [[migrations]]
 tag = "v4"
 new_sqlite_classes = ["StreamBridgeContainer"]
+
+# ── #88 M2 — ZoomRtmsBridgeDO migration. The NEW highest/last tag: it applies after v4 (array order). Keep any
+# future migration strictly after this block, or wrangler silently skips it (class not configured → 10061).
+[[migrations]]
+tag = "v5"
+new_sqlite_classes = ["ZoomRtmsBridgeDO"]
 
 [[unsafe.bindings]]
 type = "plain_text"
