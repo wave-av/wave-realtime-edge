@@ -48,6 +48,10 @@ export interface Env extends EncoderEnv, ResidencySinkEnv, IngestBridgeRuntimeEn
 	STREAM_BRIDGE_ENABLED?: string | boolean;
 	WAVE_STREAM_WEBHOOK_SECRET?: string; // wrangler SECRET — CF Stream webhook signing secret (HMAC). Empty → every webhook 401s (fail-closed).
 	STREAM_BRIDGE?: DurableObjectNamespace; // B2 republisher container (whep-to-whip). COMMENTED in wrangler until ◆ go-live → absent → dispatch fails CLOSED.
+	// #88 M2 Zoom RTMS bridge flag ([vars], default off). Falsy/absent → POST /zoom/rtms is inert (501 fall-through).
+	// Truthy → the control-plane webhook (src/zoom-rtms-bridge.ts) verifies + acks; the media WS dial-out is a ◆ follow-up.
+	WAVE_ZOOM_RTMS?: string | boolean;
+	ZOOM_RTMS_WEBHOOK_SECRET_TOKEN?: string; // wrangler SECRET — Zoom Event-notification Secret Token (signs webhooks + url_validation). Empty → every webhook 401s (fail-closed).
 	TURN_KEY_ID?: string; // wrangler SECRET — the CF TURN key uid (32-hex). Out of the public repo; persists across deploys.
 	TURN_KEY_TOKEN?: string; // wrangler SECRET — the TURN key's api token. Never logged/returned; only ephemeral ICE creds are.
 	// ── P5 CF-Calls SFU control plane ──
