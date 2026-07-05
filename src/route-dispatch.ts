@@ -16,6 +16,9 @@ import { handleWhep, whepEgressEnabled, type WhepEnv } from "./whep";
 // B1 (#91-a) — CF Stream Live → SFU bridge CONTROL PLANE. INERT behind STREAM_BRIDGE_ENABLED. worker.ts only
 // DELEGATES; all matching/auth/dispatch lives in src/stream-bridge.ts (+ cf-stream-bridge-frozen-contract).
 import { maybeHandleStreamBridge, scheduledStreamReconcile } from "./stream-bridge";
+// #88 M2 — Zoom RTMS webhook receiver (control-only). INERT behind WAVE_ZOOM_RTMS ([vars], default off →
+// the 501 catch-all is unchanged). Self-verifies x-zm-signature; the outbound media WS dial-out is a ◆ follow-up.
+import { maybeHandleZoomRtms } from "./zoom-rtms-bridge";
 // F (#55) — Direct (Plane-2) any-protocol ingest → SFU bridge CONTROL PLANE. INERT behind INGEST_BRIDGE_ENABLED
 // + per-protocol container binding. worker.ts only DELEGATES; matching/auth/dispatch lives in src/ingest-bridge.ts
 // (+ any-protocol-ingest-frozen-contract). Sibling of the Plane-1 cf-stream bridge; gateway-forwarded start trigger.
@@ -574,6 +577,12 @@ export async function dispatch(
 	// STREAM_BRIDGE_ENABLED (null → falls through to the 501 catch-all). Self-auth (CF HMAC), control-only. ──
 	const sbRes = await maybeHandleStreamBridge(request, env, ctx);
 	if (sbRes) return sbRes;
+
+	// ── #88 M2 Zoom RTMS → WAVE bridge — POST /zoom/rtms. INERT behind WAVE_ZOOM_RTMS (null → falls through
+	// to the 501 catch-all). Self-auth (x-zm-signature HMAC), control-only: verifies + acks lifecycle webhooks
+	// and answers url_validation. The outbound media WS dial-out is the ◆ follow-up slice (default seam = no-op). ──
+	const zoomRtmsRes = await maybeHandleZoomRtms(request, env, ctx);
+	if (zoomRtmsRes) return zoomRtmsRes;
 
 	// ── F (#55) Plane-2 direct any-protocol ingest → SFU bridge — POST /v1/ingest/{proto}/session +
 	// DELETE /v1/ingest/{proto}/session/{room}. INERT behind INGEST_BRIDGE_ENABLED (null → 501 catch-all).

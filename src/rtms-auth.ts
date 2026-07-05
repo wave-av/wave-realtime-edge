@@ -106,7 +106,10 @@ export async function verifyZoomWebhookSignature(
   timestampHeader: string | null,
   webhookSecretToken: string,
 ): Promise<boolean> {
-  if (!signatureHeader || !timestampHeader) return false;
+  // Fail CLOSED on an absent secret. Beyond the security intent (an unprovisioned
+  // endpoint must reject every webhook), WebCrypto rejects a zero-length HMAC key
+  // with a DataError — returning false here keeps that a clean 401, never a throw.
+  if (!webhookSecretToken || !signatureHeader || !timestampHeader) return false;
   const expected = "v0=" + (await hmacSha256Hex(webhookSecretToken, `v0:${timestampHeader}:${rawBody}`));
   return timingSafeEqualHex(signatureHeader, expected);
 }

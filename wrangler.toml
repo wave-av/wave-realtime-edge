@@ -148,6 +148,16 @@ INGRESS_ROUTER_ENABLED = "0"  # INERT — #77 P2+P3+P4 backends built (ingress b
 # ◆ ARMED "1" (#48 go-live, Jake-named 2026-06-26).
 STREAM_BRIDGE_ENABLED = "1"
 
+# ── #88 M2 — Zoom RTMS → WAVE bridge control plane (POST /zoom/rtms). DEFAULT OFF / FULLY INERT. ──
+# WAVE_ZOOM_RTMS gates the self-authenticating Zoom RTMS webhook receiver (src/zoom-rtms-bridge.ts). Absent/
+# "0" → the route falls through to the honest 501 catch-all, UNCHANGED — the whole bridge is inert. The webhook
+# is HMAC-verified against ZOOM_RTMS_WEBHOOK_SECRET_TOKEN (a wrangler SECRET — `wrangler secret put`, = the Zoom
+# app's Event-notification "Secret Token"; empty → every webhook 401s, fail-closed). This receiver only verifies
+# + acks lifecycle events and answers url_validation; the OUTBOUND signaling+media WebSocket dial-out (which dials
+# Zoom's servers, transcodes via rtmsAudioToSfuPcm, and injects into a room) is the ◆ follow-up slice and needs a
+# live Zoom meeting to prove. Arming this flag in a live env is a Jake-named ◆ crossing.
+WAVE_ZOOM_RTMS = "0"
+
 # ── #82/#114 CASCADE multi-region relay (RT_CASCADE). INERT by default. ──
 # Absent/"0"/"false" → the realtime room path is byte-identical to today: a join routes to the PRIMARY Room
 # DO `idFromName(org:room)` with NO locationHint and NO regional relay. Set RT_CASCADE="1" → a regional join

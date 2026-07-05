@@ -56,6 +56,11 @@ describe("verifyZoomWebhookSignature", () => {
     expect(await verifyZoomWebhookSignature(body, null, ts, secret)).toBe(false);
     expect(await verifyZoomWebhookSignature(body, sig, null, secret)).toBe(false);
   });
+
+  it("fails CLOSED on an empty secret (never throws on a zero-length WebCrypto key)", async () => {
+    const sig = "v0=" + (await hmacSha256Hex(secret, `v0:${ts}:${body}`));
+    await expect(verifyZoomWebhookSignature(body, sig, ts, "")).resolves.toBe(false);
+  });
 });
 
 describe("timingSafeEqualHex", () => {
