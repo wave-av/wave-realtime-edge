@@ -52,6 +52,9 @@ export interface Env extends EncoderEnv, ResidencySinkEnv, IngestBridgeRuntimeEn
 	// Truthy → the control-plane webhook (src/zoom-rtms-bridge.ts) verifies + acks; the media WS dial-out is a ◆ follow-up.
 	WAVE_ZOOM_RTMS?: string | boolean;
 	ZOOM_RTMS_WEBHOOK_SECRET_TOKEN?: string; // wrangler SECRET — Zoom Event-notification Secret Token (signs webhooks + url_validation). Empty → every webhook 401s (fail-closed).
+	ZOOM_RTMS_BRIDGE?: DurableObjectNamespace; // #88 M2 outbound media DO (ZoomRtmsBridgeDO), keyed idFromName(meetingUuid). Absent → the webhook seam is a no-op (INERT); dial-out fails closed.
+	ZOOM_APPS_CLIENT_ID?: string; // wrangler SECRET — WAVE General-app Client ID; the RTMS handshake clientId (read by ZoomRtmsBridgeDO). Unset → dial-out fails closed.
+	ZOOM_APPS_CLIENT_SECRET?: string; // wrangler SECRET — signs the RTMS handshake. Never logged/returned.
 	TURN_KEY_ID?: string; // wrangler SECRET — the CF TURN key uid (32-hex). Out of the public repo; persists across deploys.
 	TURN_KEY_TOKEN?: string; // wrangler SECRET — the TURN key's api token. Never logged/returned; only ephemeral ICE creds are.
 	// ── P5 CF-Calls SFU control plane ──
@@ -132,6 +135,11 @@ export const AGENT_EGRESS_ROUTE = /^\/v1\/realtime\/agents\/egress\/([^/]+)\/([^
 /** Task #81 — agent INGEST WS (SFU dials IN to PULL the agent's PCM): /v1/realtime/agents/ingest/:org/:room/:sessionId/:trackName.
  *  Symmetric to AGENT_EGRESS_ROUTE, but the upgrade is FORWARDED to the `${org}:${room}` AgentSessionDO so the DO owns the durable socket. */
 export const AGENT_INGEST_ROUTE = /^\/v1\/realtime\/agents\/ingest\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
+/** #88 M2 — Zoom RTMS ingest WS (the SFU dials IN to PULL the bridged Zoom audio):
+ *  /zoom/rtms/ingest/:meetingUuid/:org/:sessionId/:trackName. The upgrade is FORWARDED to the
+ *  idFromName(meetingUuid) ZoomRtmsBridgeDO (the same DO the verified rtms_started started), which owns the
+ *  durable sink socket. The capability token (?t=) authorizes the third-party SFU dial-in (org/session/track). */
+export const ZOOM_RTMS_INGEST_ROUTE = /^\/zoom\/rtms\/ingest\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
 
 // ── WAVE-native ingress listeners (LK-rip #42) — POST /v1/realtime/ingress/:protocol/:intent ──
 // The protocol + intent allowlist MUST match the gateway ingress forwarding contract (rtmp/whip/srt/url +

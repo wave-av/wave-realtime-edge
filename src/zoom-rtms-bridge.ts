@@ -51,12 +51,22 @@ export interface ZoomRtmsEnv {
 /** The narrowed `rtms_started` event handed to the media-bridge seam. */
 export type RtmsStartedEvent = Extract<RtmsWebhookEvent, { kind: "rtms_started" }>;
 
+/** The narrowed `rtms_stopped` event handed to the teardown seam. */
+export type RtmsStoppedEvent = Extract<RtmsWebhookEvent, { kind: "rtms_stopped" }>;
+
 /**
- * Seam for the (◆ follow-up) outbound media bridge. Receives a verified
- * rtms_started event; the default is a no-op so this PR stays INERT (verify+ack
- * only, no dial-out). The follow-up slice injects the real DO-backed dialer.
+ * Seam for the outbound media bridge. Receives a verified rtms_started event; the
+ * default is a no-op so the surface stays INERT (verify+ack only, no dial-out) until
+ * a caller injects the real DO-backed dialer (route-dispatch wires it to ZoomRtmsBridgeDO).
  */
 export type OnRtmsStarted = (event: RtmsStartedEvent) => void | Promise<void>;
+
+/**
+ * Seam for tearing the bridge down on `meeting.rtms_stopped`. Default no-op (INERT); the
+ * live wiring routes it to the same meeting-keyed DO's `/stop`. A dropped Zoom leg also
+ * self-tears-down inside the core, so this is the clean-shutdown path, not the only one.
+ */
+export type OnRtmsStopped = (event: RtmsStoppedEvent) => void | Promise<void>;
 
 /** Truthy-flag check (mirrors streamBridgeEnabled): "1"/"true"/true → enabled; absent/"0"/false → inert. */
 export function zoomRtmsEnabled(env: { WAVE_ZOOM_RTMS?: string | boolean }): boolean {
@@ -77,6 +87,7 @@ export async function maybeHandleZoomRtms(
   env: ZoomRtmsEnv,
   ctx?: { waitUntil(p: Promise<unknown>): void },
   onRtmsStarted: OnRtmsStarted = () => {},
+  onRtmsStopped: OnRtmsStopped = () => {},
 ): Promise<Response | null> {
   const url = new URL(request.url);
   if (url.pathname !== ZOOM_RTMS_ROUTE) return null; // not our route → fall through unchanged
@@ -114,8 +125,13 @@ export async function maybeHandleZoomRtms(
       else await started;
       return Response.json({ ok: true, accepted: "rtms_started" });
     }
-    case "rtms_stopped":
+    case "rtms_stopped": {
+      // Clean teardown of the meeting-keyed bridge DO (a dropped Zoom leg also self-tears-down in the core).
+      const stopped = Promise.resolve(onRtmsStopped(event));
+      if (ctx) ctx.waitUntil(stopped);
+      else await stopped;
       return Response.json({ ok: true, accepted: "rtms_stopped" });
+    }
     default:
       return Response.json({ ok: true, accepted: "ignored" });
   }

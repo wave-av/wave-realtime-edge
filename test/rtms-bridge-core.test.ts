@@ -1,0 +1,178 @@
+// #88 M2 — RtmsBridgeCore state machine (src/rtms-bridge-core.ts). Proves the full outbound sequence with
+// mock sockets (zero live Zoom/SFU): create the SFU ingest adapter, dial signaling with the handshake
+// signature, open the media leg on the ack with the data handshake, echo keepalives on BOTH legs, and
+// transcode one MEDIA_DATA_AUDIO frame to the exact 48k-stereo encodeIngestFrame wire bytes on the ingest
+// socket. The auth/protocol/audio primitives it composes are each independently vector-pinned (#145).
+import { describe, it, expect, vi } from "vitest";
+import {
+  RtmsBridgeCore,
+  pickMediaUrl,
+  type RtmsBridgeDeps,
+  type RtmsBridgeConfig,
+  type RtmsSocket,
+} from "../src/rtms-bridge-core.js";
+import type { IngestSocket } from "../src/agent-session.js";
+import type { RtmsStartedEvent } from "../src/zoom-rtms-bridge.js";
+import { rtmsHandshakeSignature } from "../src/rtms-auth.js";
+import { signalingHandshakeReq, dataHandshakeReq, keepAliveResp, RTMS_MEDIA_TYPE } from "../src/rtms-protocol.js";
+import { rtmsAudioToSfuPcm, int16ToPcmS16Le } from "../src/rtms-audio.js";
+import { encodeIngestFrame } from "../src/agent-ingest-adapter.js";
+import { bytesToBase64 } from "../src/twilio-mediastream.js";
+
+interface FakeLeg {
+  url: string;
+  onMessage: (t: string) => void | Promise<void>;
+  onClose?: () => void;
+  sent: string[];
+  closed: boolean;
+}
+
+const EVENT: RtmsStartedEvent = {
+  kind: "rtms_started",
+  meetingUuid: "mtg-uuid-xyz",
+  rtmsStreamId: "stream-77",
+  serverUrls: "wss://signal.zoom.us",
+};
+
+/** Build a fresh core + capture harness (mock Zoom legs + a capturing SFU ingest sink). */
+function harness(opts?: { ingestConnected?: boolean }) {
+  const legs: FakeLeg[] = [];
+  const ingestSent: Uint8Array[] = [];
+  const sink: IngestSocket = { send: (d) => ingestSent.push(d as Uint8Array), close: () => {} };
+  const connect = async (url: string, onMessage: (t: string) => void | Promise<void>, onClose?: () => void): Promise<RtmsSocket> => {
+    const leg: FakeLeg = { url, onMessage, onClose, sent: [], closed: false };
+    legs.push(leg);
+    return { send: (d) => leg.sent.push(d), close: () => { leg.closed = true; } };
+  };
+  const createIngest = vi.fn(async (tracks) => ({ adapterId: "in_1", publishedSessionId: "cf_pub_sess", raw: { tracks } }));
+  const deps: RtmsBridgeDeps = {
+    connect,
+    createIngest,
+    ingestSocket: () => (opts?.ingestConnected ? sink : null),
+    now: () => 0,
+    log: () => {},
+  };
+  const config: RtmsBridgeConfig = {
+    clientId: "APPID123",
+    clientSecret: "s3cr3t",
+    target: {
+      appId: "a".repeat(32),
+      bearer: "sfu-bearer",
+      sessionId: "sess-12345678",
+      trackName: "zoom-mtg",
+      endpoint: "wss://rt.wave.online/zoom/rtms/ingest/mtg-uuid-xyz/org/sess-12345678/zoom-mtg?t=tok",
+    },
+  };
+  return { core: new RtmsBridgeCore(deps, config), legs, ingestSent, createIngest, config };
+}
+
+const ackFrame = (audioUrl: string): string =>
+  JSON.stringify({ msg_type: 2, status_code: 0, media_server: { server_urls: { audio: audioUrl } } });
+
+describe("RtmsBridgeCore.start — ingest adapter + signaling handshake", () => {
+  it("creates a location:local ingest adapter for the target then dials + signs the signaling leg", async () => {
+    const { core, legs, createIngest, config } = harness();
+    await core.start(EVENT);
+
+    const tracks = createIngest.mock.calls[0][0] as Array<Record<string, unknown>>;
+    expect(tracks[0]).toMatchObject({
+      location: "local",
+      sessionId: config.target.sessionId,
+      trackName: config.target.trackName,
+      endpoint: config.target.endpoint,
+      inputCodec: "pcm",
+      mode: "buffer",
+    });
+
+    expect(legs).toHaveLength(1);
+    expect(legs[0].url).toBe("wss://signal.zoom.us");
+    const sig = await rtmsHandshakeSignature("APPID123", EVENT.meetingUuid, EVENT.rtmsStreamId, "s3cr3t");
+    expect(legs[0].sent[0]).toBe(signalingHandshakeReq(EVENT.meetingUuid, EVENT.rtmsStreamId, sig));
+    expect(core.isStarted).toBe(true);
+  });
+
+  it("is idempotent — a second start() does not re-dial", async () => {
+    const { core, legs } = harness();
+    await core.start(EVENT);
+    await core.start(EVENT);
+    expect(legs).toHaveLength(1);
+  });
+});
+
+describe("RtmsBridgeCore — signaling ack opens the media leg", () => {
+  it("dials the ack's media URL and sends the AUDIO data handshake with the same signature", async () => {
+    const { core, legs } = harness();
+    await core.start(EVENT);
+    await legs[0].onMessage(ackFrame("wss://media.zoom.us/audio"));
+
+    expect(legs).toHaveLength(2);
+    expect(legs[1].url).toBe("wss://media.zoom.us/audio");
+    const sig = await rtmsHandshakeSignature("APPID123", EVENT.meetingUuid, EVENT.rtmsStreamId, "s3cr3t");
+    expect(legs[1].sent[0]).toBe(dataHandshakeReq(EVENT.meetingUuid, EVENT.rtmsStreamId, sig, RTMS_MEDIA_TYPE.AUDIO));
+  });
+
+  it("does not open a media leg on a non-zero signaling status (nack)", async () => {
+    const { core, legs } = harness();
+    await core.start(EVENT);
+    await legs[0].onMessage(JSON.stringify({ msg_type: 2, status_code: 7, media_server: { server_urls: {} } }));
+    expect(legs).toHaveLength(1);
+  });
+});
+
+describe("RtmsBridgeCore — keepalives", () => {
+  it("echoes KEEP_ALIVE_RESP on the signaling and media legs", async () => {
+    const { core, legs } = harness();
+    await core.start(EVENT);
+    await legs[0].onMessage(ackFrame("wss://media.zoom.us/audio"));
+    await legs[0].onMessage(JSON.stringify({ msg_type: 12, timestamp: 111 }));
+    await legs[1].onMessage(JSON.stringify({ msg_type: 12, timestamp: 222 }));
+    expect(legs[0].sent).toContain(keepAliveResp(111));
+    expect(legs[1].sent).toContain(keepAliveResp(222));
+  });
+});
+
+describe("RtmsBridgeCore — audio pump", () => {
+  it("transcodes one MEDIA_DATA_AUDIO frame to the exact 48k-stereo ingest wire bytes", async () => {
+    const { core, legs, ingestSent } = harness({ ingestConnected: true });
+    await core.start(EVENT);
+    await legs[0].onMessage(ackFrame("wss://media.zoom.us/audio"));
+
+    const rtmsPcm = int16ToPcmS16Le(new Int16Array([100, -200, 300, 400]));
+    const b64 = bytesToBase64(rtmsPcm);
+    await legs[1].onMessage(JSON.stringify({ msg_type: 14, content: { user_id: 5, data: b64 } }));
+
+    const expected = encodeIngestFrame(int16ToPcmS16Le(rtmsAudioToSfuPcm(rtmsPcm)), { sequenceNumber: 0, timestamp: 0 }, "packet");
+    expect(ingestSent).toHaveLength(1);
+    expect(ingestSent[0]).toEqual(expected);
+  });
+
+  it("drops audio (no throw) when the SFU ingest socket is not connected yet", async () => {
+    const { core, legs, ingestSent } = harness({ ingestConnected: false });
+    await core.start(EVENT);
+    await legs[0].onMessage(ackFrame("wss://media.zoom.us/audio"));
+    const rtmsPcm = int16ToPcmS16Le(new Int16Array([1, 2, 3]));
+    await legs[1].onMessage(JSON.stringify({ msg_type: 14, content: { data: bytesToBase64(rtmsPcm) } }));
+    expect(ingestSent).toHaveLength(0);
+  });
+});
+
+describe("RtmsBridgeCore — teardown", () => {
+  it("a dropped leg tears down the whole bridge (both legs closed, idempotent)", async () => {
+    const { core, legs } = harness();
+    await core.start(EVENT);
+    await legs[0].onMessage(ackFrame("wss://media.zoom.us/audio"));
+    legs[0].onClose?.();
+    expect(legs[0].closed).toBe(true);
+    expect(legs[1].closed).toBe(true);
+    core.stop(); // idempotent — no throw, no double-close error
+  });
+});
+
+describe("pickMediaUrl", () => {
+  it("prefers audio, then all, then any URL, else null", () => {
+    expect(pickMediaUrl({ audio: "a", all: "x" })).toBe("a");
+    expect(pickMediaUrl({ all: "x", video: "v" })).toBe("x");
+    expect(pickMediaUrl({ video: "v" })).toBe("v");
+    expect(pickMediaUrl({})).toBeNull();
+  });
+});

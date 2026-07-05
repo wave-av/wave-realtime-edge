@@ -42,6 +42,10 @@ export {
 // AGENT_SESSION binding + migration resolve on deploy. INERT unless VOICE_AGENT_PROVIDER==="wave".
 export { AgentSessionDO } from "./agent-session";
 
+// #88 M2 — the per-meeting Zoom RTMS → WAVE media bridge Durable Object. Exported so the ZOOM_RTMS_BRIDGE
+// binding + migration resolve on deploy. INERT unless WAVE_ZOOM_RTMS is armed AND a meeting→room map exists.
+export { ZoomRtmsBridgeDO } from "./zoom-rtms-bridge-do";
+
 export default {
 	async fetch(request: Request, env: Env = {} as Env, ctx?: ExecutionContext): Promise<Response> {
 		return dispatch(request, env, ctx);

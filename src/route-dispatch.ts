@@ -18,7 +18,7 @@ import { handleWhep, whepEgressEnabled, type WhepEnv } from "./whep";
 import { maybeHandleStreamBridge, scheduledStreamReconcile } from "./stream-bridge";
 // #88 M2 — Zoom RTMS webhook receiver (control-only). INERT behind WAVE_ZOOM_RTMS ([vars], default off →
 // the 501 catch-all is unchanged). Self-verifies x-zm-signature; the outbound media WS dial-out is a ◆ follow-up.
-import { maybeHandleZoomRtms } from "./zoom-rtms-bridge";
+import { maybeHandleZoomRtms, zoomRtmsEnabled, type RtmsStartedEvent, type RtmsStoppedEvent } from "./zoom-rtms-bridge";
 // F (#55) — Direct (Plane-2) any-protocol ingest → SFU bridge CONTROL PLANE. INERT behind INGEST_BRIDGE_ENABLED
 // + per-protocol container binding. worker.ts only DELEGATES; matching/auth/dispatch lives in src/ingest-bridge.ts
 // (+ any-protocol-ingest-frozen-contract). Sibling of the Plane-1 cf-stream bridge; gateway-forwarded start trigger.
@@ -50,6 +50,7 @@ import {
 	AGENT_DISPATCH_INTENTS,
 	AGENT_EGRESS_ROUTE,
 	AGENT_INGEST_ROUTE,
+	ZOOM_RTMS_INGEST_ROUTE,
 	PRESENCE_ROUTE,
 	presenceEnabled,
 	INGRESS_ROUTE,
@@ -579,10 +580,55 @@ export async function dispatch(
 	if (sbRes) return sbRes;
 
 	// ── #88 M2 Zoom RTMS → WAVE bridge — POST /zoom/rtms. INERT behind WAVE_ZOOM_RTMS (null → falls through
-	// to the 501 catch-all). Self-auth (x-zm-signature HMAC), control-only: verifies + acks lifecycle webhooks
-	// and answers url_validation. The outbound media WS dial-out is the ◆ follow-up slice (default seam = no-op). ──
-	const zoomRtmsRes = await maybeHandleZoomRtms(request, env, ctx);
+	// to the 501 catch-all). Self-auth (x-zm-signature HMAC), control-only. A verified rtms_started/stopped is
+	// routed to the meeting-keyed ZoomRtmsBridgeDO (start dials Zoom + publishes into the mapped room; stop tears
+	// it down). When ZOOM_RTMS_BRIDGE is unbound the seams are undefined → the handler's no-op defaults → the
+	// surface stays verify+ack only (still INERT). Arming the dial-out (secrets + meeting→room map) is a ◆. ──
+	const zoomBridge = env.ZOOM_RTMS_BRIDGE;
+	const onZoomStarted = zoomBridge
+		? async (ev: RtmsStartedEvent): Promise<void> => {
+				const stub = zoomBridge.get(zoomBridge.idFromName(ev.meetingUuid));
+				await stub.fetch(new Request("https://zoom-rtms/start", {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ event: ev }),
+				}));
+			}
+		: undefined;
+	const onZoomStopped = zoomBridge
+		? async (ev: RtmsStoppedEvent): Promise<void> => {
+				const stub = zoomBridge.get(zoomBridge.idFromName(ev.meetingUuid));
+				await stub.fetch(new Request("https://zoom-rtms/stop", { method: "POST" }));
+			}
+		: undefined;
+	const zoomRtmsRes = await maybeHandleZoomRtms(request, env, ctx, onZoomStarted, onZoomStopped);
 	if (zoomRtmsRes) return zoomRtmsRes;
+
+	// ── #88 M2 — Zoom RTMS ingest WS: the CF Realtime SFU dials IN to PULL the bridged Zoom audio. Forward the
+	// upgrade to the idFromName(meetingUuid) ZoomRtmsBridgeDO (the DO that started the bridge owns the sink
+	// socket). Symmetric auth to the agent ingest route: the ?t= capability token (org/session/track), else the
+	// gateway-trust seal. INERT: unmatched path or unbound DO → falls through unchanged. ──
+	if (zoomRtmsEnabled(env)) {
+		const ziMatch = url.pathname.match(ZOOM_RTMS_INGEST_ROUTE);
+		if (ziMatch) {
+			const [, zmid, zorg, zsession, ztrack] = ziMatch;
+			if (![zmid, zorg, zsession, ztrack].every((s) => SAFE_SEGMENT.test(s)) || !env.ZOOM_RTMS_BRIDGE) {
+				return Response.json({ error: "BAD_REQUEST", message: "invalid zoom rtms ingest path or no ZOOM_RTMS_BRIDGE binding" }, { status: 400 });
+			}
+			const tok = url.searchParams.get("t");
+			const tokenOk = !!tok && !!env.WAVE_INTERNAL_SECRET && (await verifyRecorderToken(env.WAVE_INTERNAL_SECRET, zorg, zsession, ztrack, tok));
+			if (!tokenOk) {
+				const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
+				if (denied) return denied;
+			}
+			if ((request.headers.get("Upgrade") ?? "").toLowerCase() !== "websocket") {
+				return Response.json({ error: "UPGRADE_REQUIRED", message: "zoom rtms ingest route requires a WebSocket upgrade" }, { status: 426 });
+			}
+			const stub = env.ZOOM_RTMS_BRIDGE.get(env.ZOOM_RTMS_BRIDGE.idFromName(zmid));
+			// Preserve the Upgrade header + WS-upgrade intent across the stub boundary; relay the DO's 101 + client.
+			return stub.fetch(new Request("https://zoom-rtms/ingest", request));
+		}
+	}
 
 	// ── F (#55) Plane-2 direct any-protocol ingest → SFU bridge — POST /v1/ingest/{proto}/session +
 	// DELETE /v1/ingest/{proto}/session/{room}. INERT behind INGEST_BRIDGE_ENABLED (null → 501 catch-all).
