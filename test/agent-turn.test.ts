@@ -161,6 +161,25 @@ describe("TurnTakingCore — one full turn", () => {
     expect(Array.from(decodePacket(sent[1]).payload)).toEqual([5, 6, 7, 8]);
   });
 
+  // #34 barge-in tail: the ingest Packet timestamp MUST be a monotonic 48 kHz per-channel sample index (not the
+  // ts=0 placeholder) so the SFU paces by the media clock and never buffers ahead — the deep buffer was what
+  // drained as the post-abort tail. First frame ts=0; each frame advances by byteLen/4 sample ticks.
+  it("emits monotonic media-clock timestamps on the ingest frames (SFU paces by media time, not ts=0)", async () => {
+    const { deps, sent, complete, transcribe } = mkDeps();
+    const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_FAST });
+    await core.onFrame(egressFrame([10, 20], 1));
+    await core.onFrame(egressFrame([30, 0x00], 2));
+    expect(transcribe).toHaveBeenCalled();
+    expect(complete).toHaveBeenCalledTimes(1);
+    expect(sent.length).toBe(2);
+    // Two 4-byte chunks → ts0=0, ts1 = floor(4/4) = 1 (one 48 kHz sample tick), strictly increasing.
+    const ts0 = decodePacket(sent[0]).timestamp;
+    const ts1 = decodePacket(sent[1]).timestamp;
+    expect(ts0).toBe(0);
+    expect(ts1).toBe(1);
+    expect(ts1).toBeGreaterThan(ts0);
+  });
+
   it("accumulates conversation history across turns (alternating user/assistant)", async () => {
     const { deps, complete } = mkDeps();
     const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_FAST });
