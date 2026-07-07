@@ -156,7 +156,7 @@ STREAM_BRIDGE_ENABLED = "1"
 # + acks lifecycle events and answers url_validation; the OUTBOUND signaling+media WebSocket dial-out (which dials
 # Zoom's servers, transcodes via rtmsAudioToSfuPcm, and injects into a room) is the ◆ follow-up slice and needs a
 # live Zoom meeting to prove. Arming this flag in a live env is a Jake-named ◆ crossing.
-WAVE_ZOOM_RTMS = "0"
+WAVE_ZOOM_RTMS = "1"
 
 # ── #82/#114 CASCADE multi-region relay (RT_CASCADE). INERT by default. ──
 # Absent/"0"/"false" → the realtime room path is byte-identical to today: a join routes to the PRIMARY Room
