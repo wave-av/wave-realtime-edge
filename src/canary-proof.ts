@@ -39,7 +39,16 @@ export async function maybeHandleCanaryProof(
     ts: 0,
     codec: "jpeg",
     negotiate: true,
-    dst: { decode: [{ name: "av1", available: true }], transports: [{ protocol: "moq", activated: true }] },
+    // DST offers the container's PROVEN recorder lane (ws-adapter, activated) so negotiation is satisfiable, plus
+    // moq (which the container honestly lists activated:false → skipped). The selector picks ws-adapter and then
+    // the CODEC ladder negotiates av1 from this DST's av1 decode ∩ the container's av1 encode caps.
+    dst: {
+      decode: [{ name: "av1", available: true }],
+      transports: [
+        { protocol: "ws-adapter", activated: true },
+        { protocol: "moq", activated: true },
+      ],
+    },
   });
   const out = await res.arrayBuffer();
   return Response.json({
