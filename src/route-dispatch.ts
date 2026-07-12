@@ -35,6 +35,9 @@ import { captureSessionZone } from "./residency-sink";
 // #82/#114 EX P2/P3 — cascade relay wiring (used only when RT_CASCADE is on). cascade.ts stays PURE; the
 // env/cf glue lives in src/cascade-sink.ts. OFF/absent → the primary `idFromName(org:room)` path is unchanged.
 import { resolveRelay } from "./cascade-sink";
+// #138 Canary C3 — CF-runtime recorder proof (CANARY-ONLY, INERT on prod). Handler extracted to a leaf module so
+// this router stays under the file-size gate; it 404s unless RECORDER_TARGET==="cf" (only the canary sets it).
+import { maybeHandleCanaryProof } from "./canary-proof";
 // Env shape, route-match constants, and the auth/deps/sink plumbing — extracted to a leaf module (task #56) so
 // neither file exceeds 800 lines. dispatch-helpers.ts imports nothing from here (no cycle).
 import {
@@ -87,6 +90,10 @@ export async function dispatch(
 			version: "dev",
 		});
 	}
+
+	// #138 Canary C3 — CF-runtime recorder proof (canary-only; prod-inert). Handler lives in canary-proof.ts.
+	const canaryProof = await maybeHandleCanaryProof(request, url, env);
+	if (canaryProof) return canaryProof;
 
 	// RealtimeKit recording.statusUpdate webhook (RT-R-WH). PUBLIC by design — RTK calls it directly, so it
 	// is intentionally NOT behind gatewayGate; it authenticates itself via the `rtk-signature` header
