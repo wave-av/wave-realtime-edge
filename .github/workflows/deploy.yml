@@ -29,7 +29,15 @@ name: deploy
 #   WAVE_INTERNAL_SECRET, CF_API_TOKEN, TURN_KEY_ID, TURN_KEY_TOKEN — existing /rtk surface (worker.ts)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "which env to deploy (production = rt.wave.online; canary = wave-realtime-edge-canary on workers.dev)"
+        type: choice
+        options:
+          - production
+          - canary
+        default: production
 
 permissions:
   contents: read
@@ -65,5 +73,9 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # wrangler reads wrangler.toml: name=wave-realtime-edge, route rt.wave.online (custom_domain),
-          # ROOM Durable Object binding + v1 migration. First deploy bootstraps the RoomDO migration.
+          # production → default worker (wrangler.toml top-level: name=wave-realtime-edge, rt.wave.online
+          # custom_domain, ROOM/RECORDER/AGENT_SESSION DOs). canary → the [env.canary] worker
+          # (wave-realtime-edge-canary, workers_dev, routes=[] so it CANNOT inherit/steal the prod custom
+          # domain, RT_ENCODER=container + AV1_DEFAULT + NEGOTIATION_ENABLED for the #138 recorder proof).
+          # `environment` is a restricted choice input (production|canary) — no injection surface.
+          command: ${{ inputs.environment == 'canary' && 'deploy --env canary' || 'deploy' }}
