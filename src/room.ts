@@ -561,7 +561,7 @@ export class RoomDO {
    * (fail-open inside metering.ts). The DO never holds media — only state + orchestration.
    */
   async fetch(request: Request): Promise<Response> {
-    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent | "recorder-frame" | "presence" | "agent-bind";
+    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent | "recorder-frame" | "presence" | "agent-bind" | "whip-publish";
     // #76 P2 (arch A): fold the agent's media-READ onto this room's single MediaTap. The AGENT dispatch
     // (/bind) additionally forwards the SAME AgentSessionConfig here when MEDIA_TAP_ENABLED is armed, so the
     // RoomDO registers an IN-PROCESS MediaConsumer for the agent's target track — no 2nd SFU subscription, no
@@ -620,6 +620,13 @@ export class RoomDO {
         }
         case "publish": {
           const res = await signaling.publishTrack(ctx!, { tracks: body.tracks as PublishTrack[], offer: body.offer as SessionDescription });
+          await this.emitPresence();
+          return Response.json(res, { status: 200 });
+        }
+        case "whip-publish": {
+          // #144 (#91-B): direct-WHIP ingress routed through the room so the recorder + negotiation apply.
+          // The room creates the SFU session, seats the publisher, and arms the recorder (fail-open inside).
+          const res = await signaling.whipPublish(ctx!, { offer: body.offer as SessionDescription });
           await this.emitPresence();
           return Response.json(res, { status: 200 });
         }

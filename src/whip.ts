@@ -27,6 +27,12 @@ import {
 	type UsageEnvelope,
 	type MeterLine,
 } from "./metering.js";
+import {
+	whipRoomRecordingEnabled,
+	publishViaRoom,
+	WHIP_ROOM_HEADER,
+	type WhipRoomEnv,
+} from "./whip-room.js";
 
 /** WHIP ingest meter — dedicated SKU per the frozen contract §4 (priced to STRIPE_PRICE_WHIP_INGEST_MIN). */
 export const METER_WHIP_INGEST_MINUTES = "wave_whip_ingest_minutes";
@@ -64,11 +70,14 @@ export interface WhipKv {
 }
 
 /** The subset of worker Env this module reads. SFU creds gate liveness; meter/KV are optional → INERT. */
-export interface WhipEnv extends MeterEmitEnv {
+export interface WhipEnv extends MeterEmitEnv, WhipRoomEnv {
 	WHIP_INGEST_ENABLED?: string | boolean; // [vars] flag — falsy/absent → surface is inert (worker 501s)
 	CF_CALLS_APP_ID?: string; // CF Realtime SFU app id (hex) — SfuClient appId
 	CF_CALLS_APP_SECRET?: string; // CF Realtime SFU app secret (Bearer) — never logged/returned
 	RT_MEETING_ORG?: WhipKv; // reused KV namespace: resourceId → {sessionId, org, startedAt}
+	// #144 (#91-B): WHIP_ROOM_RECORDING (WhipRoomEnv) routes publish through a RoomDO room so the recorder +
+	// negotiation apply. Default-off → the direct SFU path below is byte-identical. ROOM (WhipRoomEnv) is the
+	// RoomDO binding used only on that flagged path.
 }
 
 /** A persisted WHIP resource record (resourceId → SFU session), used by PATCH/DELETE. */
@@ -211,20 +220,36 @@ async function handlePublish(request: Request, env: WhipEnv, deps: WhipDeps, org
 		return jsonError(err.code, err.message, err.status);
 	}
 
-	try {
-		// newSession(offer) creates the SFU session FROM the publisher's offer and returns the SFU's answer
-		// (verbatim SDP passthrough). The publisher's offered tracks are pushed in the same negotiation; we
-		// surface mid/trackName pairs from the answer's media sections only if the SFU asks for an explicit
-		// push (CF returns the answer on newSession for an offer, so a second pushTracks is a no-op here).
-		const session = await sfu.newSession(offer);
-		const answer = session.sessionDescription;
-		if (!answer || answer.type !== "answer" || !answer.sdp) {
-			return jsonError("REALTIME_UPSTREAM", "SFU did not return an SDP answer", 503);
-		}
+	// Mint the resource id up front — the recorder-routed path (#144) derives its room key from it.
+	const resourceId = deps.mintResourceId();
+	if (!RESOURCE_ID.test(resourceId)) {
+		return jsonError("REALTIME_ERROR", "failed to mint a resource id", 500);
+	}
 
-		const resourceId = deps.mintResourceId();
-		if (!RESOURCE_ID.test(resourceId)) {
-			return jsonError("REALTIME_ERROR", "failed to mint a resource id", 500);
+	try {
+		// #144 (#91-B): when WHIP_ROOM_RECORDING is armed AND a ROOM binding is present, route the publish
+		// through a RoomDO room so the room owns the recorder + capability negotiation (the bare newSession
+		// below bypasses BOTH). FAIL-SOFT: publishViaRoom returns null on ANY failure → fall back to the proven
+		// direct path (media-safety > recording, design §4). Default-off → the direct path is byte-identical.
+		let sessionId: string;
+		let answerSdp: string;
+		const routed = whipRoomRecordingEnabled(env)
+			? await publishViaRoom(env, org, offer, resourceId, request.headers.get(WHIP_ROOM_HEADER), `whip-${resourceId}`)
+			: null;
+		if (routed) {
+			sessionId = routed.sessionId;
+			answerSdp = routed.answerSdp;
+		} else {
+			// Direct path (UNCHANGED): newSession(offer) creates the SFU session FROM the publisher's offer and
+			// returns the SFU's answer (verbatim SDP passthrough). The publisher's offered tracks are pushed in
+			// the same negotiation (a second pushTracks is a no-op here). Media terminates at the SFU.
+			const session = await sfu.newSession(offer);
+			const answer = session.sessionDescription;
+			if (!answer || answer.type !== "answer" || !answer.sdp) {
+				return jsonError("REALTIME_UPSTREAM", "SFU did not return an SDP answer", 503);
+			}
+			sessionId = session.sessionId;
+			answerSdp = answer.sdp;
 		}
 
 		// Persist the resourceId → session record so PATCH(trickle)/DELETE(teardown) can address this session.
@@ -233,7 +258,7 @@ async function handlePublish(request: Request, env: WhipEnv, deps: WhipDeps, org
 		// #91 B2: resolve the billing meter from the gateway-SEALED override header (allowset-validated) and
 		// persist it, so the teardown bills the right SKU (bridge vs bare WHIP) however it later fires.
 		const meter = resolveWhipMeter(request.headers.get(WHIP_METER_OVERRIDE_HEADER));
-		const record: WhipResource = { sessionId: session.sessionId, org, startedAt: deps.now(), meter };
+		const record: WhipResource = { sessionId, org, startedAt: deps.now(), meter };
 		try {
 			await env.RT_MEETING_ORG?.put(`${WHIP_KV_PREFIX}${resourceId}`, JSON.stringify(record), {
 				expirationTtl: WHIP_KV_TTL_SECONDS,
@@ -244,7 +269,7 @@ async function handlePublish(request: Request, env: WhipEnv, deps: WhipDeps, org
 
 		// 201 Created — body is the SFU's SDP answer; Location is an edge-relative WHIP resource path (the
 		// gateway rewrites it to a gateway-absolute path so PATCH/DELETE stay on the control plane, §2/§3).
-		return new Response(answer.sdp, {
+		return new Response(answerSdp, {
 			status: 201,
 			headers: {
 				"content-type": "application/sdp",
