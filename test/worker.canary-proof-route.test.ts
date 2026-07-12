@@ -1,18 +1,18 @@
 // #138 Canary C3 — /__canary/encode-proof route. CANARY-ONLY CF-runtime recorder proof; INERT on prod.
 // Proves: (a) prod-inert — with RECORDER_TARGET unset (the prod/default worker) the route 404s and touches no
-// container; (b) canary — with RECORDER_TARGET="cf" + a bound RECORDER namespace, the route forwards the POSTed
-// JPEG frame through the SAME getContainer().fetch('/encode') call the live recorder makes, with negotiation
-// armed (x-dst-capabilities = av1 decode + moq transport), and surfaces the container's negotiated response
-// headers verbatim; (c) an empty body is rejected 400 before any container hop.
+// container; (b) canary — with RECORDER_TARGET="cf" + a bound RECORDER namespace, the route makes TWO
+// getContainer().fetch('/encode') calls: a negotiate=ON probe (carries the av1 x-dst-capabilities descriptor)
+// and a negotiate=OFF probe (no descriptor → AV1_DEFAULT path), surfacing each response's negotiated headers;
+// (c) an empty body is rejected 400 before any container hop.
 import { describe, it, expect } from "vitest";
 import worker from "../src/worker.js";
 
 const ctx = { waitUntil: () => {} } as unknown as ExecutionContext;
 
-// A stub RECORDER container namespace: records the /encode request it receives and returns a canned negotiated
+// A stub RECORDER container namespace: records EVERY /encode request it receives and returns a canned negotiated
 // response (mirrors the container's success headers). idFromName/get mirror the live DO-stub shape.
 function stubRecorder() {
-  const seen: { id?: string; req?: Request } = {};
+  const seen: { id?: string; reqs: Request[] } = { reqs: [] };
   const ns = {
     idFromName(id: string) {
       seen.id = id;
@@ -21,12 +21,11 @@ function stubRecorder() {
     get(_id: unknown) {
       return {
         fetch: async (req: Request) => {
-          seen.req = req;
+          seen.reqs.push(req);
           return new Response(new Uint8Array([0xde, 0xad, 0xbe, 0xef]), {
             status: 200,
             headers: {
               "x-output-codec": "av1",
-              "x-negotiated-transport": "moq",
               "x-encoder": "libaom-av1",
               "x-output-container": "mp4",
             },
@@ -63,10 +62,10 @@ describe("#138 /__canary/encode-proof — canary-only CF-runtime recorder proof"
       ctx,
     );
     expect(res.status).toBe(400);
-    expect(seen.req, "container must not be called on an empty frame").toBeUndefined();
+    expect(seen.reqs.length, "container must not be called on an empty frame").toBe(0);
   });
 
-  it("canary: forwards the frame to /encode with av1+moq negotiation and surfaces the negotiated headers", async () => {
+  it("canary: makes a negotiate-ON + a negotiate-OFF probe and surfaces both results", async () => {
     const { ns, seen } = stubRecorder();
     const res = await worker.fetch(
       proofReq(),
@@ -74,27 +73,28 @@ describe("#138 /__canary/encode-proof — canary-only CF-runtime recorder proof"
       ctx,
     );
     expect(res.status).toBe(200);
-    const body = (await res.json()) as Record<string, unknown>;
-    expect(body.xOutputCodec).toBe("av1");
-    expect(body.xNegotiatedTransport).toBe("moq");
-    expect(body.xEncoder).toBe("libaom-av1");
-    expect(body.status).toBe(200);
+    const body = (await res.json()) as {
+      framedBytesIn: number;
+      negotiation: Record<string, unknown>;
+      av1Default: Record<string, unknown>;
+    };
     expect(body.framedBytesIn).toBe(4);
-    expect(body.bytesOut).toBe(4);
+    expect(body.negotiation.xOutputCodec).toBe("av1");
+    expect(body.av1Default.xOutputCodec).toBe("av1");
 
-    // The container was reached at the stable "rt-encoder" id, on POST /encode, as a jpeg video frame …
+    // TWO container hops, both at the stable "rt-encoder" id, both POST /encode jpeg video frames.
     expect(seen.id).toBe("rt-encoder");
-    const req = seen.req!;
-    expect(new URL(req.url).pathname).toBe("/encode");
-    expect(req.headers.get("x-codec")).toBe("jpeg");
-    expect(req.headers.get("x-kind")).toBe("video");
-    // … carrying the negotiation descriptor (av1 decode + moq transport) the live recorder path would send.
-    const dst = JSON.parse(atob(req.headers.get("x-dst-capabilities")!)) as {
+    expect(seen.reqs.length).toBe(2);
+    for (const req of seen.reqs) {
+      expect(new URL(req.url).pathname).toBe("/encode");
+      expect(req.headers.get("x-codec")).toBe("jpeg");
+      expect(req.headers.get("x-kind")).toBe("video");
+    }
+    // Probe 1 (negotiate ON) carries the av1 descriptor; probe 2 (negotiate OFF) sends none (AV1_DEFAULT path).
+    const dst = JSON.parse(atob(seen.reqs[0].headers.get("x-dst-capabilities")!)) as {
       decode: Array<{ name: string }>;
-      transports: Array<{ protocol: string }>;
     };
     expect(dst.decode.map((d) => d.name)).toContain("av1");
-    // Offers the container's proven recorder lane (ws-adapter) so negotiation is satisfiable, plus moq.
-    expect(dst.transports.map((t) => t.protocol)).toContain("ws-adapter");
+    expect(seen.reqs[1].headers.get("x-dst-capabilities"), "negotiate-OFF probe must omit the descriptor").toBeNull();
   });
 });
