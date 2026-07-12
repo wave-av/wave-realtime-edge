@@ -76,6 +76,14 @@ describe("#136 [env.canary] — separate canary worker arms the container encode
     expect(/^\s*workers_dev\s*=\s*true/m.test(canaryToml)).toBe(true);
     // The canary must NOT attach a custom domain route (would shadow the paid prod host).
     expect(/custom_domain/.test(canaryToml), "canary must not add a custom_domain route").toBe(false);
+    // REAL anti-inheritance guard (incident 2026-07-12): a named env INHERITS the top-level `routes` (which
+    // declares the rt.wave.online custom domain) UNLESS it declares its own. The absence of a custom_domain
+    // token above is NOT sufficient — the canary once STOLE rt.wave.online precisely because it declared no
+    // routes and inherited the prod one. An explicit empty `routes = []` is what pins the canary to workers.dev.
+    expect(
+      /^\s*routes\s*=\s*\[\s*\]/m.test(canaryToml),
+      "canary MUST declare `routes = []` to override top-level custom-domain inheritance (else it steals rt.wave.online)",
+    ).toBe(true);
   });
 
   it("canary arms the container encode path: RT_ENCODER=container, RECORDER_TARGET=cf, AV1+negotiation ON", () => {

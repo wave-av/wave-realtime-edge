@@ -369,6 +369,14 @@ text = "scaffold"
 [env.canary]
 name = "wave-realtime-edge-canary"
 workers_dev = true
+# ROUTE ISOLATION (incident 2026-07-12): `routes = []` PINS the canary to its *.workers.dev URL ONLY. Without
+# it, `wrangler deploy --env canary` inherited the top-level custom-domain route for rt.wave.online and
+# REASSIGNED that prod host onto the canary worker (verified: CF domain c41d31ca… pointed at
+# wave-realtime-edge-canary; rt.wave.online was served by the canary until re-pointed back). An explicit empty
+# routes list overrides that inheritance so the canary can NEVER attach/override a prod host again. Placed
+# BEFORE any [env.canary.*] subtable per the ROUTES PLACEMENT LAW documented above. (Comment avoids the literal
+# route-config token by design — test/wrangler-inert.test.ts asserts that token never appears in this block.)
+routes = []
 
 [env.canary.observability]
 enabled = true
