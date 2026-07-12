@@ -35,6 +35,10 @@ import { captureSessionZone } from "./residency-sink";
 // #82/#114 EX P2/P3 — cascade relay wiring (used only when RT_CASCADE is on). cascade.ts stays PURE; the
 // env/cf glue lives in src/cascade-sink.ts. OFF/absent → the primary `idFromName(org:room)` path is unchanged.
 import { resolveRelay } from "./cascade-sink";
+// #138 Canary C3 — CF-runtime recorder proof. `fetchContainerEncode` is the SAME getContainer().fetch('/encode')
+// call the live recorder makes; `defaultGetContainer` is the live DO-stub resolver. Used ONLY by the canary-gated
+// /__canary/encode-proof route below (inert on prod: RECORDER_TARGET is unset there → the gate 404s).
+import { fetchContainerEncode, defaultGetContainer } from "./encoders/recorder-target";
 // Env shape, route-match constants, and the auth/deps/sink plumbing — extracted to a leaf module (task #56) so
 // neither file exceeds 800 lines. dispatch-helpers.ts imports nothing from here (no cycle).
 import {
@@ -85,6 +89,45 @@ export async function dispatch(
 			layer: "edge",
 			protocol: "webrtc-sfu",
 			version: "dev",
+		});
+	}
+
+	// #138 Canary C3 — CF-runtime recorder proof (CANARY-ONLY; INERT on prod). Gated on RECORDER_TARGET==="cf",
+	// which ONLY the canary worker sets (prod leaves it unset → default 'none' → this 404s and the byte-identical
+	// 501/route behaviour is unchanged). Forwards a POSTed JPEG frame through the EXACT getContainer().fetch(
+	// '/encode') path the live recorder uses, with negotiation armed (consumer descriptor = av1 decode + moq
+	// transport), and returns the container's negotiated response headers. This proves CF's runtime wiring end to
+	// end — getContainer resolution + the forwarded AV1_DEFAULT/NEGOTIATION_ENABLED envVars actually reach a live
+	// RecorderContainer and drive negotiated output — which the 06-28 docker proof (container contract) did not cover.
+	if (request.method === "POST" && url.pathname === "/__canary/encode-proof") {
+		if (env.RECORDER_TARGET !== "cf" || !env.RECORDER) {
+			return Response.json(
+				{ error: "CANARY_PROOF_UNAVAILABLE", note: "RECORDER_TARGET!==cf or RECORDER unbound (prod-inert)" },
+				{ status: 404 },
+			);
+		}
+		const frame = new Uint8Array(await request.arrayBuffer());
+		if (frame.byteLength === 0) return Response.json({ error: "EMPTY_FRAME", note: "POST a JPEG body" }, { status: 400 });
+		const recorderNs = (env as unknown as { RECORDER: Parameters<typeof fetchContainerEncode>[0] }).RECORDER;
+		const res = await fetchContainerEncode(recorderNs, defaultGetContainer, frame, {
+			kind: "video",
+			ts: 0,
+			codec: "jpeg",
+			negotiate: true,
+			dst: { decode: [{ name: "av1", available: true }], transports: [{ protocol: "moq", activated: true }] },
+		});
+		const out = await res.arrayBuffer();
+		return Response.json({
+			ok: res.ok,
+			status: res.status,
+			framedBytesIn: frame.byteLength,
+			bytesOut: out.byteLength,
+			xOutputCodec: res.headers.get("x-output-codec"),
+			xNegotiatedTransport: res.headers.get("x-negotiated-transport"),
+			xEncoder: res.headers.get("x-encoder"),
+			xOutputContainer: res.headers.get("x-output-container"),
+			xAv1FallbackReason: res.headers.get("x-av1-fallback-reason"),
+			xNegotiationReason: res.headers.get("x-negotiation-reason"),
 		});
 	}
 

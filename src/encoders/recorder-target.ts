@@ -122,6 +122,28 @@ async function readEncoded(res: Response): Promise<Uint8Array | null> {
   return new Uint8Array(buf);
 }
 
+/** The live default getContainer impl (a plain DO-stub-by-name). Exported so a proof/diagnostic caller uses the
+ *  EXACT resolution the recorder path uses, not a divergent hand-rolled one. */
+export const defaultGetContainer = (ns: DurableObjectNamespace<Container>, id: string): Container =>
+  ns.get(ns.idFromName(id)) as unknown as Container;
+
+/**
+ * The raw `/encode` container round-trip — resolve the container by id and POST the frame with the negotiation
+ * headers `encodeInit` builds. Returns the RAW `Response` (headers intact) so a canary proof route can read the
+ * negotiated response headers (`x-output-codec` / `x-negotiated-transport`) that `encode()` discards on its way
+ * to the muxer. This is the SAME call the live recorder makes — the proof exercises the real wiring, not a copy.
+ */
+export async function fetchContainerEncode(
+  binding: DurableObjectNamespace<Container>,
+  getContainerImpl: (ns: DurableObjectNamespace<Container>, id: string) => Container,
+  frame: Uint8Array,
+  meta: FrameMeta,
+  containerId = "rt-encoder",
+): Promise<Response> {
+  const container = getContainerImpl(binding, containerId);
+  return container.fetch(new Request("http://rt-encoder/encode", encodeInit(frame, meta)));
+}
+
 /** Path A — encode via a CF Container fronted by the Worker. `getContainer` is injected for unit testing. */
 export class CfContainerTarget implements RecorderTarget {
   readonly kind = "cf" as const;
@@ -134,8 +156,7 @@ export class CfContainerTarget implements RecorderTarget {
 
   async encode(frame: Uint8Array, meta: FrameMeta): Promise<Uint8Array | null> {
     try {
-      const container = this.getContainerImpl(this.binding, this.containerId);
-      const res = await container.fetch(new Request("http://rt-encoder/encode", encodeInit(frame, meta)));
+      const res = await fetchContainerEncode(this.binding, this.getContainerImpl, frame, meta, this.containerId);
       return await readEncoded(res);
     } catch {
       return null; // fail-open — drop this one frame, never throw the media path
@@ -192,9 +213,7 @@ export function selectRecorderTarget(env: RecorderTargetEnv, deps: SelectTargetD
       console.warn(JSON.stringify({ msg: "rt-recorder-target-cf-unbound", note: "[[containers]] RECORDER absent" }));
       return new NoneTarget();
     }
-    const getC =
-      deps.getContainer ??
-      ((ns: DurableObjectNamespace<Container>, id: string) => ns.get(ns.idFromName(id)) as unknown as Container);
+    const getC = deps.getContainer ?? defaultGetContainer;
     return new CfContainerTarget(env.RECORDER, getC);
   }
   if (sel === "selfhost") {
