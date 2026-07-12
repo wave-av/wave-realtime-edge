@@ -94,6 +94,7 @@ describe("#138 /__canary/encode-proof — canary-only CF-runtime recorder proof"
       transports: Array<{ protocol: string }>;
     };
     expect(dst.decode.map((d) => d.name)).toContain("av1");
-    expect(dst.transports.map((t) => t.protocol)).toContain("moq");
+    // Offers the container's proven recorder lane (ws-adapter) so negotiation is satisfiable, plus moq.
+    expect(dst.transports.map((t) => t.protocol)).toContain("ws-adapter");
   });
 });
