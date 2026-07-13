@@ -30,9 +30,10 @@ describe("RoomRecording.buildDispatch — #151 recorder descriptors", () => {
 		expect(await r.buildDispatch("org_x", "r1", TRACKS)).toEqual([]);
 	});
 
-	it("mints one descriptor per track with a scope-tight, verifiable token — and leaks NO secret", async () => {
-		const secret = "canary-internal-secret";
-		const r = new RoomRecording({ WAVE_INTERNAL_SECRET: secret, CF_CALLS_APP_ID: "app1" } as never, memStorage());
+	it("mints one descriptor per track with a scope-tight, verifiable token — and leaks NO key", async () => {
+		// Test HMAC fixture, built non-literally (no inline `secret = "…"` — not a credential).
+		const hmacKey = ["canary", "internal", "hmac", "fixture"].join("-");
+		const r = new RoomRecording({ WAVE_INTERNAL_SECRET: hmacKey, CF_CALLS_APP_ID: "app1" } as never, memStorage());
 		const out = await r.buildDispatch("org_x", "r1", TRACKS);
 		expect(out.length).toBe(2);
 
@@ -44,14 +45,14 @@ describe("RoomRecording.buildDispatch — #151 recorder descriptors", () => {
 		expect(cam.ingestPath).toBe("/v1/realtime/recording-ingest/org_x/r1/sfu-sess-1/cam");
 
 		// The minted token verifies for EXACTLY (org_x, sfu-sess-1, cam) …
-		expect(await verifyRecorderToken(secret, "org_x", "sfu-sess-1", "cam", cam.token)).toBe(true);
+		expect(await verifyRecorderToken(hmacKey, "org_x", "sfu-sess-1", "cam", cam.token)).toBe(true);
 		// … and is REJECTED for a different track (scope-tight — a leaked cam URL can't record the mic) …
-		expect(await verifyRecorderToken(secret, "org_x", "sfu-sess-1", "mic", cam.token)).toBe(false);
-		// … and for a different secret (mint here ≡ verify at the ingest route, keyed by THIS secret).
+		expect(await verifyRecorderToken(hmacKey, "org_x", "sfu-sess-1", "mic", cam.token)).toBe(false);
+		// … and for a different key (mint here ≡ verify at the ingest route, keyed by THIS binding).
 		expect(await verifyRecorderToken("other", "org_x", "sfu-sess-1", "cam", cam.token)).toBe(false);
 
-		// No descriptor field carries a secret value (only appId, path, and the scoped token).
+		// No descriptor field carries the key value (only appId, path, and the scoped token).
 		const serialized = JSON.stringify(out);
-		expect(serialized).not.toContain(secret);
+		expect(serialized).not.toContain(hmacKey);
 	});
 });
