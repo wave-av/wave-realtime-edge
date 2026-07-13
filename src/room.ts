@@ -428,6 +428,9 @@ interface DurableObjectStateLike {
 export interface RoomDOEnv {
   CF_CALLS_APP_ID?: string;
   CF_CALLS_APP_SECRET?: string;
+  // #151 recorder-dispatch: the DO mints track-scoped ingest capability tokens with this (the SAME secret the
+  // ingest route verifies with — mint here ≡ verify there). Unset (local/test) → buildDispatch returns [].
+  WAVE_INTERNAL_SECRET?: string;
   GATEWAY_BASE_URL?: string;
   WAVE_SERVICE_TOKEN?: string;
   MEDIA_TAP_ENABLED?: string | boolean; // #74 — arms MediaTap fan-out; default off = inert (prod byte-identical)
@@ -561,7 +564,7 @@ export class RoomDO {
    * (fail-open inside metering.ts). The DO never holds media — only state + orchestration.
    */
   async fetch(request: Request): Promise<Response> {
-    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent | "recorder-frame" | "recording-ingest" | "whip-finalize" | "presence" | "agent-bind" | "whip-publish";
+    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent | "recorder-frame" | "recording-ingest" | "recorder-dispatch" | "whip-finalize" | "presence" | "agent-bind" | "whip-publish";
     // #76 P2 (arch A): fold the agent's media-READ onto this room's single MediaTap. The AGENT dispatch
     // (/bind) additionally forwards the SAME AgentSessionConfig here when MEDIA_TAP_ENABLED is armed, so the
     // RoomDO registers an IN-PROCESS MediaConsumer for the agent's target track — no 2nd SFU subscription, no
@@ -595,6 +598,23 @@ export class RoomDO {
         /* fail-open */
       }
       return new Response(null, { status: 204 });
+    }
+    // #151 recorder-DISPATCH: an internal orchestrator (container spawner / self-host recorder driver) asks what
+    // to record in this room. Answer with one descriptor per REGISTERED track (real armed state, never arbitrary
+    // scope), each carrying a track-scoped ingest token minted with THIS DO's WAVE_INTERNAL_SECRET (so mint here
+    // ≡ verify at the ingest route). Gateway-gated upstream; never returns a secret. Fail-safe: on any error
+    // return an empty list (records nothing) rather than throw the control plane down.
+    if (intent === "recorder-dispatch") {
+      try {
+        const u = new URL(request.url);
+        const org = u.searchParams.get("org") ?? "";
+        const room = u.searchParams.get("room") ?? "";
+        const tracks = await this.core.listTracks();
+        const descriptors = await this.recording.buildDispatch(org, room, tracks);
+        return Response.json({ descriptors }, { status: 200 });
+      } catch {
+        return Response.json({ descriptors: [] }, { status: 200 });
+      }
     }
     // #151 HOSTED recorder INGEST: the self-host werift recorder streams a finalized WebM/Matroska container
     // here (via the Worker /v1/realtime/recording-ingest route). Stream it into the single-writer canonical R2
