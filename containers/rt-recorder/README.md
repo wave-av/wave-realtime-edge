@@ -64,12 +64,30 @@ werift** — an honest degrade, never a hang or a silent wrong-codec mux.
 2. **Use werift's MediaRecorder** (not a hand-rolled depacketizer) — its jitter buffer handles reorder.
    `onTrack` fires twice (codec-less placeholder, then the real negotiated track); add the **codec-bearing** one.
 
-## Go-live gate (remaining, mostly infra)
+## Running it
 
-INERT until a self-host runtime actually runs this process:
-1. `npm install` the werift dep in the deployed image/host.
-2. Provide a Node `RecordingSink` (R2 uploader or a writer that POSTs to the Worker recorder route) — the DO
-   owns the canonical object; **do not** create a competing R2 writer.
-3. Feed the SFU descriptor from the RoomDO (#135 seam) at track publish.
-4. `WAVE_INTERNAL_SECRET` provisioned (#141) if the recorder route is the sink transport.
-5. Live canary receipt → closes **#145-video + #91**.
+One track per process (12-factor). Two sink modes, chosen by env:
+
+```bash
+# Hosted (production): stream to the Worker recording-ingest route → RoomDO writes the canonical R2 object.
+# INGEST_ENDPOINT is PRE-SIGNED (?t=<recorder-token>) by the orchestrator; this process holds no secret.
+ORG=acme SESSION_ID=<sfuSession> APP_ID=<hex> APP_SECRET=<secret> \
+  PUBLISHER_SESSION=<pubSession> TRACK=<trackName> CODEC=VP8 RUN_MS=15000 \
+  INGEST_ENDPOINT="https://rt.wave.online/v1/realtime/recording-ingest/acme/<room>/<sfuSession>/<track>?t=<tok>" \
+  node server/run.mjs
+
+# Local (dev/on-prem): write a self-contained WebM to RECORDER_LOCAL_DIR.
+ORG=acme SESSION_ID=s APP_ID=… APP_SECRET=… PUBLISHER_SESSION=… TRACK=… RECORDER_LOCAL_DIR=/tmp node server/run.mjs
+```
+
+## Go-live gate (remaining)
+
+Server code is COMPLETE + tested + pushed; the ingest route is ARMED on canary (`RECORDER_INGEST_ENABLED=1`,
+reusing the canary's existing `WAVE_INTERNAL_SECRET` — **no new secret needed**; #141 is a separate RTMS gap).
+Remaining:
+1. Deploy the canary worker (`gh workflow run deploy.yml -f environment=canary`) so the armed route is live.
+2. Build the werift image (`docker build`) on a self-host node (the Studio) and `npm install` werift.
+3. **First receipt (manual):** a live WHIP publish → run `server/run.mjs` with a RoomDO-minted pre-signed
+   `INGEST_ENDPOINT` → ffprobe the landed R2 object. Closes **#145-video + #91**.
+4. **Productionize (follow-up):** RoomDO auto-dispatch — on WHIP publish, mint the token + dispatch one
+   recorder process per track with the descriptor (today `run.mjs` takes it from env / a manual run).
