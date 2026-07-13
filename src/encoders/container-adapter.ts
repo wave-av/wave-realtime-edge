@@ -134,9 +134,12 @@ export async function createWebsocketAdapter(
       headers: { Authorization: `Bearer ${params.bearer}`, "Content-Type": "application/json" },
       body: JSON.stringify({ tracks: params.tracks }),
     });
+    // Read the body as text FIRST so a non-JSON error page (e.g. a 5xx) is still captured for diagnostics,
+    // then attempt a JSON parse for the notReady/id shape. res.json() alone silently drops a non-JSON body.
+    const bodyText = await res.text().catch(() => "");
     let json: unknown = null;
     try {
-      json = await res.json();
+      json = bodyText ? JSON.parse(bodyText) : null;
     } catch {
       json = null;
     }
@@ -151,9 +154,13 @@ export async function createWebsocketAdapter(
       await sleep(delayMs(attempt));
       continue;
     }
-    // observability only — never the token; notReady distinguishes the race from a real upstream error.
-    console.warn(`sfu-ws-adapter status=${res.status} ok=${res.ok} notReady=${notReady} attempt=${attempt}`);
-    throw new SfuAdapterError("UPSTREAM", `create websocket adapter returned ${res.status}`, 502);
+    // observability only — never the token (it's a request header, never echoed in the body); notReady
+    // distinguishes the publish race from a real upstream error. The upstream body carries CF's actual
+    // reason (#147: the create was 503-ing with the reason swallowed) — truncate to bound the log line.
+    console.warn(
+      `sfu-ws-adapter status=${res.status} ok=${res.ok} notReady=${notReady} attempt=${attempt} body=${bodyText.slice(0, 512)}`,
+    );
+    throw new SfuAdapterError("UPSTREAM", `create websocket adapter returned ${res.status}: ${bodyText.slice(0, 256)}`, 502);
   }
 }
 

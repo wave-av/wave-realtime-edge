@@ -209,6 +209,15 @@ export async function dispatch(
 		const tok = url.searchParams.get("t");
 		const tokenOk =
 			!!tok && !!env.WAVE_INTERNAL_SECRET && (await verifyRecorderToken(env.WAVE_INTERNAL_SECRET, rorg, rsession, rtrack, tok));
+		// #147 diagnostic — capture the shape of CF's dial-in so we can see WHY its WS handshake cancels
+		// (create-adapter 503). NEVER logs the token VALUE (only presence) or any secret; the Sec-WebSocket-*
+		// and Upgrade/Connection headers are handshake metadata, not secrets. Remove once #147 is diagnosed.
+		console.warn(
+			`recorder-dial org=${rorg} room=${rroom} session=${rsession} track=${rtrack} ` +
+				`upgrade=${request.headers.get("Upgrade") ?? ""} connection=${request.headers.get("Connection") ?? ""} ` +
+				`wsKey=${request.headers.get("Sec-WebSocket-Key") ? "1" : "0"} wsVer=${request.headers.get("Sec-WebSocket-Version") ?? ""} ` +
+				`wsProto=${request.headers.get("Sec-WebSocket-Protocol") ?? ""} hasTok=${tok ? "1" : "0"} tokenOk=${tokenOk} rtRecord=${env.RT_RECORD ?? ""}`,
+		);
 		if (!tokenOk) {
 			const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
 			if (denied) return denied;
