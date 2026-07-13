@@ -392,6 +392,13 @@ RT_ENCODER = "container"
 RECORDER_TARGET = "cf"
 NEGOTIATION_ENABLED = "true"
 AV1_DEFAULT = "1"
+# #145 (#91-C) — arm the WHIP ingest surface + the #144 room-recording route on the canary so a real direct-WHIP
+# publish flows through a RoomDO room → recorder tap + negotiation (the live av1-recorded receipt). Named envs do
+# NOT inherit top-level [vars], so these (and CF_CALLS_APP_ID) are restated here. Liveness additionally needs the
+# canary SECRETS CF_CALLS_APP_SECRET (SFU Bearer) + WAVE_INTERNAL_SECRET (gateway trust), provisioned separately.
+WHIP_INGEST_ENABLED = "1"
+WHIP_ROOM_RECORDING = "1"
+CF_CALLS_APP_ID = "45197a76d6d3475db3b7dc1c2b876e26"
 
 # Canary recordings bucket — a DISTINCT bucket so canary recordings never mix with prod. Created in the deploy
 # step (`wrangler r2 bucket create wave-realtime-recordings-canary`); --dry-run tolerates a not-yet-existing
