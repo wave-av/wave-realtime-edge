@@ -10,6 +10,7 @@ import {
   deriveWhipRoom,
   buildWhipTrackName,
   publishViaRoom,
+  finalizeViaRoom,
   WHIP_ROOM_HEADER,
   type WhipRoomEnv,
 } from "../src/whip-room.js";
@@ -119,6 +120,29 @@ describe("#144 publishViaRoom", () => {
     });
     expect(await publishViaRoom(env, "acme", OFFER, "res01", null, "whip-res01")).toBeNull();
     expect(await publishViaRoom({}, "acme", OFFER, "res01", null, "whip-res01")).toBeNull();
+  });
+});
+
+// ── (b2) finalizeViaRoom forward + fail-soft (#145 recorder-finalize on WHIP teardown) ─────────────
+describe("#145 finalizeViaRoom", () => {
+  it("forwards a whip-finalize intent (keyed org:room) carrying the sessionId, returns true on ok", async () => {
+    const { env, seen } = stubRoom(async () => new Response(null, { status: 204 }));
+    expect(await finalizeViaRoom(env, "acme", "whip:res01", "sessRoom01")).toBe(true);
+    expect(seen.keys[0]).toBe("acme:whip:res01");
+    const u = new URL(seen.reqs[0].url);
+    expect(u.pathname).toBe("/whip-finalize");
+    expect(u.searchParams.get("sessionId")).toBe("sessRoom01");
+    expect(seen.reqs[0].method).toBe("POST");
+  });
+
+  it("returns false (fail-soft) on a non-2xx room response, a DO throw, or no ROOM binding", async () => {
+    const bad = stubRoom(async () => new Response("boom", { status: 500 }));
+    expect(await finalizeViaRoom(bad.env, "acme", "whip:res01", "s1")).toBe(false);
+    const threw = stubRoom(async () => {
+      throw new Error("net");
+    });
+    expect(await finalizeViaRoom(threw.env, "acme", "whip:res01", "s1")).toBe(false);
+    expect(await finalizeViaRoom({}, "acme", "whip:res01", "s1")).toBe(false);
   });
 });
 
@@ -309,5 +333,55 @@ describe("#144 whip.ts handlePublish routing", () => {
     expect(res!.status).toBe(201);
     expect(await res!.text()).toBe(DIRECT_ANSWER);
     expect(h.newSessionCalls).toBe(1);
+  });
+});
+
+describe("#145 whip.ts DELETE drives the recorder finalize", () => {
+  // A ROOM binding that answers /whip-publish AND records every forwarded request (so the DELETE-time
+  // /whip-finalize forward is observable).
+  function recordingRoom(): { room: WhipRoomEnv["ROOM"]; paths: string[] } {
+    const paths: string[] = [];
+    const room: WhipRoomEnv["ROOM"] = {
+      idFromName: (n: string) => ({ n }),
+      get: () => ({
+        fetch: async (req: Request) => {
+          const p = new URL(req.url).pathname;
+          paths.push(p);
+          return p === "/whip-publish"
+            ? Response.json({ sessionId: "sessRoom01", sessionDescription: { type: "answer", sdp: ROOM_ANSWER } })
+            : new Response(null, { status: 204 });
+        },
+      }),
+    };
+    return { room, paths };
+  }
+
+  it("routed publish → DELETE forwards a whip-finalize for the session (multipart completes)", async () => {
+    const h = whipDeps();
+    const { room, paths } = recordingRoom();
+    const env = baseEnv({ WHIP_ROOM_RECORDING: "1", ROOM: room });
+    const pub = await handleWhip(publishReq(), env, "acme", h.deps);
+    expect(pub!.status).toBe(201);
+    const location = pub!.headers.get("location")!; // /v1/whip/resource/res00000001
+    const del = await handleWhip(
+      new Request(`https://rt.wave.online${location}`, { method: "DELETE" }),
+      env,
+      "acme",
+      h.deps,
+    );
+    expect(del!.status).toBe(204);
+    expect(paths).toContain("/whip-publish");
+    expect(paths).toContain("/whip-finalize"); // the teardown drove the recorder finalize
+  });
+
+  it("direct-path resource (no room) → DELETE does NOT forward a finalize", async () => {
+    const h = whipDeps();
+    const { room, paths } = recordingRoom();
+    // Flag OFF ⇒ direct path ⇒ record has no room ⇒ teardown skips the finalize forward.
+    const env = baseEnv({ ROOM: room });
+    const pub = await handleWhip(publishReq(), env, "acme", h.deps);
+    const location = pub!.headers.get("location")!;
+    await handleWhip(new Request(`https://rt.wave.online${location}`, { method: "DELETE" }), env, "acme", h.deps);
+    expect(paths).not.toContain("/whip-finalize");
   });
 });
