@@ -117,7 +117,11 @@ export class ContainerEncoder implements RecordingEncoder {
     // Bind to globalThis: native `fetch` throws "Illegal invocation" when later called as `this.fetchImpl(...)`;
     // binding makes every call site safe (a no-op for an injected test fake). See managed.ts for the same fix.
     this.fetchImpl = (deps.fetchImpl ?? fetch).bind(globalThis);
-    this.recorderBase = (deps.recorderEndpointBase ?? DEFAULT_RECORDER_ENDPOINT_BASE).replace(/\/+$/, "");
+    // #146 — the SFU dials THIS base to push media; it MUST be the host running this worker. On the Worker deps
+    // carries nothing, so without an env override every env (incl. canary) fell back to the PROD host → CF was
+    // told to push canary media at rt.wave.online, whose recorder route rejects the foreign session/token →
+    // create-adapter 503. RECORDER_PUBLIC_WSS (env) pins it to the actual host; absent → the prod default.
+    this.recorderBase = (deps.recorderEndpointBase ?? this.env.RECORDER_PUBLIC_WSS ?? DEFAULT_RECORDER_ENDPOINT_BASE).replace(/\/+$/, "");
     this.retry = deps.retry ?? adapterRetryFromEnv(this.env);
     this.localWriterFor = deps.localWriterFor; // undefined on Worker (inert); self-host injects the fs writer
   }

@@ -404,6 +404,10 @@ WHIP_ROOM_RECORDING = "1"
 # client's. Widen the container create-adapter retry budget (~14 attempts ≈ 12s) so the recorder rides out the
 # WHIP publish→media-flow gap instead of exhausting the RTK-tuned default (7 ≈ 4.5s) before media arrives.
 RT_ADAPTER_MAX_ATTEMPTS = "14"
+# #146 — the SFU dials THIS base to push recorder media. The default is the PROD host (rt.wave.online), which
+# would make the canary's SFU push media at the prod worker (foreign session/token -> create-adapter 503). Pin
+# it to the canary's OWN workers.dev host so the SFU dials the SAME worker that signed the capability token.
+RECORDER_PUBLIC_WSS = "wss://wave-realtime-edge-canary.jakefineman.workers.dev/v1/realtime/recorder"
 
 # Canary recordings bucket — a DISTINCT bucket so canary recordings never mix with prod. Created in the deploy
 # step (`wrangler r2 bucket create wave-realtime-recordings-canary`); --dry-run tolerates a not-yet-existing

@@ -37,6 +37,7 @@ export interface EncoderEnv {
   RT_ENCODER?: EncoderKind; // selector; default "managed" (C)
   RT_RECORD?: string; // "1" to arm recording at all (default OFF — fully inert)
   RT_ADAPTER_MAX_ATTEMPTS?: string; // #146 container create-adapter retry budget override (WHIP media starts later); absent → RTK default (7)
+  RECORDER_PUBLIC_WSS?: string; // #146 the wss base the SFU dials to push media (MUST be THIS worker's host); absent → prod rt.wave.online default
   // adapter A: signs the per-(org,session,track) capability token the SFU appends to the recorder route URL
   // (?t=...) so it can authenticate the dial-in WITHOUT the internal header. Unset → no token (local/test).
   WAVE_INTERNAL_SECRET?: string;
