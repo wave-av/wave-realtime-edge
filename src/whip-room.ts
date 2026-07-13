@@ -123,3 +123,29 @@ export async function publishViaRoom(
     return null; // fail-soft → direct path
   }
 }
+
+/**
+ * #145 (#91-C) — drive the recorder FINALIZE on WHIP teardown. A WHIP publish routed through a room opens a
+ * raw-SFU recorder tap that streams to an R2 MULTIPART upload; that upload only becomes an object when
+ * `RoomRecording.finalize(sessionId)` completes it. WHIP DELETE (unlike a RoomDO `leave`) never drove that,
+ * so every routed recording's multipart was abandoned → no object landed. This forwards a `whip-finalize`
+ * intent to the SAME DO (`{org}:{room}`) that holds the tap, completing the upload. FAIL-SOFT (returns
+ * whether it fired): a finalize blip must never fail the teardown response (media-safety > recording, §4).
+ */
+export async function finalizeViaRoom(
+  env: WhipRoomEnv,
+  org: string,
+  room: string,
+  sessionId: string,
+): Promise<boolean> {
+  if (!env.ROOM) return false;
+  try {
+    const stub = env.ROOM.get(env.ROOM.idFromName(`${org}:${room}`));
+    const res = await stub.fetch(
+      new Request(`https://room/whip-finalize?sessionId=${encodeURIComponent(sessionId)}`, { method: "POST" }),
+    );
+    return res.ok;
+  } catch {
+    return false; // fail-soft → teardown still returns 204
+  }
+}

@@ -561,7 +561,7 @@ export class RoomDO {
    * (fail-open inside metering.ts). The DO never holds media — only state + orchestration.
    */
   async fetch(request: Request): Promise<Response> {
-    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent | "recorder-frame" | "presence" | "agent-bind" | "whip-publish";
+    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent | "recorder-frame" | "whip-finalize" | "presence" | "agent-bind" | "whip-publish";
     // #76 P2 (arch A): fold the agent's media-READ onto this room's single MediaTap. The AGENT dispatch
     // (/bind) additionally forwards the SAME AgentSessionConfig here when MEDIA_TAP_ENABLED is armed, so the
     // RoomDO registers an IN-PROCESS MediaConsumer for the agent's target track — no 2nd SFU subscription, no
@@ -591,6 +591,18 @@ export class RoomDO {
         const trackName = u.searchParams.get("trackName") ?? "";
         const buf = new Uint8Array(await request.arrayBuffer());
         if (sessionId && trackName && buf.length > 0) await this.feedRecorderFrame(sessionId, trackName, buf);
+      } catch {
+        /* fail-open */
+      }
+      return new Response(null, { status: 204 });
+    }
+    // #145 (#91-C): WHIP teardown drives the recorder FINALIZE here (WHIP DELETE has no `leave` to hang it on).
+    // Completes the tap's R2 multipart into the one canonical object. DORMANT for managed (finalize is a no-op
+    // when no tap is held). Fail-open: always 204, never throws.
+    if (intent === "whip-finalize") {
+      try {
+        const sessionId = new URL(request.url).searchParams.get("sessionId") ?? "";
+        if (sessionId) await this.recording.finalize(sessionId);
       } catch {
         /* fail-open */
       }

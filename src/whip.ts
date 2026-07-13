@@ -30,6 +30,7 @@ import {
 import {
 	whipRoomRecordingEnabled,
 	publishViaRoom,
+	finalizeViaRoom,
 	WHIP_ROOM_HEADER,
 	type WhipRoomEnv,
 } from "./whip-room.js";
@@ -85,6 +86,9 @@ interface WhipResource {
 	sessionId: string;
 	org: string;
 	startedAt: number; // epoch ms — start of the publish session, for the teardown meter
+	// #145 (#91-C): the RoomDO room this publish routed through (WHIP_ROOM_RECORDING path). Persisted so DELETE
+	// can address the SAME DO (`{org}:{room}`) to finalize the recorder. Absent ⇒ direct path (no recorder tap).
+	room?: string;
 	// #91 B2: the resolved billing meter, captured (gateway-sealed, allowset-validated) at publish so the
 	// teardown bills the right SKU regardless of how it fires (client DELETE or cron). Absent ⇒ default WHIP.
 	meter?: string;
@@ -180,6 +184,8 @@ async function loadResource(kv: WhipKv | undefined, resourceId: string): Promise
 				org: r.org,
 				startedAt: r.startedAt,
 				meter: typeof r.meter === "string" ? r.meter : undefined,
+				// #145: carry the room forward so DELETE can address the recorder-holding DO to finalize.
+				room: typeof r.room === "string" ? r.room : undefined,
 			};
 		}
 	} catch {
@@ -258,7 +264,7 @@ async function handlePublish(request: Request, env: WhipEnv, deps: WhipDeps, org
 		// #91 B2: resolve the billing meter from the gateway-SEALED override header (allowset-validated) and
 		// persist it, so the teardown bills the right SKU (bridge vs bare WHIP) however it later fires.
 		const meter = resolveWhipMeter(request.headers.get(WHIP_METER_OVERRIDE_HEADER));
-		const record: WhipResource = { sessionId, org, startedAt: deps.now(), meter };
+		const record: WhipResource = { sessionId, org, startedAt: deps.now(), meter, room: routed?.room };
 		try {
 			await env.RT_MEETING_ORG?.put(`${WHIP_KV_PREFIX}${resourceId}`, JSON.stringify(record), {
 				expirationTtl: WHIP_KV_TTL_SECONDS,
@@ -325,6 +331,14 @@ async function handleDelete(env: WhipEnv, deps: WhipDeps, resourceId: string): P
 	// idempotency key (resourceId) and the org/startedAt are still in hand. A meter failure never blocks teardown.
 	const line = buildWhipMeterLine(resourceId, resource.startedAt, deps.now(), resolveWhipMeter(resource.meter));
 	await emitWhipTeardownMeter(env, resource.org, line, deps.fetch);
+
+	// #145 (#91-C): finalize the raw-SFU recorder for this session. The room-routed publish (WHIP_ROOM_RECORDING)
+	// opened a tap streaming to an R2 MULTIPART upload; only finalize() completes it into the canonical object.
+	// WHIP DELETE has no `leave` to hang finalize on, so drive it here — to the SAME DO (`{org}:{room}`) that
+	// holds the tap. Fail-open (media-safety > recording, §4): a finalize blip never blocks the 204 teardown.
+	if (resource.room && whipRoomRecordingEnabled(env)) {
+		await finalizeViaRoom(env, resource.org, resource.room, resource.sessionId);
+	}
 
 	// Best-effort: clear the resource record. CF Realtime sessions GC on idle, so there is no explicit
 	// SFU close primitive to drive from here in v1 (closeTracks needs the published mids, which the edge
