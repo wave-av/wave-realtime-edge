@@ -2,6 +2,8 @@
 // stays under the file-size gate (E-ROOMS P4 added the presence layer). Behavior is unchanged: this is the
 // same class the RoomDO holds; type-only imports from ./room.js keep the split cycle-free.
 import { selectEncoder } from "./encoders/factory.js";
+import { R2Sink } from "./encoders/recording-sink.js";
+import type { RecordingResult } from "./recording-writer.js";
 import type { EncoderEnv, EncoderHandle, RecordingEncoder } from "./encoders/encoder.js";
 import type { RoomDOEnv, RoomStorage, TrackKind } from "./room.js";
 
@@ -52,6 +54,32 @@ export class RoomRecording {
       await this.persist(sessionId, handle);
     } catch {
       /* fail-open — recording never blocks publish */
+    }
+  }
+
+  /**
+   * #151 HOSTED path: stream a finalized WebM/Matroska container (produced by the self-host werift recorder,
+   * containers/rt-recorder) into the ONE canonical R2 object for (org, sessionId). The DO is the SINGLE WRITER
+   * (this method runs in the RoomDO): `R2Sink` lazy-begins on the first byte (container magic → the right
+   * extension), appends the rest, finalizes → {key,bytes,container}. Returns null when nothing was streamed or
+   * no RT_RECORDINGS bucket is bound. NOT fail-open — unlike the best-effort frame tap, the recorder needs the
+   * receipt (this stream IS the recording), so a write error propagates as a real failure the ingest surfaces.
+   */
+  async ingestContainer(org: string, sessionId: string, body: ReadableStream<Uint8Array>): Promise<RecordingResult | null> {
+    const bucket = this.env.RT_RECORDINGS;
+    if (!bucket) return null; // no SKIP sink bound → nothing to write (loud 501/422 upstream, never a silent ok)
+    const sink = new R2Sink(bucket, { org, sessionId });
+    const reader = body.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && value.length > 0) await sink.write(value);
+      }
+      return await sink.finalize(); // one canonical object; null if zero bytes (never a 0-byte object)
+    } catch (e) {
+      await sink.abort();
+      throw e;
     }
   }
 
