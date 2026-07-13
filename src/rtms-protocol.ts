@@ -168,13 +168,16 @@ export type RtmsInboundMessage =
   | { msgType: 4; kind: "data_ack"; statusCode: number }
   | { msgType: 12; kind: "keepalive_req"; timestamp: number }
   | { msgType: 14; kind: "audio"; userId?: number; payload: Uint8Array }
+  | { msgType: 15; kind: "video"; userId?: number; payload: Uint8Array }
   | { msgType: 17; kind: "transcript"; userName?: string; text: string }
   | { msgType: number; kind: "other"; raw: Record<string, unknown> };
 
 /**
  * Parse one inbound RTMS text frame into a typed message. Throws
  * RtmsProtocolError on malformed JSON; unknown msg_types return kind:"other".
- * MEDIA_DATA_AUDIO payloads are base64-decoded to raw PCM `s16le` bytes.
+ * MEDIA_DATA_AUDIO/MEDIA_DATA_VIDEO payloads are base64-decoded to raw bytes
+ * (PCM `s16le` for audio; JPEG stills for video — see rtms-video.ts header for
+ * the video-codec grounding + what's still unverified pending a live meeting).
  */
 export function parseRtmsMessage(text: string): RtmsInboundMessage {
   let msg: Record<string, unknown>;
@@ -215,6 +218,16 @@ export function parseRtmsMessage(text: string): RtmsInboundMessage {
       return {
         msgType: 14,
         kind: "audio",
+        userId: typeof content["user_id"] === "number" ? (content["user_id"] as number) : undefined,
+        payload: base64ToBytes(data),
+      };
+    }
+    case RTMS_MSG_TYPE.MEDIA_DATA_VIDEO: {
+      const data = content["data"];
+      if (typeof data !== "string") throw new RtmsProtocolError("video frame missing content.data");
+      return {
+        msgType: 15,
+        kind: "video",
         userId: typeof content["user_id"] === "number" ? (content["user_id"] as number) : undefined,
         payload: base64ToBytes(data),
       };

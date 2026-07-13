@@ -43,7 +43,9 @@ export interface IngestAdapterTrack {
   trackName: string;
   /** wss:// the SFU connects to receive OUR PCM (symmetric with the egress `endpoint`). */
   endpoint: string;
-  inputCodec: "pcm";
+  /** "pcm" = audio (the proven path). "jpeg" = video ingest (#88 WAVE_RTMS_VIDEO — see rtms-video.ts;
+   *  mirrors the existing `outputCodec:"jpeg"` egress convention). Type-only widen, additive. */
+  inputCodec: "pcm" | "jpeg";
   /**
    * CF Realtime WebSocket-adapter mode for a local (publish) track. "buffer" = the SFU reads PROTOBUF frames whose
    * `payload` field carries chunks of 48k/16-bit/stereo PCM (exactly what encodeIngestFrame emits) — REQUIRED for

@@ -44,6 +44,11 @@ import { SAFE_SEGMENT, ZOOM_RTMS_INGEST_ROUTE } from "./dispatch-helpers.js";
 /** Env the ZoomRtmsBridgeDO reads. INERT unless WAVE_ZOOM_RTMS is truthy. All creds referenced, not valued. */
 export interface ZoomRtmsBridgeDoEnv {
   WAVE_ZOOM_RTMS?: string | boolean; // truthy arms; absent/"0"/false → fully inert
+  // #88 M2 — independent flag for the VIDEO ingest leg (RTMS video frame → SFU video track push), still
+  // gated by WAVE_ZOOM_RTMS being on too. Absent/"0"/false → audio-only, byte-identical to pre-video. The
+  // DO does not yet mint a video target or accept a live video-ingest-sink socket (◆ follow-up slice) —
+  // this only threads the flag into RtmsBridgeCore so its handshake/pump wiring is exercised.
+  WAVE_RTMS_VIDEO?: string | boolean;
   ZOOM_APPS_CLIENT_ID?: string; // General-app Client ID — the RTMS handshake clientId (fails closed if unset)
   ZOOM_APPS_CLIENT_SECRET?: string; // signs the RTMS handshake — never logged/returned
   CF_CALLS_APP_ID?: string; // CF Realtime SFU app id (createIngestAdapter) — unset → fails closed
@@ -53,6 +58,12 @@ export interface ZoomRtmsBridgeDoEnv {
   AGENT_INGEST_FRAMING?: IngestFraming; // "packet" (default) | "raw" (a live spike may select)
   RT_MEETING_ORG?: KVNamespace; // meeting_uuid → {org, sessionId, trackName?} publish-target mapping
   __zoomFetch?: typeof fetch; // test-only: injected fetch for the outbound dial + adapter create
+}
+
+/** Truthy-flag check for the video ingest leg (mirrors zoomRtmsEnabled's pattern). */
+export function rtmsVideoEnabled(env: { WAVE_RTMS_VIDEO?: string | boolean }): boolean {
+  const v = env.WAVE_RTMS_VIDEO;
+  return v === true || v === "1" || v === "true";
 }
 
 /** The publish-target record stored in RT_MEETING_ORG under the meeting_uuid key. */
@@ -172,6 +183,7 @@ export class ZoomRtmsBridgeDO {
       clientSecret: this.env.ZOOM_APPS_CLIENT_SECRET,
       target,
       framing: this.env.AGENT_INGEST_FRAMING,
+      videoEnabled: rtmsVideoEnabled(this.env),
     });
     await this.core.start(event);
     return true;
