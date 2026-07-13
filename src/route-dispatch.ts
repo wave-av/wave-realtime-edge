@@ -38,6 +38,9 @@ import { resolveRelay } from "./cascade-sink";
 // #138 Canary C3 — CF-runtime recorder proof (CANARY-ONLY, INERT on prod). Handler extracted to a leaf module so
 // this router stays under the file-size gate; it 404s unless RECORDER_TARGET==="cf" (only the canary sets it).
 import { maybeHandleCanaryProof } from "./canary-proof";
+// #151 hosted recorder INGEST (PUT /v1/realtime/recording-ingest/*) — leaf module keeps this router under the
+// file-size gate. INERT behind RECORDER_INGEST_ENABLED (default off → 501).
+import { maybeHandleRecordingIngest } from "./recording-ingest-route";
 // Env shape, route-match constants, and the auth/deps/sink plumbing — extracted to a leaf module (task #56) so
 // neither file exceeds 800 lines. dispatch-helpers.ts imports nothing from here (no cycle).
 import {
@@ -277,6 +280,11 @@ export async function dispatch(
 			return new Response(null, { status: 200, webSocket: client } as ResponseInit & { webSocket: WebSocket });
 		}
 	}
+
+	// ── #151 hosted recorder INGEST — PUT /v1/realtime/recording-ingest/:org/:room/:sessionId/:trackName ──
+	// Delegated to a leaf module (recording-ingest-route.ts) so this router stays under the file-size gate.
+	const recIngest = await maybeHandleRecordingIngest(request, url, env);
+	if (recIngest) return recIngest;
 
 	// ── P5 CF-Calls SFU control plane — POST /v1/realtime/rooms/:room/:intent ──
 	// Routed through the Room DO (per-org isolation: the DO id is keyed `${org}:${room}`), which runs the

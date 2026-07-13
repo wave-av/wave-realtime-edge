@@ -43,6 +43,9 @@ export interface Env extends EncoderEnv, ResidencySinkEnv, IngestBridgeRuntimeEn
 	// B3 (#98) WHIP v1 ingest flag ([vars], default off). Falsy/absent → the /v1/whip/* surface is inert and
 	// the 501 catch-all is unchanged. Truthy ("1"/"true") → the WHIP listener (src/whip.ts) handles /v1/whip/*.
 	WHIP_INGEST_ENABLED?: string | boolean;
+	// #151 hosted self-host recorder-ingest flag ([vars], default off). Falsy/absent → PUT /v1/realtime/
+	// recording-ingest/* 501s (inert). Truthy → the RoomDO streams the werift-muxed container to R2.
+	RECORDER_INGEST_ENABLED?: string | boolean;
 	// B1 (#91-a) CF Stream bridge flag ([vars], default off). Falsy/absent → POST /v1/stream/bridge/webhook is
 	// inert (501 fall-through). Truthy → the control-plane webhook (src/stream-bridge.ts) handles it.
 	STREAM_BRIDGE_ENABLED?: string | boolean;
@@ -119,6 +122,18 @@ export function presenceEnabled(env: Env): boolean {
  *  :room is REQUIRED so a frame addresses the SAME RoomDO (keyed `${org}:${room}`) holding the publish-path tap;
  *  the capability token binds ONLY (org, sessionId, trackName) — room is a routing key, not signed identity. */
 export const RECORDER_ROUTE = /^\/v1\/realtime\/recorder\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
+/** #151 hosted self-host recorder INGEST: PUT /v1/realtime/recording-ingest/:org/:room/:sessionId/:trackName.
+ *  The self-host werift recorder (containers/rt-recorder) PULLs the SFU track, muxes a WebM/Matroska container,
+ *  and STREAMS the finalized bytes here (one PUT, streamed body). The RoomDO (keyed `${org}:${room}`) appends
+ *  them to its single-writer RealtimeRecorder → the ONE canonical R2 object. Same dual-auth + segment-scope as
+ *  RECORDER_ROUTE (pre-signed capability token OR x-wave-internal). Distinct from the WS frame route: this
+ *  ingests a whole muxed container, not per-frame media. Gated by RECORDER_INGEST_ENABLED (default off → 501). */
+export const RECORDER_INGEST_ROUTE = /^\/v1\/realtime\/recording-ingest\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
+/** #151 recorder-ingest surface flag ([vars], default off → 501 inert). Truthy "1"/"true"/boolean-true arms it. */
+export function recorderIngestEnabled(env: Env): boolean {
+	const v = env.RECORDER_INGEST_ENABLED;
+	return v === true || v === "1" || v === "true";
+}
 /** LK-rip #77 egress control plane the gateway fronts:
  * POST /rtk/egress/start|stop|info. Intent allowlist — anything else is not a recognized egress route. */
 export const EGRESS_INTENTS = new Set(["start", "stop", "info"]);

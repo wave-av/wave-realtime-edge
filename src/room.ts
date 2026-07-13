@@ -561,7 +561,7 @@ export class RoomDO {
    * (fail-open inside metering.ts). The DO never holds media — only state + orchestration.
    */
   async fetch(request: Request): Promise<Response> {
-    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent | "recorder-frame" | "whip-finalize" | "presence" | "agent-bind" | "whip-publish";
+    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent | "recorder-frame" | "recording-ingest" | "whip-finalize" | "presence" | "agent-bind" | "whip-publish";
     // #76 P2 (arch A): fold the agent's media-READ onto this room's single MediaTap. The AGENT dispatch
     // (/bind) additionally forwards the SAME AgentSessionConfig here when MEDIA_TAP_ENABLED is armed, so the
     // RoomDO registers an IN-PROCESS MediaConsumer for the agent's target track — no 2nd SFU subscription, no
@@ -595,6 +595,25 @@ export class RoomDO {
         /* fail-open */
       }
       return new Response(null, { status: 204 });
+    }
+    // #151 HOSTED recorder INGEST: the self-host werift recorder streams a finalized WebM/Matroska container
+    // here (via the Worker /v1/realtime/recording-ingest route). Stream it into the single-writer canonical R2
+    // object. NOT fail-open — the recorder needs the {key,bytes} receipt (this stream IS the recording): a 422
+    // (no bytes / no bucket) or a 500 (write error) is the honest result, never a silent 204.
+    if (intent === "recording-ingest") {
+      const u = new URL(request.url);
+      const org = u.searchParams.get("org") ?? "";
+      const sessionId = u.searchParams.get("sessionId") ?? "";
+      if (!org || !sessionId || !request.body) {
+        return Response.json({ error: "BAD_REQUEST", message: "recording-ingest requires org, sessionId, body" }, { status: 400 });
+      }
+      try {
+        const result = await this.recording.ingestContainer(org, sessionId, request.body);
+        if (!result) return Response.json({ error: "NO_RECORDING", message: "no bytes streamed or no sink bound" }, { status: 422 });
+        return Response.json(result, { status: 200 });
+      } catch (e) {
+        return Response.json({ error: "INGEST_FAILED", message: String((e as Error)?.message ?? e).slice(0, 200) }, { status: 500 });
+      }
     }
     // #145 (#91-C): WHIP teardown drives the recorder FINALIZE here (WHIP DELETE has no `leave` to hang it on).
     // Completes the tap's R2 multipart into the one canonical object. DORMANT for managed (finalize is a no-op

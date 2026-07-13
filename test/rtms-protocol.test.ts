@@ -92,6 +92,15 @@ describe("parseRtmsMessage — inbound frames", () => {
     expect(m.userId).toBe(16778240);
   });
 
+  it("parses MEDIA_DATA_VIDEO(15) and base64-decodes the JPEG payload", () => {
+    const jpeg = new Uint8Array([0xff, 0xd8, 9, 9, 9, 0xff, 0xd9]);
+    const frame = JSON.stringify({ msg_type: 15, content: { user_id: 42, data: bytesToBase64(jpeg) } });
+    const m = parseRtmsMessage(frame);
+    if (m.kind !== "video") throw new Error("wrong");
+    expect(Array.from(m.payload)).toEqual(Array.from(jpeg));
+    expect(m.userId).toBe(42);
+  });
+
   it("parses MEDIA_DATA_TRANSCRIPT(17), returns 'other' for unknown, throws on bad JSON / missing audio data", () => {
     const tr = parseRtmsMessage(JSON.stringify({ msg_type: 17, content: { user_name: "Jake", data: "hello" } }));
     if (tr.kind !== "transcript") throw new Error("wrong");

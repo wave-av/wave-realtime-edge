@@ -39,6 +39,7 @@ import {
 } from "./rtms-protocol.js";
 import { rtmsHandshakeSignature } from "./rtms-auth.js";
 import { rtmsAudioToSfuPcm, int16ToPcmS16Le } from "./rtms-audio.js";
+import { rtmsVideoToSfuJpeg } from "./rtms-video.js";
 import {
   encodeIngestFrame,
   chunkPcm,
@@ -75,6 +76,11 @@ export interface RtmsBridgeDeps {
   createIngest(tracks: IngestAdapterTrack[]): Promise<CreateIngestAdapterResult>;
   /** The DO-held socket the SFU dialed IN on to pull our PCM (null until it connects → frames drop). */
   ingestSocket(): IngestSocket | null;
+  /** #88 WAVE_RTMS_VIDEO — the DO-held socket the SFU dialed IN on to pull our video JPEG stills (null
+   *  until it connects → frames drop). Optional: only meaningful when config.videoEnabled is true; the
+   *  live DO does not yet wire a real video-ingest-sink socket (◆ follow-up slice), so this stays
+   *  undefined in production today and pumpVideo drops every frame — inert, never a fabricated push. */
+  videoIngestSocket?(): IngestSocket | null;
   /** Wall clock (ms) — injectable so any timing instrumentation is deterministic in tests. */
   now(): number;
   /** Structured log sink (JSON line) — injectable so tests can assert emitted instrumentation. */
@@ -93,6 +99,13 @@ export interface BridgeTarget {
   trackName: string;
   /** wss:// our ingest route the SFU dials to pull our PCM (bound to org/session/track). */
   endpoint: string;
+  /** #88 WAVE_RTMS_VIDEO — the video-track name (e.g. `zoom-${meetingUuid}-video`). Only used when the
+   *  flag is on AND both video fields are set; absent → no video track is requested (inert). */
+  videoTrackName?: string;
+  /** #88 WAVE_RTMS_VIDEO — wss:// ingest route the SFU dials to pull our JPEG stills. Same gating as
+   *  videoTrackName. The live DO does not mint this yet (◆ follow-up slice); a caller (or a test) that
+   *  sets it is opting into the video track-push path. */
+  videoEndpoint?: string;
 }
 
 /** Per-bridge config: the Zoom app creds that sign the handshake + the publish target. */
@@ -105,6 +118,10 @@ export interface RtmsBridgeConfig {
   target: BridgeTarget;
   /** Ingest send-side framing; "packet" (default, modeled) | "raw" (a live spike may select). */
   framing?: IngestFraming;
+  /** #88 WAVE_RTMS_VIDEO — default OFF/false. On: the media handshake also subscribes to VIDEO and
+   *  inbound MEDIA_DATA_VIDEO frames are mapped + pushed (see pumpVideo). Off (the default): identical
+   *  to the audio-only bridge — no video subscription, no video track, no video code path entered. */
+  videoEnabled?: boolean;
 }
 
 /**
@@ -126,9 +143,11 @@ export class RtmsBridgeCore {
   private media: RtmsSocket | null = null;
   private signature = "";
   private outSeq = 0;
+  private outVideoSeq = 0; // #88 WAVE_RTMS_VIDEO — independent sequence counter, separate socket/track
   private started = false;
   private closed = false;
   private readonly framing: IngestFraming;
+  private readonly videoEnabled: boolean;
 
   constructor(
     private readonly deps: RtmsBridgeDeps,
@@ -136,6 +155,8 @@ export class RtmsBridgeCore {
   ) {
     // DEFAULT "packet" — symmetric with the verified egress decoder; a live spike may flip to "raw".
     this.framing = config.framing ?? "packet";
+    // DEFAULT false — WAVE_RTMS_VIDEO off is byte-identical to the pre-video audio-only bridge.
+    this.videoEnabled = config.videoEnabled ?? false;
   }
 
   get isStarted(): boolean {
@@ -153,9 +174,16 @@ export class RtmsBridgeCore {
     const t = this.config.target;
     // Tell the SFU to publish a NEW room track sourced from the PCM we send on t.endpoint. mode:"buffer"
     // is REQUIRED for the SFU to actually establish the pull (agent-ingest-adapter.ts §mode).
-    await this.deps.createIngest([
+    const tracks: IngestAdapterTrack[] = [
       { location: "local", sessionId: t.sessionId, trackName: t.trackName, endpoint: t.endpoint, inputCodec: "pcm", mode: "buffer" },
-    ]);
+    ];
+    // #88 WAVE_RTMS_VIDEO — only requests a second (video) track when armed AND the target actually
+    // carries video fields (the live DO does not mint these yet — see BridgeTarget doc). Off/unset →
+    // this block never runs, so createIngest's payload is byte-identical to the audio-only bridge.
+    if (this.videoEnabled && t.videoTrackName && t.videoEndpoint) {
+      tracks.push({ location: "local", sessionId: t.sessionId, trackName: t.videoTrackName, endpoint: t.videoEndpoint, inputCodec: "jpeg", mode: "buffer" });
+    }
+    await this.deps.createIngest(tracks);
     this.signature = await rtmsHandshakeSignature(
       this.config.clientId,
       event.meetingUuid,
@@ -190,7 +218,10 @@ export class RtmsBridgeCore {
         (t) => this.onMedia(event, t),
         () => this.onLegClose("media"),
       );
-      this.media.send(dataHandshakeReq(event.meetingUuid, event.rtmsStreamId, this.signature, RTMS_MEDIA_TYPE.AUDIO));
+      // #88 WAVE_RTMS_VIDEO — off (default): AUDIO only, byte-identical to the pre-video bitmask. On:
+      // also subscribes to VIDEO so Zoom starts sending MEDIA_DATA_VIDEO(15) frames on this leg.
+      const mediaType = this.videoEnabled ? RTMS_MEDIA_TYPE.AUDIO | RTMS_MEDIA_TYPE.VIDEO : RTMS_MEDIA_TYPE.AUDIO;
+      this.media.send(dataHandshakeReq(event.meetingUuid, event.rtmsStreamId, this.signature, mediaType));
       this.deps.log("rtms-bridge-media-open", { meetingUuid: event.meetingUuid });
     } else if (msg.kind === "keepalive_req") {
       this.sig?.send(keepAliveResp(msg.timestamp));
@@ -204,6 +235,9 @@ export class RtmsBridgeCore {
     switch (msg.kind) {
       case "audio":
         this.pumpAudio(msg.payload);
+        break;
+      case "video":
+        this.pumpVideo(msg.payload);
         break;
       case "keepalive_req":
         this.media?.send(keepAliveResp(msg.timestamp));
@@ -234,6 +268,29 @@ export class RtmsBridgeCore {
       }
     } catch (e) {
       this.deps.log("rtms-bridge-audio-error", { message: (e as Error)?.message ?? "unknown" });
+    }
+  }
+
+  /**
+   * One RTMS video frame (a JPEG still) → the SFU video-ingest socket, behind WAVE_RTMS_VIDEO. Mirrors
+   * pumpAudio's fail-safe contract: dropped (not buffered) until the SFU has dialed the video ingest
+   * endpoint, and a transcode/send error is logged + swallowed, never thrown up the socket path. Sent as
+   * ONE ingest Packet per still (no chunking) — symmetric with the egress decode side, which treats one
+   * decoded Packet payload as one whole JPEG (encoders/container-adapter.ts).
+   *
+   * #147 NOTE: pushing this frame into a room track is the INGEST leg only. Whether that track can be
+   * recorded/perceived downstream is a separate, already-known CF-platform block (issue #147) — this
+   * method proves nothing about that and never claims to.
+   */
+  private pumpVideo(rtmsJpeg: Uint8Array): void {
+    if (!this.videoEnabled) return; // defensive — the handshake never subscribes to VIDEO when off
+    const sock = this.deps.videoIngestSocket?.();
+    if (!sock) return; // video ingest not connected yet (or the DO never wired one) → drop
+    try {
+      const jpeg = rtmsVideoToSfuJpeg(rtmsJpeg);
+      sock.send(encodeIngestFrame(jpeg, { sequenceNumber: this.outVideoSeq++, timestamp: 0 }, this.framing));
+    } catch (e) {
+      this.deps.log("rtms-bridge-video-error", { message: (e as Error)?.message ?? "unknown" });
     }
   }
 

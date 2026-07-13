@@ -399,6 +399,11 @@ AV1_DEFAULT = "1"
 # from Doppler wave/prd via the foundation provision-worker-secrets workflow (CF_CALLS_APP_ID is a SECRET on prod
 # too, not a [vars] value — do NOT hardcode it here).
 WHIP_INGEST_ENABLED = "1"
+# #151 (#145-video D) — arm the hosted recorder-INGEST route on the canary: PUT /v1/realtime/recording-ingest/*
+# accepts the self-host werift recorder's streamed WebM and the RoomDO writes the single canonical R2 object.
+# Auth reuses the canary's existing WAVE_INTERNAL_SECRET (gateway trust) — the recorder dials in with a pre-signed
+# capability token, so NO new secret is needed. Canary-only (prod stays inert until a Jake-named flip).
+RECORDER_INGEST_ENABLED = "1"
 WHIP_ROOM_RECORDING = "1"
 # #146 — a WHIP publisher only starts ICE/DTLS AFTER our 201, so its media flows seconds later than an RTK
 # client's. Widen the container create-adapter retry budget (~14 attempts ≈ 12s) so the recorder rides out the

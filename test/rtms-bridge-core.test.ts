@@ -34,11 +34,18 @@ const EVENT: RtmsStartedEvent = {
   serverUrls: "wss://signal.zoom.us",
 };
 
-/** Build a fresh core + capture harness (mock Zoom legs + a capturing SFU ingest sink). */
-function harness(opts?: { ingestConnected?: boolean }) {
+/** Build a fresh core + capture harness (mock Zoom legs + capturing SFU ingest sinks, audio + video). */
+function harness(opts?: {
+  ingestConnected?: boolean;
+  videoEnabled?: boolean;
+  videoIngestConnected?: boolean;
+  withVideoTarget?: boolean;
+}) {
   const legs: FakeLeg[] = [];
   const ingestSent: Uint8Array[] = [];
+  const videoIngestSent: Uint8Array[] = [];
   const sink: IngestSocket = { send: (d) => ingestSent.push(d as Uint8Array), close: () => {} };
+  const videoSink: IngestSocket = { send: (d) => videoIngestSent.push(d as Uint8Array), close: () => {} };
   const connect = async (url: string, onMessage: (t: string) => void | Promise<void>, onClose?: () => void): Promise<RtmsSocket> => {
     const leg: FakeLeg = { url, onMessage, onClose, sent: [], closed: false };
     legs.push(leg);
@@ -49,21 +56,29 @@ function harness(opts?: { ingestConnected?: boolean }) {
     connect,
     createIngest,
     ingestSocket: () => (opts?.ingestConnected ? sink : null),
+    videoIngestSocket: () => (opts?.videoIngestConnected ? videoSink : null),
     now: () => 0,
     log: () => {},
   };
   const config: RtmsBridgeConfig = {
     clientId: "APPID123",
     clientSecret: "s3cr3t",
+    videoEnabled: opts?.videoEnabled,
     target: {
       appId: "a".repeat(32),
       bearer: "sfu-bearer",
       sessionId: "sess-12345678",
       trackName: "zoom-mtg",
       endpoint: "wss://rt.wave.online/zoom/rtms/ingest/mtg-uuid-xyz/org/sess-12345678/zoom-mtg?t=tok",
+      ...(opts?.withVideoTarget
+        ? {
+            videoTrackName: "zoom-mtg-video",
+            videoEndpoint: "wss://rt.wave.online/zoom/rtms/ingest/mtg-uuid-xyz/org/sess-12345678/zoom-mtg-video?t=tok",
+          }
+        : {}),
     },
   };
-  return { core: new RtmsBridgeCore(deps, config), legs, ingestSent, createIngest, config };
+  return { core: new RtmsBridgeCore(deps, config), legs, ingestSent, videoIngestSent, createIngest, config };
 }
 
 const ackFrame = (audioUrl: string): string =>
@@ -174,5 +189,59 @@ describe("pickMediaUrl", () => {
     expect(pickMediaUrl({ all: "x", video: "v" })).toBe("x");
     expect(pickMediaUrl({ video: "v" })).toBe("v");
     expect(pickMediaUrl({})).toBeNull();
+  });
+});
+
+describe("RtmsBridgeCore — video (WAVE_RTMS_VIDEO)", () => {
+  it("flag off (default): media handshake requests AUDIO only, no video track requested", async () => {
+    const { core, legs, createIngest } = harness();
+    await core.start(EVENT);
+    const tracks = createIngest.mock.calls[0][0] as Array<Record<string, unknown>>;
+    expect(tracks).toHaveLength(1);
+    await legs[0].onMessage(ackFrame("wss://media.zoom.us/audio"));
+    const sig = await rtmsHandshakeSignature("APPID123", EVENT.meetingUuid, EVENT.rtmsStreamId, "s3cr3t");
+    expect(legs[1].sent[0]).toBe(dataHandshakeReq(EVENT.meetingUuid, EVENT.rtmsStreamId, sig, RTMS_MEDIA_TYPE.AUDIO));
+  });
+
+  it("flag on + a video target: requests AUDIO|VIDEO and a second inputCodec:jpeg track", async () => {
+    const { core, legs, createIngest } = harness({ videoEnabled: true, withVideoTarget: true });
+    await core.start(EVENT);
+    const tracks = createIngest.mock.calls[0][0] as Array<Record<string, unknown>>;
+    expect(tracks).toHaveLength(2);
+    expect(tracks[1]).toMatchObject({ inputCodec: "jpeg", mode: "buffer", trackName: "zoom-mtg-video" });
+    await legs[0].onMessage(ackFrame("wss://media.zoom.us/audio"));
+    const sig = await rtmsHandshakeSignature("APPID123", EVENT.meetingUuid, EVENT.rtmsStreamId, "s3cr3t");
+    expect(legs[1].sent[0]).toBe(
+      dataHandshakeReq(EVENT.meetingUuid, EVENT.rtmsStreamId, sig, RTMS_MEDIA_TYPE.AUDIO | RTMS_MEDIA_TYPE.VIDEO),
+    );
+  });
+
+  it("flag on + video ingest connected: maps one MEDIA_DATA_VIDEO frame to one ingest Packet, unchanged bytes", async () => {
+    const { core, legs, videoIngestSent } = harness({ videoEnabled: true, withVideoTarget: true, videoIngestConnected: true });
+    await core.start(EVENT);
+    await legs[0].onMessage(ackFrame("wss://media.zoom.us/audio"));
+    const jpeg = Uint8Array.from([0xff, 0xd8, 7, 7, 7, 0xff, 0xd9]);
+    await legs[1].onMessage(JSON.stringify({ msg_type: 15, content: { user_id: 5, data: bytesToBase64(jpeg) } }));
+    const expected = encodeIngestFrame(jpeg, { sequenceNumber: 0, timestamp: 0 }, "packet");
+    expect(videoIngestSent).toHaveLength(1);
+    expect(videoIngestSent[0]).toEqual(expected);
+  });
+
+  it("flag on but video ingest socket not connected: drops the frame, no throw", async () => {
+    const { core, legs, videoIngestSent } = harness({ videoEnabled: true, withVideoTarget: true, videoIngestConnected: false });
+    await core.start(EVENT);
+    await legs[0].onMessage(ackFrame("wss://media.zoom.us/audio"));
+    const jpeg = Uint8Array.from([0xff, 0xd8, 1, 0xff, 0xd9]);
+    await legs[1].onMessage(JSON.stringify({ msg_type: 15, content: { data: bytesToBase64(jpeg) } }));
+    expect(videoIngestSent).toHaveLength(0);
+  });
+
+  it("flag OFF: a MEDIA_DATA_VIDEO frame is ignored even if a video ingest socket exists (off-path never invoked)", async () => {
+    const { core, legs, videoIngestSent } = harness({ videoEnabled: false, videoIngestConnected: true });
+    await core.start(EVENT);
+    await legs[0].onMessage(ackFrame("wss://media.zoom.us/audio"));
+    const jpeg = Uint8Array.from([0xff, 0xd8, 2, 0xff, 0xd9]);
+    await legs[1].onMessage(JSON.stringify({ msg_type: 15, content: { data: bytesToBase64(jpeg) } }));
+    expect(videoIngestSent).toHaveLength(0);
   });
 });
