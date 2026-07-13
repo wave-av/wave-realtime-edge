@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { streamFileToSink } from "../server/stream-to-sink.mjs";
+import { recordTrackToSink } from "../server/record-to-sink.mjs";
 
 /** In-memory sink implementing the RecordingSink contract; lazy-begins its key on the first non-empty write. */
 function memSink() {
@@ -63,5 +64,44 @@ describe("streamFileToSink — file → sink in ordered chunks", () => {
     await streamFileToSink(fakeFs(Buffer.alloc(0)), "/tmp/empty.webm", sink, 1024);
     expect(sink.parts.length).toBe(0);
     expect(sink.key).toBe(null);
+  });
+});
+
+describe("recordTrackToSink — #153 native-transcode routing (injected fakes, no live SFU/ffmpeg)", () => {
+  const fs = { rmSync: () => {} };
+
+  it("werift-safe codec → streams the recorder's WebM to the sink (routed:mediarecorder)", async () => {
+    const content = Buffer.from("WEBM" + "b".repeat(2000));
+    const sink = memSink();
+    const subscribe = async ({ webmPath }) => ({ routed: "mediarecorder", codec: "VP9", webmPath, stats: { frames: 100 } });
+    const out = await recordTrackToSink({ recorder: {}, fs: fakeFs(content), tmpPath: "/tmp/x.webm", sink, chunkBytes: 1024, subscribe });
+    expect(out.routed).toBe("mediarecorder");
+    expect(out.result.bytes).toBe(content.length);
+  });
+
+  it("AV1 native input → transcodes to WebM and streams to the SAME sink (routed:native-transcode)", async () => {
+    const webm = Buffer.from("WEBM" + "c".repeat(3000));
+    const sink = memSink();
+    // Recorder routed native + captured an input (a file / the SDP bridge); ffmpeg is faked to "produce" the WebM.
+    const subscribe = async () => ({ routed: "native-transcode", codec: "AV1", nativeInput: { input: "/tmp/raw.ivf" }, stats: { pkts: 120 } });
+    const transcode = async ({ input, codec, outPath }) => {
+      expect(input).toBe("/tmp/raw.ivf");
+      expect(codec).toBe("AV1");
+      return { outPath, bytes: webm.length, container: "webm", codec: "av1" };
+    };
+    const out = await recordTrackToSink({ recorder: {}, fs: fakeFs(webm), tmpPath: "/tmp/out.webm", sink, chunkBytes: 1024, subscribe, transcode });
+    expect(out.routed).toBe("native-transcode");
+    expect(out.codec).toBe("av1"); // H265 would report av1 too; AV1 rewraps to av1
+    expect(out.result.bytes).toBe(webm.length); // the transcoded bytes reached the canonical sink
+  });
+
+  it("native codec with NO capture bridge → honest signal, sink untouched", async () => {
+    const sink = memSink();
+    const subscribe = async () => ({ routed: "native-transcode", codec: "H265", reason: "no bridge yet", stats: {} });
+    const transcode = async () => { throw new Error("must not transcode without a native input"); };
+    const out = await recordTrackToSink({ recorder: {}, fs, tmpPath: "/tmp/x", sink, subscribe, transcode });
+    expect(out.routed).toBe("native-transcode");
+    expect(out.reason).toBe("no bridge yet");
+    expect(sink.parts.length).toBe(0); // nothing written — the caller takes the native path
   });
 });
