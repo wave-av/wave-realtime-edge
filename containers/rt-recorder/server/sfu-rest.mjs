@@ -17,10 +17,19 @@
  * Build an SFU REST client bound to one app's creds.
  * @param {{ fetchImpl?: typeof fetch, sfuBase?: string, appId: string, appSecret: string }} cfg
  */
+/** Strip trailing '/' (charCode 47) via one linear scan from the end — no regex, no backtracking (ReDoS-safe). */
+function trimTrailingSlashes(s) {
+  let end = s.length;
+  while (end > 0 && s.charCodeAt(end - 1) === 47) end--;
+  return s.slice(0, end);
+}
+
 export function makeSfuClient({ fetchImpl, sfuBase, appId, appSecret }) {
   if (!appId || !appSecret) throw new Error("makeSfuClient: appId + appSecret required");
   const doFetch = (fetchImpl ?? fetch).bind(globalThis);
-  const base = (sfuBase ?? "https://rtc.live.cloudflare.com/v1").replace(/\/+$/, "");
+  // Trim trailing slashes with a single linear scan — NOT a backtracking regex like /\/+$/ (CodeQL
+  // js/polynomial-redos: an unanchored `+` is retried from every position → O(n²) on a long slash run).
+  const base = trimTrailingSlashes(sfuBase ?? "https://rtc.live.cloudflare.com/v1");
   const auth = { Authorization: `Bearer ${appSecret}`, "Content-Type": "application/json" };
   const url = (path) => `${base}/apps/${appId}${path}`;
 

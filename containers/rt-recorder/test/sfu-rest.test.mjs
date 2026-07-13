@@ -69,4 +69,11 @@ describe("makeSfuClient — the proven three-call subscribe handshake", () => {
   it("requires appId + appSecret", () => {
     expect(() => makeSfuClient({ appId: "", appSecret: "x" })).toThrow(/required/);
   });
+
+  it("trims trailing slashes from sfuBase (linear, ReDoS-safe) without doubling the path slash", async () => {
+    const f = fakeFetch({ "/sessions/new": { status: 201, body: { sessionId: "s" } } });
+    const client = makeSfuClient({ ...CREDS, sfuBase: "https://sfu.example/v1///", fetchImpl: f });
+    await client.createSession("x");
+    expect(f.calls[0].url).toBe("https://sfu.example/v1/apps/abc123/sessions/new");
+  });
 });
