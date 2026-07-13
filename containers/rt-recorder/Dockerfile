@@ -23,6 +23,11 @@ COPY package.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 COPY server/ ./server/
 
+# Run as a NON-ROOT user (defense in depth — semgrep missing-user-entrypoint). The recorder needs no root:
+# ICE/DTLS use ephemeral UDP ports (>1024), it writes only to os.tmpdir(), and holds no creds at rest.
+RUN useradd --system --uid 10001 --home-dir /app --shell /usr/sbin/nologin recorder
+USER recorder
+
 # ONE track per process (12-factor): the RoomDO dispatches one recorder per published track with a fresh
 # descriptor + pre-signed ingest endpoint in the environment. No long-lived server, no state, no creds at rest.
 ENTRYPOINT ["node", "server/run.mjs"]
