@@ -195,14 +195,23 @@ export class Signaling {
   /**
    * WHIP-PUBLISH (#144 / #91-B): the ingress equivalent of join+publish, run INSIDE the RoomDO so the room
    * owns the single-writer recorder + capability negotiation for a direct-WHIP publish (which the bare
-   * `sfu.newSession(offer)` in whip.ts bypasses). Flow (mirrors join → publish, but the tracks are SERVER-
-   * derived from the SDP because WHIP carries no explicit track list):
-   *   1. ensureRoom + newSession(offer) → sessionId + the SFU's SDP answer (the WHIP 201 body).
-   *   2. seat the publisher as a participant (so registerTrack's presence invariant holds).
-   *   3. parse the answer/offer m-lines → (mid, kind); assign each a deterministic trackName; name them on the
-   *      SFU (best-effort — media is already live from newSession), register in the room, and arm the recorder
-   *      via onPublish. onPublish is the SAME recorder+negotiation arm the room `publish` intent uses.
-   * RECORDING IS FAIL-OPEN: a naming/register/record error never fails the publish (media-safety > recording).
+   * `sfu.newSession(offer)` in whip.ts bypasses). WHIP carries no explicit track list, so the tracks are
+   * SERVER-derived from the OFFER's media sections.
+   *
+   * #146 — uses CF's STANDARD local-publish handshake so track-naming is ATOMIC with transport establishment:
+   *   1. ensureRoom + newSession() → an EMPTY session id (no offer consumed yet).
+   *   2. parse the OFFER m-lines → (mid, kind); assign each a deterministic trackName.
+   *   3. pushTracks(local tracks, OFFER) — ONE tracks/new that BOTH establishes the transport (the offer is the
+   *      client's SDP) AND names the tracks; CF returns the answer (the WHIP 201 body). The tracks exist the
+   *      instant we return the answer.
+   *   4. seat the publisher (registerTrack's presence invariant) and, per named track, register + arm the
+   *      recorder (onPublish — the SAME arm the room `publish` intent uses).
+   *
+   * Why not newSession(offer) + tracks/new(no-offer) (the prior shape)? That 425s "Too Early": the WHIP client
+   * only applies the answer AFTER our 201 returns, so a no-offer tracks/new races ahead of the client's DTLS
+   * and CF has no established transport to name a local track against. Carrying the offer IN tracks/new makes
+   * the offer itself the establishing SDP, so naming never races the (still-connecting) client.
+   * RECORDING IS FAIL-OPEN: a register/record error never fails the publish (media-safety > recording).
    */
   async whipPublish(ctx: SignalContext, opts: { offer: SessionDescription }): Promise<{
     sessionId: string;
@@ -214,49 +223,45 @@ export class Signaling {
       throw new SignalError("BAD_REQUEST", "whip-publish requires an SDP offer", 400);
     }
     await this.room.ensureRoom({ roomId: ctx.room, org: ctx.org, type: ctx.type });
-    const session = await this.sfu.newSession(opts.offer);
-    const answer = session.sessionDescription;
-    if (!answer || answer.type !== "answer" || !answer.sdp) {
-      throw new SignalError("REALTIME_UPSTREAM", "SFU did not return an SDP answer for the WHIP offer", 502);
+    // Empty session first (no offer) — the offer rides the tracks/new below so naming is atomic with transport.
+    const { sessionId } = await this.sfu.newSession();
+    // Derive the tracks from the OFFER's media sections (the answer isn't back yet) and assign url-safe names.
+    const parsed = parseSdpTracks(opts.offer.sdp);
+    if (parsed.length === 0) {
+      throw new SignalError("BAD_REQUEST", "WHIP offer carries no audio/video media sections", 400);
     }
-    // Seat the ingress publisher (speaker) so the room's registry/recorder can attribute their tracks.
-    await this.room.joinRoom(ctx.org, {
-      participantId: ctx.participantId,
-      sessionId: session.sessionId,
-      role: ctx.role ?? "speaker",
-    });
-    // WHIP carries no track names → derive them from the negotiated media sections (answer, falling back to
-    // the offer) and assign deterministic, url-safe SFU trackNames.
-    const parsed = parseSdpTracks(answer.sdp || opts.offer.sdp);
     const named = parsed.map((t) => ({
       mid: t.mid,
-      trackName: buildWhipTrackName(session.sessionId, t.mid),
+      trackName: buildWhipTrackName(sessionId, t.mid),
       kind: t.kind as TrackKind,
     }));
+    const local: LocalTrack[] = named.map((n) => ({ location: "local", mid: n.mid, trackName: n.trackName }));
+    // ONE tracks/new carrying the OFFER: establishes transport + names every local track; returns the answer.
+    const pushed = await this.sfu.pushTracks(sessionId, local, opts.offer);
+    const answer = pushed.sessionDescription;
+    if (!answer || answer.type !== "answer" || !answer.sdp) {
+      throw new SignalError("REALTIME_UPSTREAM", "SFU did not return an SDP answer for the WHIP publish", 502);
+    }
+    // Seat the ingress publisher (speaker) so the room's registry/recorder can attribute their tracks.
+    await this.room.joinRoom(ctx.org, { participantId: ctx.participantId, sessionId, role: ctx.role ?? "speaker" });
     for (const n of named) {
-      // Name the (already-live) track on the SFU so it is pullable/recordable by name. Best-effort: the media
-      // is live from newSession; a naming hiccup must not fail the publish (the live #145 receipt validates
-      // the exact CF handshake). Then register + arm the recorder (onPublish), each fail-open.
-      try {
-        const local: LocalTrack[] = [{ location: "local", mid: n.mid, trackName: n.trackName }];
-        await this.sfu.pushTracks(session.sessionId, local);
-      } catch {
-        /* naming best-effort — media already live on the SFU */
-      }
+      // Register in the room + arm the recorder. The track is already NAMED on the SFU (step 3), so the
+      // recorder's create-adapter rides out only the media-FLOW race (its designed budget) — never a
+      // never-named track. Each step fail-open: recording/registry never blocks the WHIP publish.
       try {
         await this.room.registerTrack(ctx.org, {
           trackName: n.trackName,
-          sessionId: session.sessionId,
+          sessionId,
           participantId: ctx.participantId,
           kind: n.kind,
         });
         await emitEvent(this.eventEnv, buildTrackPublished({ org: ctx.org, room: ctx.room }, ctx.participantId, { name: n.trackName, kind: n.kind }));
-        if (this.recording) await this.recording.onPublish(ctx.org, session.sessionId, ctx.room, n.trackName, n.kind);
+        if (this.recording) await this.recording.onPublish(ctx.org, sessionId, ctx.room, n.trackName, n.kind);
       } catch {
         /* fail-open — recording/registry never blocks the WHIP publish */
       }
     }
-    return { sessionId: session.sessionId, sessionDescription: answer, tracks: named };
+    return { sessionId, sessionDescription: answer, tracks: named };
   }
 
   /**

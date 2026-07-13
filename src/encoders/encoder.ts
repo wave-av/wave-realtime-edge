@@ -36,6 +36,7 @@ export interface EncoderEnv {
   RT_RECORDINGS?: R2Bucket; // the SKIP sink bucket — the webhook pull writes the finished recording here (RT-P2.4 ◆)
   RT_ENCODER?: EncoderKind; // selector; default "managed" (C)
   RT_RECORD?: string; // "1" to arm recording at all (default OFF — fully inert)
+  RT_ADAPTER_MAX_ATTEMPTS?: string; // #146 container create-adapter retry budget override (WHIP media starts later); absent → RTK default (7)
   // adapter A: signs the per-(org,session,track) capability token the SFU appends to the recorder route URL
   // (?t=...) so it can authenticate the dial-in WITHOUT the internal header. Unset → no token (local/test).
   WAVE_INTERNAL_SECRET?: string;

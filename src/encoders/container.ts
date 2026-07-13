@@ -90,6 +90,17 @@ export const DEFAULT_RECORDER_ENDPOINT_BASE = "wss://rt.wave.online/v1/realtime/
 export const DEFAULT_ADAPTER_RETRY: AdapterRetry = { maxAttempts: 7 };
 
 /**
+ * #146 — the RTK default (7 ≈ 4.5s) assumes an ALREADY-connected publisher (media within ~hundreds of ms).
+ * A WHIP publisher only starts its ICE/DTLS AFTER our 201 returns, so media flows seconds later; the
+ * create-adapter needs a longer window. `RT_ADAPTER_MAX_ATTEMPTS` (env) overrides it without a code change
+ * (canary uses ~14 ≈ 12s); absent/invalid → the RTK default. delayMs still caps at ~1s/attempt.
+ */
+export function adapterRetryFromEnv(env: EncoderEnv): AdapterRetry {
+  const n = Number(env.RT_ADAPTER_MAX_ATTEMPTS);
+  return Number.isFinite(n) && n >= 1 ? { maxAttempts: Math.floor(n) } : DEFAULT_ADAPTER_RETRY;
+}
+
+/**
  * ContainerEncoder (adapter A). Constructed armed by the factory (`RT_RECORD==="1"` + `RT_ENCODER="container"`).
  * `begin` returns a `ContainerHandle` when configured, else `null` (loud-warn, never throw — fail-open).
  */
@@ -107,7 +118,7 @@ export class ContainerEncoder implements RecordingEncoder {
     // binding makes every call site safe (a no-op for an injected test fake). See managed.ts for the same fix.
     this.fetchImpl = (deps.fetchImpl ?? fetch).bind(globalThis);
     this.recorderBase = (deps.recorderEndpointBase ?? DEFAULT_RECORDER_ENDPOINT_BASE).replace(/\/+$/, "");
-    this.retry = deps.retry ?? DEFAULT_ADAPTER_RETRY;
+    this.retry = deps.retry ?? adapterRetryFromEnv(this.env);
     this.localWriterFor = deps.localWriterFor; // undefined on Worker (inert); self-host injects the fs writer
   }
 
