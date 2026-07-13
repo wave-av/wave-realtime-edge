@@ -1,0 +1,14 @@
+{
+  "name": "wave-rt-recorder",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-host raw-SFU track recorder (#151/#145-video D): werift recvonly PULL → MediaRecorder → WebM → sink. Node-only (werift needs node:dgram); never runs in the Worker isolate.",
+  "main": "server/sfu-track-recorder.mjs",
+  "scripts": {
+    "test": "vitest run --config vitest.config.mjs"
+  },
+  "dependencies": {
+    "werift": "0.23.0"
+  }
+}
