@@ -147,8 +147,18 @@ async function subscribe(pubSession, trackName, webmPath) {
       distinctFrames: distinctTs.size, sourceFps: secs ? Number((distinctTs.size / secs).toFixed(2)) : 0, plisSent,
     };
   };
-  const stop = async () => { clearInterval(pliPump); try { await recorder.stop(); } catch (e) { log("rec-stop-err", { err: String(e).slice(0, 120) }); } try { pc.close(); } catch {} };
-  return { result, stop };
+  const stop = async () => {
+    clearInterval(pliPump);
+    // Hang-proof: some codecs' WebM finalization can stall — never let stop() block the PROOF line.
+    try { await Promise.race([recorder.stop(), new Promise((r) => setTimeout(r, 4000))]); }
+    catch (e) { log("rec-stop-err", { err: String(e).slice(0, 120) }); }
+    try { pc.close(); } catch {}
+  };
+  // expose the received payloadType so we can confirm the browser actually SENT the requested codec.
+  const recvPt = () => { let pt = null; return { get: () => pt, set: (v) => { if (pt == null) pt = v; } }; };
+  const ptTrack = recvPt();
+  pc.onTrack.subscribe((track) => track.onReceiveRtp.subscribe((rtp) => ptTrack.set(rtp.header.payloadType)));
+  return { result: () => ({ ...result(), recvPt: ptTrack.get() }), stop };
 }
 
 // ffprobe the muxed WebM = the iron receipt: real container, real codec, real frame count/fps, decodable.
