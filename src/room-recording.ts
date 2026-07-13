@@ -3,9 +3,40 @@
 // same class the RoomDO holds; type-only imports from ./room.js keep the split cycle-free.
 import { selectEncoder } from "./encoders/factory.js";
 import { R2Sink } from "./encoders/recording-sink.js";
+import { mintRecorderToken } from "./encoders/recorder-auth.js";
 import type { RecordingResult } from "./recording-writer.js";
 import type { EncoderEnv, EncoderHandle, RecordingEncoder } from "./encoders/encoder.js";
 import type { RoomDOEnv, RoomStorage, TrackKind } from "./room.js";
+
+/** The CF Realtime SFU base the self-host recorder PULLs the published track from (mirrors sfu.ts
+ *  DEFAULT_BASE_URL). Fixed — no request-derived URLs (SSRF-safe). The recorder appends /apps/{appId}/… */
+const SFU_BASE = "https://rtc.live.cloudflare.com/v1";
+/** TTL the dispatch mints tokens with (matches recorder-auth DEFAULT_TTL_SEC). Surfaced so the orchestrator
+ *  knows when to re-request before the token expires mid-recording of a long session. */
+const DISPATCH_TOKEN_TTL_SEC = 7200;
+
+/**
+ * #151 — one recorder job the internal orchestrator should run. Carries everything a self-host werift recorder
+ * (containers/rt-recorder) or a spawned CF Container needs to PULL exactly one published SFU track and STREAM
+ * the muxed container back to the ingest route — EXCEPT the SFU app secret (CF_CALLS_APP_SECRET), which the
+ * recorder reads from its OWN environment (container env / doppler). No secret is ever carried in this shape.
+ */
+export interface RecorderDispatch {
+  org: string;
+  room: string;
+  /** The publisher's SFU session id — the recorder pulls the remote track from here. */
+  publisherSessionId: string;
+  trackName: string;
+  kind: TrackKind;
+  /** CF Realtime SFU base + app id for the pull (the app SECRET comes from the recorder's own env). */
+  sfuBase: string;
+  appId: string;
+  /** Path to PUT the finalized container to (compose with the worker origin the orchestrator knows). */
+  ingestPath: string;
+  /** Track-scoped, short-lived capability token — append as `?t=` to the ingest URL (recorder holds no secret). */
+  token: string;
+  ttlSec: number;
+}
 
 /**
  * RT-R9 — per-DO raw-SFU recording orchestrator. Holds the lazily-built recording encoder + one EncoderHandle
@@ -81,6 +112,41 @@ export class RoomRecording {
       await sink.abort();
       throw e;
     }
+  }
+
+  /**
+   * #151 — build the recorder-dispatch list for a room: one {@link RecorderDispatch} per registered track, each
+   * with a freshly-minted, track-scoped ingest capability token. Called by the RoomDO `recorder-dispatch` intent
+   * (gateway-gated upstream) so the INTERNAL orchestrator can spawn/point a recorder at each published track. The
+   * mint uses WAVE_INTERNAL_SECRET, which lives in THIS DO — so a token minted here verifies at the ingest route
+   * by construction, whatever the secret's value. Returns [] when the secret is unset (local/test) — an unusable
+   * descriptor is never emitted (config-no-silent-noop). NEVER returns CF_CALLS_APP_SECRET or WAVE_INTERNAL_SECRET.
+   */
+  async buildDispatch(
+    org: string,
+    room: string,
+    tracks: ReadonlyArray<{ trackName: string; sessionId: string; kind: TrackKind }>,
+  ): Promise<RecorderDispatch[]> {
+    const secret = this.env.WAVE_INTERNAL_SECRET;
+    if (!secret) return []; // no secret → the ingest route can't verify a token → don't emit an unusable descriptor
+    const appId = this.env.CF_CALLS_APP_ID ?? "";
+    const out: RecorderDispatch[] = [];
+    for (const t of tracks) {
+      const token = await mintRecorderToken(secret, org, t.sessionId, t.trackName, { ttlSec: DISPATCH_TOKEN_TTL_SEC });
+      out.push({
+        org,
+        room,
+        publisherSessionId: t.sessionId,
+        trackName: t.trackName,
+        kind: t.kind,
+        sfuBase: SFU_BASE,
+        appId,
+        ingestPath: `/v1/realtime/recording-ingest/${org}/${room}/${t.sessionId}/${t.trackName}`,
+        token,
+        ttlSec: DISPATCH_TOKEN_TTL_SEC,
+      });
+    }
+    return out;
   }
 
   /** Feed ONE decoded WS media frame to the tap for (sessionId, trackName) — used by the Worker recorder route. */

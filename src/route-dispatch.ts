@@ -41,6 +41,7 @@ import { maybeHandleCanaryProof } from "./canary-proof";
 // #151 hosted recorder INGEST (PUT /v1/realtime/recording-ingest/*) — leaf module keeps this router under the
 // file-size gate. INERT behind RECORDER_INGEST_ENABLED (default off → 501).
 import { maybeHandleRecordingIngest } from "./recording-ingest-route";
+import { maybeHandleRecorderDispatch } from "./recorder-dispatch-route";
 // Env shape, route-match constants, and the auth/deps/sink plumbing — extracted to a leaf module (task #56) so
 // neither file exceeds 800 lines. dispatch-helpers.ts imports nothing from here (no cycle).
 import {
@@ -285,6 +286,12 @@ export async function dispatch(
 	// Delegated to a leaf module (recording-ingest-route.ts) so this router stays under the file-size gate.
 	const recIngest = await maybeHandleRecordingIngest(request, url, env);
 	if (recIngest) return recIngest;
+
+	// ── #151 recorder-DISPATCH — POST /v1/realtime/recorder-dispatch/:org/:room ──
+	// Internal orchestrator asks the RoomDO what to record + gets pre-signed ingest tokens. Leaf module keeps
+	// this router under the file-size gate. Gateway-trust ONLY (it mints tokens); shares RECORDER_INGEST_ENABLED.
+	const recDispatch = await maybeHandleRecorderDispatch(request, url, env);
+	if (recDispatch) return recDispatch;
 
 	// ── P5 CF-Calls SFU control plane — POST /v1/realtime/rooms/:room/:intent ──
 	// Routed through the Room DO (per-org isolation: the DO id is keyed `${org}:${room}`), which runs the

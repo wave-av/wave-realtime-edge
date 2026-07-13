@@ -129,6 +129,14 @@ export const RECORDER_ROUTE = /^\/v1\/realtime\/recorder\/([^/]+)\/([^/]+)\/([^/
  *  RECORDER_ROUTE (pre-signed capability token OR x-wave-internal). Distinct from the WS frame route: this
  *  ingests a whole muxed container, not per-frame media. Gated by RECORDER_INGEST_ENABLED (default off → 501). */
 export const RECORDER_INGEST_ROUTE = /^\/v1\/realtime\/recording-ingest\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
+/** #151 recorder-DISPATCH: POST /v1/realtime/recorder-dispatch/:org/:room. An INTERNAL orchestrator (the
+ *  container spawner in prod, or the self-host recorder driver) asks the RoomDO "what should I record here,
+ *  and with what pre-signed ingest URL?". The DO answers with one descriptor per registered track, each
+ *  carrying a freshly-minted, track-scoped ingest capability token (minted with WAVE_INTERNAL_SECRET, which
+ *  lives IN the DO — so mint here and verify at the ingest route ALWAYS agree, regardless of the secret's
+ *  value). Internal-ONLY (no token alternative — this MINTS tokens): gateway-trust (x-wave-internal) required.
+ *  Shares the RECORDER_INGEST_ENABLED flag (default off → 501 inert). Never returns any secret. */
+export const RECORDER_DISPATCH_ROUTE = /^\/v1\/realtime\/recorder-dispatch\/([^/]+)\/([^/]+)\/?$/;
 /** #151 recorder-ingest surface flag ([vars], default off → 501 inert). Truthy "1"/"true"/boolean-true arms it. */
 export function recorderIngestEnabled(env: Env): boolean {
 	const v = env.RECORDER_INGEST_ENABLED;
