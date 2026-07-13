@@ -400,6 +400,10 @@ AV1_DEFAULT = "1"
 # too, not a [vars] value — do NOT hardcode it here).
 WHIP_INGEST_ENABLED = "1"
 WHIP_ROOM_RECORDING = "1"
+# #146 — a WHIP publisher only starts ICE/DTLS AFTER our 201, so its media flows seconds later than an RTK
+# client's. Widen the container create-adapter retry budget (~14 attempts ≈ 12s) so the recorder rides out the
+# WHIP publish→media-flow gap instead of exhausting the RTK-tuned default (7 ≈ 4.5s) before media arrives.
+RT_ADAPTER_MAX_ATTEMPTS = "14"
 
 # Canary recordings bucket — a DISTINCT bucket so canary recordings never mix with prod. Created in the deploy
 # step (`wrangler r2 bucket create wave-realtime-recordings-canary`); --dry-run tolerates a not-yet-existing

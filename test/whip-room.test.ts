@@ -146,10 +146,11 @@ describe("#144 Signaling.whipPublish", () => {
     const room = new RoomCore(memStorage() as never);
     const pushed: unknown[] = [];
     const sfu = {
-      newSession: async () => ({ sessionId: "sessWhip01", sessionDescription: { type: "answer", sdp: SDP_AV } }),
+      // #146 pattern-2: empty newSession, then ONE pushTracks carrying the offer returns the answer + names tracks.
+      newSession: async () => ({ sessionId: "sessWhip01" }),
       pushTracks: async (_s: string, tracks: unknown) => {
         pushed.push(tracks);
-        return { tracks: [] };
+        return { sessionDescription: { type: "answer", sdp: SDP_AV }, tracks: [] };
       },
     } as never;
     const recorded: { sessionId: string; trackName: string; kind: string }[] = [];
@@ -178,14 +179,16 @@ describe("#144 Signaling.whipPublish", () => {
       "whip-sessWhip01-0",
       "whip-sessWhip01-1",
     ]);
-    expect(pushed.length).toBe(2); // each track named on the SFU
+    // ONE tracks/new carrying the offer names BOTH local tracks atomically (no per-track re-offer).
+    expect(pushed.length).toBe(1);
+    expect((pushed[0] as unknown[]).length).toBe(2);
   });
 
   it("is FAIL-OPEN: a recorder onPublish throw never fails the publish", async () => {
     const room = new RoomCore(memStorage() as never);
     const sfu = {
-      newSession: async () => ({ sessionId: "sessWhip02", sessionDescription: { type: "answer", sdp: SDP_AV } }),
-      pushTracks: async () => ({ tracks: [] }),
+      newSession: async () => ({ sessionId: "sessWhip02" }),
+      pushTracks: async () => ({ sessionDescription: { type: "answer", sdp: SDP_AV }, tracks: [] }),
     } as never;
     const recording: RecordingHook = {
       onPublish: async () => {
