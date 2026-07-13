@@ -77,6 +77,11 @@ export interface Env extends EncoderEnv, ResidencySinkEnv, IngestBridgeRuntimeEn
 	// ── Task #81 voice-agent runtime — ALL inert unless VOICE_AGENT_PROVIDER==="wave" ──
 	VOICE_AGENT_PROVIDER?: string; // "wave" arms the voice-agent dispatch + egress routes; else fully inert
 	AGENT_SESSION?: RoomNamespace; // Durable Object binding (wrangler AGENT_SESSION → AgentSessionDO)
+	// ── #76 Twilio Media-Stream ↔ room bridge flag ([vars], default off). Falsy/absent → the wss root
+	// telephony route (src/telephony-ws.ts) is inert (maybeHandleTelephonyStream returns null → the request
+	// falls through to the 501 catch-all, UNCHANGED). Truthy ("1"/"true") → the Twilio Media-Stream inbound
+	// socket is served. Arming it in any live env is a ◆ (a real inbound phone call must prove the path).
+	WAVE_TELEPHONY_STREAM?: string | boolean;
 	// ── E3.P2/P4 (#127) DATA-RESIDENCY fields come from ResidencySinkEnv (src/residency-sink.ts); inert unless RT_RESIDENCY. ──
 }
 
@@ -140,6 +145,11 @@ export const RECORDER_DISPATCH_ROUTE = /^\/v1\/realtime\/recorder-dispatch\/([^/
 /** #151 recorder-ingest surface flag ([vars], default off → 501 inert). Truthy "1"/"true"/boolean-true arms it. */
 export function recorderIngestEnabled(env: Env): boolean {
 	const v = env.RECORDER_INGEST_ENABLED;
+	return v === true || v === "1" || v === "true";
+}
+/** #76 Twilio telephony-stream surface flag ([vars], default off → inert). Truthy "1"/"true"/boolean-true arms it. */
+export function telephonyStreamEnabled(env: Env): boolean {
+	const v = env.WAVE_TELEPHONY_STREAM;
 	return v === true || v === "1" || v === "true";
 }
 /** LK-rip #77 egress control plane the gateway fronts:

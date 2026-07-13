@@ -44,6 +44,14 @@ RTK_APP_ID = "6dee33e5-cd89-41e8-a81c-9a8cd48bb9c3"
 # = https://api.wave.online. (sfu.ts/room.ts are P5 substrate; the metering tap reads this when wired.)
 GATEWAY_BASE_URL = "https://api.wave.online"
 
+# ── #76 — Twilio Media-Stream ↔ WAVE room bridge (wss://rt.wave.online/?room=<id>). DEFAULT OFF / INERT. ──
+# WAVE_TELEPHONY_STREAM gates the whole telephony WS route (src/telephony-ws.ts). Absent/"0" → the surface is
+# inert: maybeHandleTelephonyStream returns null and a root ?room= WS request falls through to the honest 501
+# catch-all (worker.ts), exactly as before this builder. Set "1" to ARM — but the send-side ingest framing
+# ("packet" vs "raw") and the room→SFU-session resolution are UNVERIFIED until a real inbound phone call, so
+# flipping this in any live env is a Jake-named ◆ crossing (a human must dial in to prove the two-way path).
+WAVE_TELEPHONY_STREAM = "0"
+
 # ── E3.P2/P4 (#127) DATA-RESIDENCY arm flag. DEFAULT OFF / FULLY INERT. ──
 # Absent/"0"/"false" -> the recorder is BYTE-IDENTICAL to today: every recording lands in RT_RECORDINGS at the
 # non-region key with NO gateway register() call (buildPullSink attaches no residency deps). Set RT_RESIDENCY="1"

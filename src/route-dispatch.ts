@@ -42,6 +42,10 @@ import { maybeHandleCanaryProof } from "./canary-proof";
 // file-size gate. INERT behind RECORDER_INGEST_ENABLED (default off → 501).
 import { maybeHandleRecordingIngest } from "./recording-ingest-route";
 import { maybeHandleRecorderDispatch } from "./recorder-dispatch-route";
+// #76 Twilio Media-Stream ↔ room WS bridge (wss root /?room=<id>). INERT behind WAVE_TELEPHONY_STREAM
+// ([vars], default off → maybeHandleTelephonyStream returns null → the 501 catch-all is unchanged). Leaf
+// module keeps this router under the file-size gate. See src/telephony-ws.ts + telephony-codec/twilio-mediastream.
+import { maybeHandleTelephonyStream } from "./telephony-ws";
 // Env shape, route-match constants, and the auth/deps/sink plumbing — extracted to a leaf module (task #56) so
 // neither file exceeds 800 lines. dispatch-helpers.ts imports nothing from here (no cycle).
 import {
@@ -627,6 +631,13 @@ export async function dispatch(
 	// Gateway-forwarded (gatewayGate + x-wave-org server-side); binding-absent → typed *_BRIDGE_NOT_ACTIVATED 501. ──
 	const ibRes = await maybeHandleIngestBridge(request, env, gatewayGate, SAFE_ORG);
 	if (ibRes) return ibRes;
+
+	// ── #76 Twilio Media-Stream ↔ room bridge — wss://rt.wave.online/?room=<id>. INERT behind
+	// WAVE_TELEPHONY_STREAM (null → falls through to the 501 catch-all, UNCHANGED). Twilio dials in
+	// directly (μ-law 8k mono JSON frames) → the SFU ingest-publish path; the send-side framing + the
+	// room→session resolution are the ONE remaining live spike (a real inbound phone call). ──
+	const telRes = await maybeHandleTelephonyStream(request, env, ctx);
+	if (telRes) return telRes;
 
 	// ── Task #81 voice-agent runtime (LK-rip Phase 6b) — INERT unless VOICE_AGENT_PROVIDER==="wave" ──
 	// When the flag is off, BOTH blocks below are skipped and the request falls through to the 501 catch-all,
