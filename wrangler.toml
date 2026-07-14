@@ -241,6 +241,12 @@ id = "4acd6ec7b04546ba8767f2353d5394e8"   # `wrangler kv namespace create RT_MEE
 # ── Metering tap (room.ts → gateway) — wrangler SECRET ──
 #   WAVE_SERVICE_TOKEN   — bearer the metering tap presents to the gateway /v1/internal/usage path.
 #                          `wrangler secret put WAVE_SERVICE_TOKEN` (Doppler wave/prd). Unset → no emit.
+#
+# ── Internal gateway-trust seal (dispatch-helpers.ts gatewayGate; zoom-rtms-bridge-do.ts:317,319) — wrangler SECRET ──
+#   WAVE_INTERNAL_SECRET — HMAC/shared secret the edge checks on the `x-wave-internal` seal. Set live (proven #155:
+#                          bogus seal → 401, gateway's WAVE_REALTIME_INTERNAL_SECRET seal → passes). Also fuels the
+#                          Zoom RTMS media dial-in (ZOOM_RTMS_BRIDGE DO). `wrangler secret put WAVE_INTERNAL_SECRET`
+#                          (Doppler wave/prd). Unset → gatewayGate fails closed (401), edge locked to gateway only.
 
 # ── Room Durable Object (room.ts RoomDO) — per-room state (participants, track registry, TTL) ──
 # RoomDO is exported from src/worker.ts (the main module) so this binding + migration resolve on the
