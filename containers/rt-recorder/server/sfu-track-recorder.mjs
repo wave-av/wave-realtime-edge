@@ -13,15 +13,19 @@
 //   2. Use werift's MediaRecorder, do NOT hand-roll depacketize — its jitter buffer handles reorder. onTrack
 //      fires TWICE (codec-less placeholder, then the real negotiated track); add the CODEC-BEARING one.
 //
-// CODEC ROUTING (#153): only VP8/VP9/H264/Opus are fed to werift MediaRecorder. AV1 HANGS werift 0.23.0 and
-// H265 is unsupported → `routeCodec` returns "native-transcode" and we RETURN EARLY (never touch werift), so
-// the caller falls back to the native ffmpeg/GPU recorder (#83/#88) instead of hanging. Honest degrade.
+// CODEC ROUTING (#153/#154): VP8/VP9/H264/Opus are fed to werift MediaRecorder (proven). AV1 HANGS werift's
+// MediaRecorder *mux* (#153) — but its low-level RTP *receiver* + `AV1RtpPayload` depacketizer do NOT hang, so
+// AV1 takes the #154 bridge: werift recvonly receive → depacketize (Av1FrameAssembler) → OBU temporal units →
+// IVF (Av1IvfWriter) → native-transcode (ffmpeg) → WebM. H265 has NO werift depacketizer at all → honest-fail
+// (the caller records it on the native ffmpeg/GPU path, #83/#88). Never a hang, never a silent wrong-codec mux.
 
-import { RTCPeerConnection, RTCRtpCodecParameters } from "werift";
+import { RTCPeerConnection, RTCRtpCodecParameters, AV1RtpPayload } from "werift";
 import { MediaRecorder } from "werift/nonstandard";
-import { statSync } from "node:fs";
+import { statSync, writeFileSync } from "node:fs";
 import { makeSfuClient } from "./sfu-rest.mjs";
 import { CODEC_DESCRIPTORS, VIDEO_FB, routeCodec } from "./codec-select.mjs";
+import { Av1FrameAssembler } from "./av1-depacketize.mjs";
+import { Av1IvfWriter } from "./av1-ivf.mjs";
 
 const log = (msg, f = {}) => console.log(JSON.stringify({ mod: "rt-recorder", msg, ...f }));
 
@@ -38,6 +42,28 @@ function waitIce(pc, ms = 4000) {
     const t = setTimeout(r, ms);
     pc.iceGatheringStateChange.subscribe((s) => s === "complete" && (clearTimeout(t), r()));
   });
+}
+
+/**
+ * The proven three-call CF SFU subscribe handshake: offer → new session → pull remote track → answer the
+ * renegotiation offer. Shared by the werift-MediaRecorder path and the #154 AV1-depacketize path.
+ */
+async function doHandshake(pc, client, publisherSessionId, trackName) {
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await waitIce(pc);
+  const session = await client.createSession(pc.localDescription.sdp);
+  await pc.setRemoteDescription(session.sessionDescription);
+  const pull = await client.pullRemoteTrack(session.sessionId, publisherSessionId, trackName);
+  log("sub-track-new", { reneg: pull.requiresImmediateRenegotiation, hasOffer: !!pull.sessionDescription });
+  if (pull.requiresImmediateRenegotiation && pull.sessionDescription) {
+    await pc.setRemoteDescription(pull.sessionDescription);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await waitIce(pc);
+    const status = await client.renegotiate(session.sessionId, pc.localDescription.sdp);
+    log("sub-renegotiate", { status });
+  }
 }
 
 /**
@@ -68,10 +94,16 @@ export async function subscribeAndRecord({
   sfuBase,
   fetchImpl,
   stopTimeoutMs = 4000,
+  width,
+  height,
 }) {
   const route = routeCodec(codec);
+  if (route.name === "AV1") {
+    // #154 bridge: werift's RTP receiver + AV1 depacketizer do not hang (only its MediaRecorder mux does).
+    return recordAv1ToIvf({ appId, appSecret, publisherSessionId, trackName, ivfBasePath: webmPath, runMs, sfuBase, fetchImpl, stopTimeoutMs, width, height });
+  }
   if (route.recorder !== "mediarecorder") {
-    // AV1 hangs werift; H265 unsupported; unknown → honest-fail. Do NOT touch werift — signal the native path.
+    // H265/HEVC have no werift depacketizer; unknown → honest-fail. The caller records on the native path.
     log("codec-routed-native", { codec: route.name, reason: route.reason });
     return { routed: "native-transcode", codec: route.name, reason: route.reason, webmPath: null };
   }
@@ -128,22 +160,7 @@ export async function subscribeAndRecord({
     });
   });
 
-  // The proven three-call handshake (sfu-rest): offer → session → pull remote → answer renegotiation.
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  await waitIce(pc);
-  const session = await client.createSession(pc.localDescription.sdp);
-  await pc.setRemoteDescription(session.sessionDescription);
-  const pull = await client.pullRemoteTrack(session.sessionId, publisherSessionId, trackName);
-  log("sub-track-new", { reneg: pull.requiresImmediateRenegotiation, hasOffer: !!pull.sessionDescription });
-  if (pull.requiresImmediateRenegotiation && pull.sessionDescription) {
-    await pc.setRemoteDescription(pull.sessionDescription);
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    await waitIce(pc);
-    const status = await client.renegotiate(session.sessionId, pc.localDescription.sdp);
-    log("sub-renegotiate", { status });
-  }
+  await doHandshake(pc, client, publisherSessionId, trackName);
 
   await new Promise((r) => setTimeout(r, runMs));
   clearInterval(pliPump);
@@ -177,4 +194,98 @@ export async function subscribeAndRecord({
   };
   log("sub-done", stats);
   return { routed: "mediarecorder", codec: route.name, webmPath: bytes > 0 ? webmPath : null, stats };
+}
+
+/**
+ * #154 AV1 bridge: subscribe to a published AV1 SFU track over a werift recvonly PC, depacketize its RTP with
+ * `AV1RtpPayload` into OBU temporal units (this path NEVER touches werift's MediaRecorder, which hangs on AV1),
+ * write those TUs into an IVF file, and return `nativeInput` so the driver rewraps it to WebM via ffmpeg.
+ *
+ * Geometry: the IVF header needs a non-zero width/height. The negotiated session knows the resolution, so the
+ * caller MUST supply `width`/`height` (honest-fail if absent — no 0x0 placeholder). ffmpeg re-derives the true
+ * geometry from the in-band OBU_SEQUENCE_HEADER downstream regardless, so the IVF value is advisory.
+ *
+ * @returns {Promise<{routed:"native-transcode", codec:"AV1", nativeInput?:{input:string}, reason?:string, stats:object}>}
+ */
+async function recordAv1ToIvf({ appId, appSecret, publisherSessionId, trackName, ivfBasePath, runMs, sfuBase, fetchImpl, stopTimeoutMs, width, height }) {
+  if (!(width > 0) || !(height > 0)) {
+    // No geometry from the session descriptor → honest-fail rather than fabricate a 0x0/placeholder container.
+    log("av1-no-geometry", { width, height });
+    return { routed: "native-transcode", codec: "AV1", reason: "AV1 bridge needs session width/height", stats: { frames: 0 } };
+  }
+  const ivfPath = `${ivfBasePath}.av1.ivf`;
+  const params = codecParamsFor("AV1");
+  const client = makeSfuClient({ fetchImpl, sfuBase, appId, appSecret });
+  const pc = new RTCPeerConnection({ codecs: { video: [params] } });
+  const transceiver = pc.addTransceiver("video", { direction: "recvonly" });
+
+  const assembler = new Av1FrameAssembler({
+    deSerialize: AV1RtpPayload.deSerialize,
+    getFrame: AV1RtpPayload.getFrame,
+  });
+  const writer = new Av1IvfWriter({ width, height, timebaseDen: 90000 });
+
+  let packets = 0, first = 0, last = 0, ssrc = null, gotFrame = false, plisSent = 0, baseTs = null;
+
+  // PLI pump: on a mid-GOP join there is no keyframe → force an IDR until the first TU lands (banked fix #1).
+  const pliPump = setInterval(() => {
+    if (ssrc == null || gotFrame) return;
+    try {
+      transceiver.receiver.sendRtcpPLI(ssrc);
+      plisSent++;
+    } catch (e) {
+      log("pli-err", { err: String(e).slice(0, 100) });
+    }
+  }, 700);
+
+  pc.onTrack.subscribe((track) => {
+    track.onReceiveRtp.subscribe((rtp) => {
+      packets++;
+      const n = Date.now();
+      if (!first) first = n;
+      last = n;
+      if (ssrc == null) {
+        ssrc = rtp.header.ssrc;
+        try {
+          transceiver.receiver.sendRtcpPLI(ssrc);
+          plisSent++;
+        } catch {
+          /* best-effort first PLI */
+        }
+      }
+      // Marker bit closes the temporal unit; getFrame reassembles the OBUs → one AV1 frame.
+      const frame = assembler.push(rtp.payload, AV1RtpPayload.isDetectedFinalPacketInSequence(rtp.header));
+      if (frame) {
+        gotFrame = true;
+        if (baseTs == null) baseTs = rtp.header.timestamp;
+        // IVF PTS in the 90kHz RTP timebase, relative to the first recorded frame.
+        writer.write(frame, (rtp.header.timestamp - baseTs) >>> 0);
+      }
+    });
+  });
+
+  await doHandshake(pc, client, publisherSessionId, trackName);
+  await new Promise((r) => setTimeout(r, runMs));
+  clearInterval(pliPump);
+  await Promise.race([pc.close().catch(() => {}), new Promise((r) => setTimeout(r, stopTimeoutMs))]);
+
+  const ivf = writer.finalize();
+  const secs = first && last > first ? (last - first) / 1000 : 0;
+  const stats = {
+    codec: "AV1",
+    packets,
+    frames: writer.frameCount,
+    keyframes: assembler.keyframes,
+    droppedPackets: assembler.dropped,
+    seconds: Number(secs.toFixed(2)),
+    plisSent,
+    ivfBytes: ivf ? ivf.length : 0,
+  };
+  log("av1-done", stats);
+  if (!ivf) {
+    // Recorded nothing decodable (no keyframe / no frames) → honest signal, no empty IVF written.
+    return { routed: "native-transcode", codec: "AV1", reason: "no AV1 frames assembled", stats };
+  }
+  writeFileSync(ivfPath, ivf);
+  return { routed: "native-transcode", codec: "AV1", nativeInput: { input: ivfPath }, stats };
 }
