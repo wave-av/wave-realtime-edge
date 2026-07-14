@@ -228,6 +228,21 @@ bucket_name = "wave-recordings-eu"
 # EU session's bytes would NOT be residency-correct. (#127 ◆ Jake-named EU-residency crossing, 2026-06-28.)
 jurisdiction = "eu"
 
+# ── #114 T2 — APAC + SAM residency buckets (INERT: bound + ready, ZERO traffic). ──
+# Staged for the N-region registry (src/region-registry.ts) apac/sam entries, which stay enabled:false until
+# their ◆ Jake-named live flip (T3). Both buckets EXIST on the d674452f R2 account (created 2026-07-14) in the
+# DEFAULT jurisdiction namespace — mirroring the registry's `jurisdiction: "default"` for both (unlike the EU
+# bucket above, so NO jurisdiction line here). They are NEVER read while the registry entries are enabled:false:
+# regionForContinent()/activeRegions() exclude disabled entries, so AS/OC/SA sessions fall to the default
+# RT_RECORDINGS path EXACTLY as today. Binding present + inert until the region is flipped enabled:true (◆).
+[[r2_buckets]]
+binding = "RT_RECORDINGS_APAC"
+bucket_name = "wave-recordings-apac"
+
+[[r2_buckets]]
+binding = "RT_RECORDINGS_SAM"
+bucket_name = "wave-recordings-sam"
+
 [[kv_namespaces]]
 binding = "RT_MEETING_ORG"
 id = "4acd6ec7b04546ba8767f2353d5394e8"   # `wrangler kv namespace create RT_MEETING_ORG` (d674452f acct)

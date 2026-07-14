@@ -38,6 +38,11 @@ export interface ResidencySinkEnv {
 	// RT_RECORDINGS path is used). RT_RECORDINGS_ENAM→wave-recordings-enam, RT_RECORDINGS_EU→wave-recordings-eu.
 	RT_RECORDINGS_ENAM?: R2Bucket;
 	RT_RECORDINGS_EU?: R2Bucket;
+	// #114 T2 — APAC + SAM residency buckets, bound INERT (registry entries enabled:false). Optional, resolved
+	// dynamically via bucketForBinding(env[binding]); never read while their regions are disabled. RT_RECORDINGS_APAC
+	// →wave-recordings-apac, RT_RECORDINGS_SAM→wave-recordings-sam (both default jurisdiction).
+	RT_RECORDINGS_APAC?: R2Bucket;
+	RT_RECORDINGS_SAM?: R2Bucket;
 	// Gateway origin for the residency register() POST (residency path only). Defaults to GATEWAY_BASE_URL.
 	WAVE_GATEWAY_ORIGIN?: string;
 	GATEWAY_BASE_URL?: string; // public gateway origin (also read inside RoomDO); reused as the register fallback.
