@@ -14,10 +14,11 @@
 import {
 	bindingForZone,
 	bucketForBinding,
+	isRtResidencyZone,
 	zoneFromContinent,
-	type RtResidencyBinding,
 	type RtResidencyZone,
 } from "./residency-rt";
+import { regionForBinding } from "./region-registry";
 import { registerRecording, type RegisterConfig } from "./recordings-register";
 import type { ResidencyPullDeps } from "./rtk-webhook";
 
@@ -80,13 +81,11 @@ export async function captureSessionZone(
  * that writes the bytes, so a built register call never 403s residency_bucket_mismatch.
  */
 export function buildResidencyDeps(env: ResidencySinkEnv, kv: KVNamespace): ResidencyPullDeps {
-	// The wrangler binding name → its configured bucket NAME (what register() asserts as `bucket`). Mirrors the
-	// gateway RESIDENCY_BUCKETS map (enam=wave-recordings-enam,eu=wave-recordings-eu); the WaveZone we SEND folds
-	// to that jurisdiction gateway-side. These literals are the bucket_name values bound in wrangler.toml.
-	const BUCKET_NAME: Record<RtResidencyBinding, string> = {
-		RT_RECORDINGS_ENAM: "wave-recordings-enam",
-		RT_RECORDINGS_EU: "wave-recordings-eu",
-	};
+	// The wrangler binding name → its configured bucket NAME (what register() asserts as `bucket`). DERIVED from
+	// the region registry (#114) — one entry per active region carries {binding, bucketName}, mirroring the
+	// gateway RESIDENCY_BUCKETS map; the WaveZone we SEND folds to that jurisdiction gateway-side. No hand-kept
+	// literal to drift from wrangler.toml — the registry IS the SSOT and each entry's bucketName is asserted.
+	const bucketNameForBinding = (binding: string): string | null => regionForBinding(binding)?.bucketName ?? null;
 	const registerCfg: RegisterConfig = {
 		gatewayOrigin: env.WAVE_GATEWAY_ORIGIN || env.GATEWAY_BASE_URL,
 		serviceToken: env.WAVE_SERVICE_TOKEN,
@@ -95,13 +94,17 @@ export function buildResidencyDeps(env: ResidencySinkEnv, kv: KVNamespace): Resi
 	return {
 		async lookupZone(meetingId) {
 			const z = await kv.get(zoneKvKey(meetingId));
-			return z === "us-east" || z === "eu-west" ? (z as RtResidencyZone) : null;
+			// Validate against the ACTIVE registry zones, not a hardcoded pair — a zone captured before a region
+			// was disabled (or an unknown value) falls to the default path rather than writing to a dead binding.
+			return isRtResidencyZone(z) ? (z as RtResidencyZone) : null;
 		},
 		bucketFor(zone) {
 			const binding = bindingForZone(zone);
-			const r2 = bucketForBinding(env, binding);
+			const r2 = bucketForBinding(env as unknown as Record<string, unknown>, binding);
 			if (!r2) return null; // binding unbound → caller falls to the default path (loud)
-			return { bucket: r2, bucketName: BUCKET_NAME[binding], binding };
+			const bucketName = bucketNameForBinding(binding);
+			if (!bucketName) return null; // binding not in the active registry → default path (loud)
+			return { bucket: r2, bucketName, binding };
 		},
 		async register({ org, r2Key, bucketName, zone }) {
 			await registerRecording({ org, r2Key, bucket: bucketName, zone }, registerCfg, log);

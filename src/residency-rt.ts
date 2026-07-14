@@ -22,18 +22,40 @@
  * Live gateway config this mirrors (the gateway wrangler.toml, 2026-06-27):
  *   RESIDENCY_BUCKETS = "enam=wave-recordings-enam,eu=wave-recordings-eu"
  *   (region.ts: us-east→enam, eu-west→eu).
+ *
+ * #114 N-REGION: the four continent/zone/binding/bucket literals this module used to carry by hand are now
+ * DERIVED from the single region registry SSOT (./region-registry). Adding a jurisdiction is a registry
+ * edit + a wrangler binding, not a change scattered here. Behavior for the live us-east/eu-west pair is
+ * byte-identical (the registry's two `enabled:true` entries reproduce the old maps exactly); staged regions
+ * are `enabled:false` in the registry so their continents keep falling to the default path until flipped (◆).
  */
+import {
+	activeZones,
+	regionForBinding,
+	regionForContinent,
+	regionForZone,
+} from "./region-registry";
 
 /**
- * The WaveZone subset this recorder produces — exactly the two zones the continent resolver maps. A real
- * member of the gateway's WaveZone SSOT (so the gateway's `isWaveZone` accepts it), NOT a jurisdiction id.
- * Mirrored, not imported (see the file header). Extending residency to another continent is a deliberate
- * follow-up: add the zone here, its bucket binding in wrangler.toml, and the continent mapping below.
+ * A residency WaveZone this recorder can produce — a real member of the gateway's WaveZone SSOT (so the
+ * gateway's `isWaveZone` accepts it), NOT a jurisdiction id. Widened from the old 2-member union to `string`:
+ * the set of PRODUCIBLE zones is now the registry's ACTIVE entries (validated at runtime via `isRtResidencyZone`
+ * / `activeZones()`), so a new zone becomes valid by adding a registry entry, not by editing this type.
  */
-export type RtResidencyZone = "us-east" | "eu-west";
+export type RtResidencyZone = string;
 
-/** The R2 binding name (wrangler.toml) that holds a zone's residency-correct bucket. */
-export type RtResidencyBinding = "RT_RECORDINGS_ENAM" | "RT_RECORDINGS_EU";
+/** The R2 binding name (wrangler.toml) that holds a zone's residency-correct bucket. Registry-driven (see above). */
+export type RtResidencyBinding = string;
+
+/** True iff `zone` is an ACTIVE residency zone (an enabled registry entry). Replaces the old hardcoded literal check. */
+export function isRtResidencyZone(zone: string | null | undefined): zone is RtResidencyZone {
+	return regionForZone(zone) !== null;
+}
+
+/** The active residency zones, in registry order (what a captured session zone is validated against). */
+export function activeResidencyZones(): readonly RtResidencyZone[] {
+	return activeZones();
+}
 
 /** A resolved residency placement: the WaveZone to assert to the gateway + the local R2 binding to write into. */
 export interface RtResidencyPlacement {
@@ -44,34 +66,24 @@ export interface RtResidencyPlacement {
 }
 
 /**
- * The Workers `request.cf.continent` two-letter codes → the residency zone we record in. Only NA and EU are
- * mapped; every other continent returns null → the caller falls back to the non-residency default path (do
- * NOT invent a zone for an unmapped continent). `request.cf.continent` is "NA","EU","AS","SA","AF","OC","AN".
- */
-const CONTINENT_TO_ZONE: Readonly<Record<string, RtResidencyZone>> = {
-  NA: "us-east",
-  EU: "eu-west",
-};
-
-/** Map a zone to the local R2 binding holding its residency-correct bucket. Total over RtResidencyZone. */
-const ZONE_TO_BINDING: Readonly<Record<RtResidencyZone, RtResidencyBinding>> = {
-  "us-east": "RT_RECORDINGS_ENAM",
-  "eu-west": "RT_RECORDINGS_EU",
-};
-
-/**
  * Resolve a session's residency zone from a Workers `request.cf.continent` code. Returns null for any
  * continent we do not (yet) have a residency bucket for — the caller MUST then use the non-residency default
- * path (recordingKey + RT_RECORDINGS), never a guessed zone. Case-insensitive on the continent code.
+ * path (recordingKey + RT_RECORDINGS), never a guessed zone. Registry-driven: only ENABLED regions map, so an
+ * unmapped OR staged (`enabled:false`) continent returns null exactly as before. Case-insensitive.
  */
 export function zoneFromContinent(continent: string | null | undefined): RtResidencyZone | null {
-  if (!continent) return null;
-  return CONTINENT_TO_ZONE[continent.toUpperCase()] ?? null;
+  return regionForContinent(continent)?.zone ?? null;
 }
 
-/** The residency-correct R2 binding name for a zone (pairs with the gateway's zone→bucket fold). */
+/**
+ * The residency-correct R2 binding name for a zone (pairs with the gateway's zone→bucket fold). Registry-
+ * driven. Throws on an unknown/inactive zone rather than returning undefined — callers only pass a zone that
+ * `zoneFromContinent`/`lookupZone` already produced from an active region, so an unknown zone is a real defect.
+ */
 export function bindingForZone(zone: RtResidencyZone): RtResidencyBinding {
-  return ZONE_TO_BINDING[zone];
+  const region = regionForZone(zone);
+  if (!region) throw new Error(`bindingForZone: no active region for zone "${zone}"`);
+  return region.binding;
 }
 
 /**
@@ -91,10 +103,11 @@ export function placementForContinent(continent: string | null | undefined): RtR
  * default path rather than write nowhere). Kept env-shape-agnostic (a record of optional R2 bindings).
  */
 export function bucketForBinding(
-  env: Partial<Record<RtResidencyBinding, R2Bucket | undefined>>,
+  env: Record<string, unknown>,
   binding: RtResidencyBinding,
 ): R2Bucket | null {
-  return env[binding] ?? null;
+  const v = env[binding];
+  return (v as R2Bucket | undefined) ?? null;
 }
 
 /**
