@@ -110,7 +110,7 @@ export const REGION_REGISTRY: readonly RegionEntry[] = [
 		bucketName: "wave-recordings-apac",
 		jurisdiction: "default",
 		cascadeHint: "apac",
-		enabled: false,
+		enabled: true, // #114 T3 (2026-07-14): bucket+binding created (#184) + storage-meter billing/lifecycle coverage live (#158). "default" jurisdiction (no legal residency lock); parity with live enam/eu.
 	},
 	{
 		zone: "sa-east",
@@ -119,7 +119,7 @@ export const REGION_REGISTRY: readonly RegionEntry[] = [
 		bucketName: "wave-recordings-sam",
 		jurisdiction: "default",
 		cascadeHint: "sam",
-		enabled: false,
+		enabled: true, // #114 T3 (2026-07-14): bucket+binding created (#184) + storage-meter billing/lifecycle coverage live (#158). "default" jurisdiction (no legal residency lock); parity with live enam/eu.
 	},
 ];
 
