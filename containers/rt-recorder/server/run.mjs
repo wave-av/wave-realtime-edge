@@ -89,9 +89,18 @@ async function main() {
   const tmpPath = join(tmpDir, "recording.webm");
   const out = await recordTrackToSink({ recorder, fs, tmpPath, sink });
   log("done", out);
-  // Route to native-transcode (AV1/H265) is not a failure of THIS process — it is an honest "not my codec".
-  if (out.routed !== "mediarecorder") process.exitCode = 3;
-  else if (!out.result) process.exitCode = 4; // nothing landed
+  // Success = bytes landed in the sink. record-to-sink sets `result` on BOTH the werift-safe (mediarecorder)
+  // path AND the #153 native-transcode path (AV1/H265 → ffmpeg → SAME WebM sink), so an AV1 recording that
+  // streamed to R2 is a success (exit 0), not a failure. Only two non-zero cases remain:
+  //   • no result + native routing → honest "no capture bridge for this source; record it natively" (exit 3)
+  //   • no result + mediarecorder  → the proven codec produced nothing streamable (exit 4, a real fault)
+  if (out.result) {
+    /* landed (mediarecorder OR native-transcode) — success */
+  } else if (out.routed === "mediarecorder") {
+    process.exitCode = 4;
+  } else {
+    process.exitCode = 3;
+  }
 }
 
 main().catch((e) => {
