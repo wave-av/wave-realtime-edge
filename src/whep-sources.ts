@@ -128,7 +128,17 @@ export async function handleWhepSources(
       now: deps.now,
     });
     const backend = new CfStreamLiveIngestBackend(client);
-    const outcome = await backend.provision(parsed.job, { org });
+    let outcome: Awaited<ReturnType<typeof backend.provision>>;
+    try {
+      outcome = await backend.provision(parsed.job, { org });
+    } catch (e) {
+      // no-silent-failure: a THROWN provision (e.g. malformed cred → fetch TypeError) must be observable,
+      // not a bare 502. Log the actionable reason (never the secret values — lengths only).
+      console.error(
+        `whep-sources provision THREW org=${org} kind=${parsed.job.sourceKind} acctLen=${creds.accountId.length} tokLen=${creds.apiToken.length}: ${(e as Error)?.stack ?? String(e)}`,
+      );
+      return jsonError("WHEP_SOURCE_PROVISION_FAILED", `provision error: ${(e as Error)?.message ?? String(e)}`, 502);
+    }
 
     switch (outcome.status) {
       case "provisioned": {
@@ -137,6 +147,9 @@ export async function handleWhepSources(
           return Response.json({ uid: r.input.uid, endpoints: r.input.endpoints }, { status: 201 });
         }
         // CF create-input / KV bind failure — surfaced with the origin's stable status + reason.
+        console.error(
+          `whep-sources provision FAILED org=${org} kind=${parsed.job.sourceKind} acctLen=${creds.accountId.length} tokLen=${creds.apiToken.length} status=${r.status}: ${r.reason}`,
+        );
         return jsonError("WHEP_SOURCE_PROVISION_FAILED", r.reason, r.status >= 400 && r.status < 600 ? r.status : 502);
       }
       case "deferred":
