@@ -155,4 +155,29 @@ export async function handleWhepSources(
   return jsonError("WHEP_METHOD_NOT_ALLOWED", "POST to provision or GET to list sources", 405);
 }
 
+/**
+ * Dispatch wrapper mirroring `maybeHandleIngestBridge` / `maybeHandleStreamBridge`: keeps the route-dispatch
+ * hot path a one-liner (file-size-two-tier-gate) and co-locates the flag + gateway-trust + org gating with the
+ * handler it guards. Returns null (fall-through) when the path isn't `/v1/whep/sources` or the router is INERT.
+ */
+export async function maybeHandleWhepSources(
+  request: Request,
+  env: WhepSourcesEnv & { WAVE_INTERNAL_SECRET?: string },
+  gatewayGate: (request: Request, secret: string | undefined) => Response | null,
+  safeOrg: RegExp,
+): Promise<Response | null> {
+  const url = new URL(request.url);
+  if (url.pathname !== SOURCES_PATH || !ingressRouterEnabled(env)) return null;
+  const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
+  if (denied) return denied;
+  const org = request.headers.get("x-wave-org") ?? "";
+  if (!safeOrg.test(org)) {
+    return Response.json(
+      { error: "BAD_REQUEST", message: "missing or malformed org context (x-wave-org) — stamped by the gateway" },
+      { status: 400 },
+    );
+  }
+  return handleWhepSources(request, env, org);
+}
+
 export { SOURCES_PATH, ingressRouterEnabled };

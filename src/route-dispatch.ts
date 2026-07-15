@@ -13,10 +13,7 @@ import { handleWhip, whipIngestEnabled, type WhipEnv } from "./whip";
 // #53 — IETF WHEP v1 egress surface (/v1/whep/*), the egress SIBLING of WHIP. INERT behind WHEP_EGRESS_ENABLED
 // ([vars], default off → the 501 catch-all is unchanged). See src/whep.ts + docs/whep-v1-frozen-contract.md.
 import { handleWhep, whepEgressEnabled, type WhepEnv } from "./whep";
-
-// WHEP-A (whep-live-egress-golive epic) — CF Stream Live source provision + discovery (/v1/whep/sources).
-// INERT behind INGRESS_ROUTER_ENABLED (default off).
-import { handleWhepSources, ingressRouterEnabled, type WhepSourcesEnv } from "./whep-sources";
+import { maybeHandleWhepSources, type WhepSourcesEnv } from "./whep-sources";
 // B1 (#91-a) — CF Stream Live → SFU bridge CONTROL PLANE. INERT behind STREAM_BRIDGE_ENABLED. worker.ts only
 // DELEGATES; all matching/auth/dispatch lives in src/stream-bridge.ts (+ cf-stream-bridge-frozen-contract).
 import { maybeHandleStreamBridge, scheduledStreamReconcile } from "./stream-bridge";
@@ -590,25 +587,10 @@ export async function dispatch(
 		if (whipRes) return whipRes; // null → unrecognized /v1/whip/* sub-path → 501 fall-through below
 	}
 
-	// ── WHEP-A (whep-live-egress-golive) CF Stream Live source provision + discovery — /v1/whep/sources ──
-	// INERT behind INGRESS_ROUTER_ENABLED ([vars], default off): when falsy/absent this block is skipped and a
-	// /v1/whep/sources request falls through to the WHEP egress block below → 501. When ON, the SAME gateway-trust
-	// chokepoint gates it (WAVE_INTERNAL_SECRET / x-wave-internal); org is the gateway-stamped x-wave-org. POST
-	// provisions a CF Stream Live input + writes its org bindings; GET lists the org's live sources. Placed BEFORE
-	// the egress block so `sources` routes to ingest while `subscribe`/`resource/*` fall through to handleWhep.
-	if (url.pathname === "/v1/whep/sources" && ingressRouterEnabled(env as WhepSourcesEnv)) {
-		const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
-		if (denied) return denied;
-		const org = request.headers.get("x-wave-org") ?? "";
-		if (!SAFE_ORG.test(org)) {
-			return Response.json(
-				{ error: "BAD_REQUEST", message: "missing or malformed org context (x-wave-org) — stamped by the gateway" },
-				{ status: 400 },
-			);
-		}
-		const srcRes = await handleWhepSources(request, env as WhepSourcesEnv, org);
-		if (srcRes) return srcRes; // null → unrecognized path → fall through (never null for /v1/whep/sources)
-	}
+	// ── WHEP-A (whep-live-egress-golive) CF Stream Live source provision + discovery — /v1/whep/sources.
+	// INERT behind INGRESS_ROUTER_ENABLED (null → falls through to the WHEP egress block → 501). ──
+	const whepSrcRes = await maybeHandleWhepSources(request, env as WhepSourcesEnv, gatewayGate, SAFE_ORG);
+	if (whepSrcRes) return whepSrcRes;
 
 	// ── #53 IETF WHEP v1 egress — /v1/whep/subscribe + /v1/whep/resource/{id} ──
 	// The egress SIBLING of the WHIP block above. INERT behind WHEP_EGRESS_ENABLED ([vars], default off): when
