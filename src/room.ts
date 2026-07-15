@@ -16,6 +16,8 @@ import { MediaTap, tapPublishFrame, mediaTapEnabled } from "./media-tap.js";
 import type { TapConsumerHandle, TapFrame } from "./media-tap.js";
 import { startAgentRead, type AgentReadTarget, type AgentFrameSink } from "./agent-media-consumer.js";
 import { buildTurnLoopSink, type TurnLoopDriver } from "./agent-turn-sink.js";
+import { startRoutedEgress, type RoutedEgressArmEnv } from "./egress-arm.js";
+import { validateEgressJob, type EgressJob } from "./egress-router.js";
 import {
   acceptPresenceSocket,
   broadcastPresence,
@@ -434,6 +436,17 @@ export interface RoomDOEnv {
   GATEWAY_BASE_URL?: string;
   WAVE_SERVICE_TOKEN?: string;
   MEDIA_TAP_ENABLED?: string | boolean; // #74 — arms MediaTap fan-out; default off = inert (prod byte-identical)
+  // #75 routed-egress arm: an `egress-bind` intent arms a routed-egress MediaConsumer off THIS room's tap
+  // (buildRoutedEgressConsumer). INERT until BOTH EGRESS_ROUTER_ENABLED and MEDIA_TAP_ENABLED read armed
+  // (routedEgressArmed) → no consumer registered, no fetch reachable. Endpoint/token vars reuse the SAME
+  // names the P2/P3 egress backends already declare (see RoutedEgressArmEnv). All optional/inert by default.
+  EGRESS_ROUTER_ENABLED?: string | boolean;
+  WAVE_RENDER_URL?: string;
+  WAVE_INTERNAL_RENDER_TOKEN?: string;
+  RUNPOD_NVENC_ENDPOINT?: string;
+  RUNPOD_API_TOKEN?: string;
+  /** test-only: injected HTTP client the routed-egress consumer POSTs frames through (defaults to global fetch). */
+  __egressFetch?: typeof fetch;
   // ── LK-rip #46 SFU event emitter (DORMANT until cutover). DO forwards to Signaling → WSC Argus
   // ingest ONLY when WAVE_REALTIME_EVENTS_EMIT="1" AND the shared HMAC secret is set (else inert). ──
   WAVE_REALTIME_EVENTS_EMIT?: string; // "1" arms; absent/anything-else → inert
@@ -475,6 +488,10 @@ export class RoomDO {
    *  Additive + inert; does NOT touch the live AgentSessionDO echo/speak path (#78 removes that later). */
   private agentReadHandle: TapConsumerHandle | null = null;
   private agentReadFrames = 0; // receipt counter: frames the co-located agent read has drained
+  /** #75 routed-egress arm: the routed-egress drain handle. Null until an `egress-bind` intent arms it
+   *  (routedEgressArmed gated) → the room forwards its tapped frames to the decided egress backend, not a 2nd
+   *  SFU subscription. Additive + inert; one routed-egress drain per room (re-arm closes the prior handle). */
+  private routedEgressHandle: TapConsumerHandle | null = null;
   private readonly doState: DurableObjectStateLike;
   /** Monotonic presence broadcast version (conflict-free client ordering). Seeded lazily from storage so it
    *  survives a DO eviction; incremented per broadcast. Null until first read. */
@@ -557,6 +574,30 @@ export class RoomDO {
   get agentReadFrameCount(): number { return this.agentReadFrames; }
 
   /**
+   * #75 — arm ROUTED EGRESS off this room's MediaTap. The routed-egress counterpart of `armAgentRead`: registers
+   * an in-process MediaConsumer (`buildRoutedEgressConsumer` → the authoritative `egressRoute` verdict per frame)
+   * and drains it, so a tapped frame flows straight to the decided backend's HTTP endpoint — no 2nd SFU
+   * subscription, no cross-DO transport. Returns whether egress was armed (false when NOT `routedEgressArmed`,
+   * i.e. either EGRESS_ROUTER_ENABLED or MEDIA_TAP_ENABLED is off → prod byte-identical: no consumer registered,
+   * no fetch reachable). Idempotent: a re-arm closes the prior drain first (one routed egress per room).
+   *
+   * `fetchFn` (test-only) overrides the injected `__egressFetch`/global fetch; it is never called until BOTH
+   * flags are armed AND a matching (video) frame is published, so this method is fully inert by default.
+   */
+  armRoutedEgress(job: EgressJob, fetchFn?: typeof fetch): boolean {
+    // Close any prior drain (idempotent re-arm) before (re)registering.
+    this.routedEgressHandle?.close();
+    this.routedEgressHandle = null;
+    this.routedEgressHandle = startRoutedEgress(
+      this.mediaTap,
+      job,
+      this.env satisfies RoutedEgressArmEnv,
+      fetchFn ?? this.env.__egressFetch ?? fetch,
+    );
+    return this.routedEgressHandle !== null;
+  }
+
+  /**
    * Control-plane surface. The worker forwards `POST .../<intent>` here with a JSON body carrying the
    * already-validated context (org/room/participantId) + the intent payload. Builds the SfuClient lazily
    * (so an unconfigured app fails closed only when an intent actually needs the SFU), runs Signaling, and
@@ -564,7 +605,7 @@ export class RoomDO {
    * (fail-open inside metering.ts). The DO never holds media — only state + orchestration.
    */
   async fetch(request: Request): Promise<Response> {
-    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent | "recorder-frame" | "recording-ingest" | "recorder-dispatch" | "whip-finalize" | "presence" | "agent-bind" | "whip-publish";
+    const intent = new URL(request.url).pathname.replace(/^\/+/, "") as RoomIntent | "recorder-frame" | "recording-ingest" | "recorder-dispatch" | "whip-finalize" | "presence" | "agent-bind" | "egress-bind" | "whip-publish";
     // #76 P2 (arch A): fold the agent's media-READ onto this room's single MediaTap. The AGENT dispatch
     // (/bind) additionally forwards the SAME AgentSessionConfig here when MEDIA_TAP_ENABLED is armed, so the
     // RoomDO registers an IN-PROCESS MediaConsumer for the agent's target track — no 2nd SFU subscription, no
@@ -582,6 +623,23 @@ export class RoomDO {
         return Response.json({ error: "BAD_REQUEST", message: "agent-bind requires agentId and participantTrackName" }, { status: 400 });
       } catch {
         // fail-open: an agent-read arm defect must never break the room control plane or the live media path.
+        return Response.json({ ok: true, armed: false }, { status: 200 });
+      }
+    }
+    // #75 routed egress: the missing trigger for routed egress. Mirrors `agent-bind` EXACTLY — a control-plane
+    // POST that arms an in-process MediaConsumer off THIS room's tap (armRoutedEgress → buildRoutedEgressConsumer).
+    // The EgressJob (the router's decision facts) travels as the JSON body; validated before the sink. INERT when
+    // unarmed (armRoutedEgress no-ops unless routedEgressArmed → prod byte-identical). Fail-open like agent-bind:
+    // an arm defect must never break the room control plane or the live media path.
+    if (intent === "egress-bind") {
+      try {
+        const body = (await request.json().catch(() => null)) as EgressJob | null;
+        if (body && typeof body === "object" && validateEgressJob(body) === null) {
+          const armed = this.armRoutedEgress(body);
+          return Response.json({ ok: true, armed }, { status: 200 });
+        }
+        return Response.json({ error: "BAD_REQUEST", message: "egress-bind requires a valid EgressJob body" }, { status: 400 });
+      } catch {
         return Response.json({ ok: true, armed: false }, { status: 200 });
       }
     }

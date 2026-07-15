@@ -39,8 +39,8 @@
  */
 import { egressRoute, type EgressBackend, type EgressJob } from "./egress-router.js";
 import { egressRouterEnabled } from "./egress-wave-render.js";
-import { mediaTapEnabled } from "./media-tap.js";
-import type { MediaConsumer, TapFrame, TapSelector } from "./media-tap.js";
+import { mediaTapEnabled, pumpConsumer } from "./media-tap.js";
+import type { MediaConsumer, MediaTap, TapConsumerHandle, TapFrame, TapSelector } from "./media-tap.js";
 
 /** Env fields this factory reads. Reuses the SAME var/secret names the P2/P3 backend Env interfaces already
  *  declare (`EgressWaveRenderEnv.WAVE_RENDER_URL`/`WAVE_INTERNAL_RENDER_TOKEN`,
@@ -121,4 +121,29 @@ export function buildRoutedEgressConsumer(
       await fetchFn(endpoint.url, { method: "POST", headers, body: frame.bytes });
     },
   };
+}
+
+/**
+ * Register the routed-egress consumer as a tap consumer and start draining it — the RoomDO call site the module
+ * docstring flagged as needing to be named. Mirrors `startAgentRead` (agent-media-consumer.ts) EXACTLY: returns
+ * the handle (so the caller can close it on unbind/room-end) or null when NOT armed. Gated by `routedEgressArmed`
+ * (BOTH `EGRESS_ROUTER_ENABLED` and `MEDIA_TAP_ENABLED`), so an unarmed room builds/subscribes NOTHING — no
+ * consumer registered, no fetch reachable (prod byte-identical until both ◆ flags flip). The pump runs detached
+ * (pumpConsumer loops until the handle closes); the returned handle.close() ends it. Re-subscribing the same
+ * consumer id closes the prior handle (MediaTap.subscribe contract), so a re-arm is idempotent.
+ */
+export function startRoutedEgress(
+  tap: MediaTap,
+  job: EgressJob,
+  env: RoutedEgressArmEnv,
+  fetchFn: typeof fetch,
+  opts: { id?: string; selector?: TapSelector } = {},
+): TapConsumerHandle | null {
+  if (!routedEgressArmed(env)) return null;
+  const consumer = buildRoutedEgressConsumer(job, env, fetchFn, opts);
+  const handle = tap.subscribe(consumer.id, consumer.selector);
+  // Detached drain — pumpConsumer returns only when the handle closes (room end / re-arm). Isolated per
+  // media-tap's contract, so no await is threaded through the frame-publish path.
+  void pumpConsumer(handle, consumer);
+  return handle;
 }
