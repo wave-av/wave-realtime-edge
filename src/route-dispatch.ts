@@ -13,6 +13,7 @@ import { handleWhip, whipIngestEnabled, type WhipEnv } from "./whip";
 // #53 — IETF WHEP v1 egress surface (/v1/whep/*), the egress SIBLING of WHIP. INERT behind WHEP_EGRESS_ENABLED
 // ([vars], default off → the 501 catch-all is unchanged). See src/whep.ts + docs/whep-v1-frozen-contract.md.
 import { handleWhep, whepEgressEnabled, type WhepEnv } from "./whep";
+import { maybeHandleWhepSources, type WhepSourcesEnv } from "./whep-sources";
 // B1 (#91-a) — CF Stream Live → SFU bridge CONTROL PLANE. INERT behind STREAM_BRIDGE_ENABLED. worker.ts only
 // DELEGATES; all matching/auth/dispatch lives in src/stream-bridge.ts (+ cf-stream-bridge-frozen-contract).
 import { maybeHandleStreamBridge, scheduledStreamReconcile } from "./stream-bridge";
@@ -585,6 +586,11 @@ export async function dispatch(
 		const whipRes = await handleWhip(request, env as WhipEnv, org);
 		if (whipRes) return whipRes; // null → unrecognized /v1/whip/* sub-path → 501 fall-through below
 	}
+
+	// ── WHEP-A (whep-live-egress-golive) CF Stream Live source provision + discovery — /v1/whep/sources.
+	// INERT behind INGRESS_ROUTER_ENABLED (null → falls through to the WHEP egress block → 501). ──
+	const whepSrcRes = await maybeHandleWhepSources(request, env as WhepSourcesEnv, gatewayGate, SAFE_ORG);
+	if (whepSrcRes) return whepSrcRes;
 
 	// ── #53 IETF WHEP v1 egress — /v1/whep/subscribe + /v1/whep/resource/{id} ──
 	// The egress SIBLING of the WHIP block above. INERT behind WHEP_EGRESS_ENABLED ([vars], default off): when
