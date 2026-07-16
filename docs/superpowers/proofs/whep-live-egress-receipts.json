@@ -1,0 +1,103 @@
+{
+  "$schema": "https://wave.online/schemas/golive-proof-ledger.v1.json",
+  "epic": "WHEP Live Egress Go-Live (CF-Stream-WHEP un-park)",
+  "epic_doc": "claude-workstation/governance/plans/whep-live-egress-golive/epic.md",
+  "design_spec": "docs/superpowers/specs/2026-07-15-whep-live-egress-golive-design.md",
+  "keystone_repo": "wave-av/wave-realtime-edge",
+  "spans": ["wave-av/wave-realtime-edge", "wave-av/wave-desktop", "wave-av/wave-gateway"],
+  "dogfood_org": "18e9224a-0e81-4c05-a336-5b9cb118d48a",
+  "as_of": "2026-07-16",
+  "verdict": "PROVEN_LIVE",
+  "summary": "Full WHEP live-egress plane proven end-to-end through the production gateway: provision -> WHIP-to-Stream feed -> WHEP subscribe (bytesReceived>0, real VP9 media) -> egress meter tick -> dogfood-excluded ($0). All A-E phases complete; client (C) shipped INERT pending desktop merge.",
+  "phases": [
+    {
+      "id": "A",
+      "task": 160,
+      "name": "ingest-arm",
+      "status": "PROVEN_LIVE",
+      "ships": "INERT until INGRESS_ROUTER_ENABLED",
+      "receipt": {
+        "provision": "POST api.wave.online/v1/whep/sources (Bearer WHEP_DOGFOOD_KEY) -> 201 {uid, endpoints:[rtmp,srt]}",
+        "chain": "auth -> scope -> entitlement-floor -> gateway-forward -> edge(rt.wave.online) -> CF create-input",
+        "kv": "stream-input-org:<uid> = <org> (bare string), reverse org-stream-inputs:<org> index; saga-compensation deletes orphan input on required-forward-KV fail",
+        "prs": [188, 190, 192, 193, 196],
+        "flag": "INGRESS_ROUTER_ENABLED 0->1 (PR #192, deployed run 29450533498)"
+      },
+      "root_cause_fix": "CfStreamLiveClientImpl stored unbound global fetch as instance prop -> Workers 'Illegal invocation' -> 502. Fix = fetch.bind(globalThis) (PR #196) + regression test on default-fetch path."
+    },
+    {
+      "id": "B",
+      "task": 161,
+      "name": "source-feeds",
+      "status": "PROVEN_LIVE",
+      "receipt": {
+        "cf_finding": "CF Stream WebRTC (WHEP) playback is served ONLY for WHIP-ingested inputs. RTMPS/SRT ingest -> HLS/DASH, WebRTC playback = 409. WHEP egress MUST feed via WHIP-to-Stream (browser sendonly -> input webRTC.url).",
+        "codec_ceiling": "CF Stream Live WebRTC accepts VP9(rec)/VP8/h264-Constrained-Baseline-L3.1 (720p cap). 1080p H.264 exceeds L3.1. Fix = setCodecPreferences VP9-first.",
+        "feed": "harness/whip-to-stream-pub.mjs (Chromium fake-media, real looping VP9 Big Buck Bunny via --use-file-for-fake-video-capture=<Y4M> + --use-file-for-fake-audio-capture=<WAV>) -> input connected",
+        "publish_handshake": "WHIP-to-Stream publish -> 201 connected; direct CF /webRTC/play -> 201 + answer + 2 tracks negotiated",
+        "harness_prs": [197]
+      }
+    },
+    {
+      "id": "C",
+      "task": 162,
+      "name": "client-discovery",
+      "status": "SHIPPED_INERT",
+      "pending": "wave-desktop PR #53 merge (◆ Jake's-hand; main = PR-required)",
+      "receipt": {
+        "repo": "wave-av/wave-desktop",
+        "pr": 53,
+        "branch": "feat/whep-c-source-discovery",
+        "diff": "7 files, +199/-12",
+        "wiring": "shared/ipc.ts SessionSource{uid,room,createdAt} + sessionListSources channel; main/ipc.ts handler whep:read GET /v1/whep/sources (404/501 edge-INERT -> honest []); whep-client.ts buildSubscribeEndpoint(endpoint,uid) URL-encoded ?resource=; Receivers.tsx <select> picker",
+        "tests": "type-check clean; vitest 139/139 (3 new for buildSubscribeEndpoint); lint 0 warnings"
+      }
+    },
+    {
+      "id": "D",
+      "task": 163,
+      "name": "live-proof",
+      "status": "PROVEN_LIVE",
+      "receipt": {
+        "endpoint": "api.wave.online/v1/whep/subscribe?resource=<uid> (Bearer WHEP_DOGFOOD_KEY)",
+        "http": 201,
+        "media": "RECEIPT-PROVEN bytesReceived:4224 packets:38 kinds:[audio,video] — 2 tracks connected, real VP9 Big Buck Bunny 1080p",
+        "chain": "dogfood key -> gateway auth -> scope -> entitlement-floor -> forward -> edge(rt.wave.online) -> WHEP relay -> CF Stream WebRTC playback -> browser recvonly",
+        "relay_bug_fix": "liveWhepDeps() stored UNBOUND global fetch -> deps.fetch() 'Illegal invocation' -> REALTIME_UPSTREAM 503 on EVERY live subscribe. Fix = fetch: fetch.bind(globalThis) (PR #209, deployed run 29467027860). Regression test drives DEFAULT liveWhepDeps path w/ this-strict fetch stub.",
+        "isolation": "direct CF /webRTC/play bytesReceived>0 (CF+media+codec OK) while gateway->edge 503 -> bug isolated to WAVE edge code. HLS 500 was a red herring."
+      }
+    },
+    {
+      "id": "E",
+      "task": 164,
+      "name": "meter-receipt",
+      "status": "PROVEN_LIVE",
+      "receipt": {
+        "flow": "subscribe -> 201 (Location /v1/whep/resource/<rid>) -> held (real bytes 15228) -> DELETE -> 204 teardown -> edge emitWhepTeardownMeter POST /v1/internal/usage -> gateway ingest -> counter store",
+        "meter_read": "GET /v1/usage shows wave_whep_egress_minutes=60000ms -> billable 1 min for dogfood org 18e9224a (baseline 0)",
+        "gateway_registration": "origin/main src/product-meters.ts:169 registers {event:'wave_whep_egress_minutes', priceEnv:'STRIPE_PRICE_WHEP_EGRESS_MIN'} (price price_1TpvB8DZp3QOCf5POyGg1llx, $0.003/min LIVE)",
+        "meter_mechanism": "unregistered meter is SILENTLY DROPPED at ingest; duration=Math.ceil(ms/60000) (started session bills >=1min); idempotent on resourceId; fail-open emit",
+        "dogfood_exclusion": "2-layer: gateway deployed wrangler.toml [vars]:522 BILLING_EXCLUDE_ORGS='18e9224a-...' -> meter-sync parseBillingExcludeOrgs has(org) -> continue BEFORE any Stripe call (layer 1); !customerId -> continue (layer 2). Gateway reads its OWN toml NOT Doppler. Same path proven for WHIP #109 on this org.",
+        "billed_stripe": "$0 (dogfood-excluded; no real external charge — separate ◆)"
+      }
+    }
+  ],
+  "crossings": {
+    "dogfood_key": "DONE — Supabase api_keys id be5af222-e042-4c65-b250-ee39b2550b31, user_id 18e9224a, scopes [whep:read,whep:write,usage:read]; Bearer -> Doppler WHEP_DOGFOOD_KEY. No Stripe write.",
+    "wave_internal_secret_sync": "NOT NEEDED — dogfood-key path made direct-edge unnecessary (orphan #155 untouched).",
+    "real_external_stripe_sub": "NOT NEEDED for proof — dogfood floor cleaner; valid for a future real-customer entitlement proof."
+  },
+  "residual_followups": [
+    {"item": "wave-desktop PR #53 merge", "owner": "◆ Jake", "blocking": false},
+    {"item": "route-dispatch.ts decompose (799 lines — 1 from the 800 file-size ceiling)", "owner": "eng", "blocking": false},
+    {"item": "re-home epic commit cbec1ca off epic/metronome-m-phases at PR time", "owner": "eng", "blocking": false},
+    {"item": "daily meter-sync cron flush of today's WHEP row (will skip via BILLING_EXCLUDE_ORGS, deterministic)", "owner": "auto", "blocking": false}
+  ],
+  "reusable_rig": {
+    "publish": "harness/whip-to-stream-pub.mjs — FAKE_VIDEO_Y4M + FAKE_AUDIO_WAV (VP9), HOLD_MS>=240000 (must outlast the subscribe)",
+    "subscribe_media": "harness/whep-subscribe-proof.mjs — BEARER=$WHEP_DOGFOOD_KEY RESOURCE=<uid> -> bytesReceived receipt",
+    "subscribe_meter": ".whep-meter-proof.mjs (subscribe+hold+DELETE; must live INSIDE edge repo — NODE_PATH does not resolve ESM imports)",
+    "assets": "BBB 1080p mp4 -> Y4M 30fps (ffmpeg -r 30 -pix_fmt yuv420p -f yuv4mpegpipe) + tone WAV",
+    "cleanup": "5 test CF inputs + KV mappings all DELETE 200"
+  }
+}
