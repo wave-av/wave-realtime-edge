@@ -95,6 +95,40 @@ describe("CfStreamLiveClientImpl — createLiveInput", () => {
     expect(fetchFn.calls[0].method).toBe("POST");
   });
 
+  it("uses the DEFAULT global fetch bound to globalThis (regression: Illegal invocation)", async () => {
+    // Reproduces the real runtime: Workers/undici `fetch` throws "Illegal invocation" unless called with
+    // `this === globalThis`. The adapter must bind the default fetch, else `this.fetchFn(...)` leaks the
+    // instance as `this`. Injected-fetch tests can't catch this — only the DEFAULT (uninjected) path does.
+    const original = globalThis.fetch;
+    const strictFetch = function (this: unknown, _input: RequestInfo | URL, init?: RequestInit) {
+      if (this !== globalThis && this !== undefined) {
+        throw new TypeError("Illegal invocation: function called with incorrect `this` reference.");
+      }
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (method === "DELETE") return Promise.resolve(new Response("{}", { status: 200 }));
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            success: true,
+            errors: [],
+            result: { uid: UID, rtmps: { url: "rtmps://x/live/", streamKey: "k" }, srt: { url: "srt://x:778" } },
+          }),
+          { status: 200 },
+        ),
+      );
+    } as unknown as typeof fetch;
+    globalThis.fetch = strictFetch;
+    try {
+      const kv = fakeKv();
+      // NO fetchFn injected → exercises the constructor's `fetch.bind(globalThis)` default.
+      const client = new CfStreamLiveClientImpl({ accountId: "acct1", apiToken: "tok", kv, now: () => 1 });
+      const res = await client.createLiveInput(req());
+      expect(res.ok).toBe(true);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
   it("reverse index is newest-first, deduped by uid, capped", async () => {
     const kv = fakeKv();
     let t = 0;

@@ -108,7 +108,10 @@ export class CfStreamLiveClientImpl implements CfStreamLiveClient {
   private readonly ttl: number;
 
   constructor(private readonly cfg: CfStreamLiveClientConfig) {
-    this.fetchFn = cfg.fetchFn ?? fetch;
+    // BIND to globalThis: the Workers/undici global `fetch` throws "Illegal invocation" when called as a
+    // method (`this.fetchFn(...)` would set `this` to this instance). Storing it bound keeps `this` correct.
+    // (Unit tests inject their own `fetchFn`, so this binding is only exercised in the real runtime.)
+    this.fetchFn = cfg.fetchFn ?? fetch.bind(globalThis);
     this.now = cfg.now ?? Date.now;
     this.ttl = cfg.ttlSeconds ?? DEFAULT_TTL_SECONDS;
   }
