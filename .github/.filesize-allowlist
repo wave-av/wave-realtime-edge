@@ -1,3 +1,11 @@
 # File-size gate justified exceptions (consumed by wave-foundation checks.yml "File-size gate").
 # One exact repo-relative path per line; lines starting with '#' are ignored (no exact match).
 # Each entry is AUDITED debt, not a free pass — every file here MUST have a tracked split task.
+#
+# src/room.ts — RoomCore + RoomDO (the realtime room Durable Object). Already 796 lines on main
+# before #187; the egress-bind intent slice (RoomDO routed-egress arm trigger, INERT until the
+# relevant flags flip) adds ~58 lines, tipping it to 854. #187 is scaffold-only shadow-arming
+# work (no behavior change) — not the right PR to carry a structural refactor of a prod-critical
+# Durable Object. Tracked follow-up to split RoomCore/RoomDO out of room.ts (mirroring the
+# worker.ts -> route-dispatch.ts split in #56): wave-av/wave-realtime-edge#191.
+src/room.ts
