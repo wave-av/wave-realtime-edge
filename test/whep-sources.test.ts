@@ -135,8 +135,8 @@ describe("handleWhepSources", () => {
     const res = await handleWhepSources(post({ sourceKind: "srtPush", room: "room-1" }), env(), "acme", {
       fetchFn: failFetch,
     });
-    expect(res?.status).toBe(403);
+    expect(res?.status).toBe(422); // diag: provision failure surfaced as 4xx so the gateway passes the reason through
     const j = (await res!.json()) as { error: string };
-    expect(j.error).toBe("WHEP_SOURCE_PROVISION_FAILED");
+    expect(j.error).toBe("WHEP_DIAG_FAILED");
   });
 });
