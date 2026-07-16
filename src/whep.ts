@@ -99,7 +99,10 @@ export function liveWhepDeps(): WhepDeps {
 	return {
 		now: () => Date.now(),
 		mintResourceId: () => crypto.randomUUID().replace(/-/g, ""),
-		fetch,
+		// BIND to globalThis: the Workers/undici global `fetch` throws "Illegal invocation" when invoked as a
+		// method (`deps.fetch(...)` sets `this` to the deps object). Storing it bound keeps `this` correct — this
+		// is exactly what silently 503'd the live WHEP relay (upstream fetch threw, caught → REALTIME_UPSTREAM).
+		fetch: fetch.bind(globalThis),
 	};
 }
 
