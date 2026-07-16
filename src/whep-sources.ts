@@ -137,7 +137,7 @@ export async function handleWhepSources(
       console.error(
         `whep-sources provision THREW org=${org} kind=${parsed.job.sourceKind} acctLen=${creds.accountId.length} tokLen=${creds.apiToken.length}: ${(e as Error)?.stack ?? String(e)}`,
       );
-      return jsonError("WHEP_SOURCE_PROVISION_FAILED", `provision error: ${(e as Error)?.message ?? String(e)}`, 502);
+      return jsonError("WHEP_DIAG_THREW", `[diag acct=${creds.accountId.length} tok=${creds.apiToken.length}] provision error: ${(e as Error)?.message ?? String(e)}`, 422);
     }
 
     switch (outcome.status) {
@@ -150,7 +150,7 @@ export async function handleWhepSources(
         console.error(
           `whep-sources provision FAILED org=${org} kind=${parsed.job.sourceKind} acctLen=${creds.accountId.length} tokLen=${creds.apiToken.length} status=${r.status}: ${r.reason}`,
         );
-        return jsonError("WHEP_SOURCE_PROVISION_FAILED", r.reason, r.status >= 400 && r.status < 600 ? r.status : 502);
+        return jsonError("WHEP_DIAG_FAILED", `[diag acct=${creds.accountId.length} tok=${creds.apiToken.length} st=${r.status}] ${r.reason}`, 422);
       }
       case "deferred":
         // Routed to another plane (whip → SFU via /v1/whip; container bridge via /v1/ingest). Not this surface.
