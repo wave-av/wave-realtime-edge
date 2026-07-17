@@ -23,8 +23,43 @@
  */
 import { Container } from "@cloudflare/containers";
 
+/**
+ * The subset of the Worker Env this DO forwards into the container. These are `wrangler secret put` /
+ * `[vars]` bindings on the WORKER — `@cloudflare/containers` does NOT inherit Worker bindings into the
+ * container, so each must be handed across explicitly via `envVars` (see constructor). Names match exactly
+ * what `containers/stream-bridge/server/index.mjs` reads (`process.env.*`).
+ */
+export interface StreamBridgeContainerEnv {
+  WHEP_SRC_URL_TEMPLATE?: string; // SECRET. Stream WHEP playback URL template ({uid} placeholder) — primary source
+  WHEP_SRC_URL?: string; // SECRET. Explicit WHEP source URL — fallback when no template
+  WHIP_DST_URL?: string; // SECRET. SFU WHIP publish endpoint the relay republishes into
+  WHIP_KEY?: string; // SECRET. Bridge wk_ key authorizing the WHIP publish (resolved server-side by the gateway)
+  WHEP_AUTH?: string; // SECRET (optional). Bearer/authorization for the upstream WHEP pull
+}
+
+/** The container env keys, in the order the server reads them; only DEFINED values are forwarded. */
+const FORWARDED_ENV_KEYS = [
+  "WHEP_SRC_URL_TEMPLATE",
+  "WHEP_SRC_URL",
+  "WHIP_DST_URL",
+  "WHIP_KEY",
+  "WHEP_AUTH",
+] as const satisfies readonly (keyof StreamBridgeContainerEnv)[];
+
 /** Path A — the WAVE-owned whep-to-whip republisher container. Same image self-hosts for Path B (no DO there). */
-export class StreamBridgeContainer extends Container {
+export class StreamBridgeContainer extends Container<StreamBridgeContainerEnv> {
   defaultPort = 8080;
   sleepAfter = "5m";
+
+  constructor(ctx: DurableObjectState<StreamBridgeContainerEnv>, env: StreamBridgeContainerEnv) {
+    super(ctx, env);
+    // Worker bindings are NOT inherited by the container — forward the WHEP/WHIP secrets explicitly. Omit
+    // undefined so we never set empty-string env (the server treats absence and "" differently).
+    const forwarded: Record<string, string> = {};
+    for (const key of FORWARDED_ENV_KEYS) {
+      const value = env[key];
+      if (value !== undefined) forwarded[key] = value;
+    }
+    this.envVars = forwarded;
+  }
 }
