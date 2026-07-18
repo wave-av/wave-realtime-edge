@@ -62,17 +62,28 @@ const RESOURCE_ID = /^[0-9a-zA-Z_-]{8,128}$/;
 const WHIP_KV_PREFIX = "whip:";
 /** Resource records outlive a publish session comfortably; TTL bounds the teardown window. */
 const WHIP_KV_TTL_SECONDS = 60 * 60 * 24; // 24h
+/**
+ * #35 — where the orphan sweeper parked its pagination cursor. Deliberately NOT under `whip:` so the sweep's
+ * own bookkeeping is never enumerated as a resource record by `list({ prefix: WHIP_KV_PREFIX })`.
+ */
+const WHIP_SWEEP_CURSOR_KEY = "whipsweep:cursor";
 
-/** The minimal KV surface this module needs (read/write/delete the resource record). Matches CF KV. */
+/** The minimal KV surface this module needs (read/write/delete/list the resource record). Matches CF KV. */
 export interface WhipKv {
 	get(key: string): Promise<string | null>;
 	put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<void>;
 	delete(key: string): Promise<void>;
+	// #35: paginated enumeration for the orphan sweeper (same shape the other cron reconciles use).
+	list(opts: {
+		prefix?: string;
+		cursor?: string;
+	}): Promise<{ keys: { name: string }[]; list_complete: boolean; cursor?: string }>;
 }
 
 /** The subset of worker Env this module reads. SFU creds gate liveness; meter/KV are optional → INERT. */
 export interface WhipEnv extends MeterEmitEnv, WhipRoomEnv {
 	WHIP_INGEST_ENABLED?: string | boolean; // [vars] flag — falsy/absent → surface is inert (worker 501s)
+	WHIP_SWEEP_ENABLED?: string | boolean; // #35 [vars] flag — falsy/absent → the orphan sweeper never runs
 	CF_CALLS_APP_ID?: string; // CF Realtime SFU app id (hex) — SfuClient appId
 	CF_CALLS_APP_SECRET?: string; // CF Realtime SFU app secret (Bearer) — never logged/returned
 	RT_MEETING_ORG?: WhipKv; // reused KV namespace: resourceId → {sessionId, org, startedAt}
@@ -92,6 +103,10 @@ interface WhipResource {
 	// #91 B2: the resolved billing meter, captured (gateway-sealed, allowset-validated) at publish so the
 	// teardown bills the right SKU regardless of how it fires (client DELETE or cron). Absent ⇒ default WHIP.
 	meter?: string;
+	// #35: last epoch-ms at which the sweeper OBSERVED this session alive at the SFU. The orphan sweep bills
+	// `startedAt → lastSeenAt` (never → sweep-time), so a session whose publisher died without a DELETE is
+	// billed only for time it was demonstrably live. Absent ⇒ never probed; falls back to startedAt.
+	lastSeenAt?: number;
 }
 
 /** Injectable seams so every path unit-tests with NO live network (mirrors the repo's __egressDeps pattern). */
@@ -120,6 +135,33 @@ export function liveWhipDeps(): WhipDeps {
 export function whipIngestEnabled(env: WhipEnv): boolean {
 	const v = env.WHIP_INGEST_ENABLED;
 	return v === true || v === "1" || v === "true";
+}
+
+/**
+ * #35 — the dedicated cron expression for the orphan sweep. MUST stay byte-identical to the second entry in
+ * wrangler.toml `crons`, since scheduledHandler compares `event.cron` against it to keep the pre-existing
+ * fifteen-minute reconciles on their original cadence.
+ */
+export const WHIP_SWEEP_CRON = "*/5 * * * *";
+
+/** #35 — True only when an operator has armed the orphan sweeper. Default (absent/"0"/false) → never runs. */
+export function whipSweepEnabled(env: WhipEnv): boolean {
+	const v = env.WHIP_SWEEP_ENABLED;
+	return v === true || v === "1" || v === "true";
+}
+
+/**
+ * #35 — cron entrypoint for the WHIP orphan sweeper, mirroring the other scheduled reconciles: flag-gated,
+ * best-effort, and detached via waitUntil so a slow sweep never delays the scheduled() return. A sweep
+ * failure is logged, never thrown — metering must not break the cron for every other tap.
+ */
+export function scheduledWhipSweep(env: WhipEnv, ctx: { waitUntil(p: Promise<unknown>): void }): void {
+	if (!whipSweepEnabled(env) || !env.RT_MEETING_ORG) return; // INERT by default
+	ctx.waitUntil(
+		sweepWhipResources(env, liveWhipDeps()).catch((e) =>
+			console.warn(`whip-sweep failed: ${(e as Error)?.message ?? e}`),
+		),
+	);
 }
 
 /** Typed JSON error envelope (the 201 body is SDP; every error body is JSON, mirroring the spoke contract). */
@@ -153,8 +195,28 @@ export async function emitWhipTeardownMeter(
 	line: MeterLine,
 	fetchFn: typeof fetch,
 ): Promise<void> {
-	if (!isEmitProvisioned(env)) return; // INERT until operator provisions URL + token
-	if (!(line.meter_value > 0)) return; // nothing billable (zero/negative duration)
+	// Fail-open by contract: the client-DELETE path must never be affected by a metering failure.
+	await deliverWhipTeardownMeter(env, org, line, fetchFn);
+}
+
+/**
+ * The same emit, but REPORTING whether the usage was actually accepted. The cron sweeper needs this: unlike
+ * handleDelete (where the client is tearing down regardless and fail-open is correct), the sweeper OWNS the
+ * only remaining record of that session's usage. If it dropped the record on an emit that silently failed,
+ * the minutes would be lost forever — reintroducing the exact revenue leak this sweeper exists to close.
+ * So the sweeper retries on the next tick instead, which is safe because the emit is idempotent on
+ * event_id = resourceId.
+ *
+ * @returns true when the usage is durably accounted for (delivered, or nothing billable to deliver).
+ */
+export async function deliverWhipTeardownMeter(
+	env: WhipEnv,
+	org: string,
+	line: MeterLine,
+	fetchFn: typeof fetch,
+): Promise<boolean> {
+	if (!isEmitProvisioned(env)) return false; // INERT — nothing was recorded, so nothing may be dropped
+	if (!(line.meter_value > 0)) return true; // nothing billable (zero/negative duration) → safe to drop
 	const base = (env.GATEWAY_BASE_URL as string).replace(/\/+$/, "");
 	const token = env.WAVE_SERVICE_TOKEN as string;
 	const body: UsageEnvelope = { org, usage: line };
@@ -164,11 +226,192 @@ export async function emitWhipTeardownMeter(
 			headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
 			body: JSON.stringify(body),
 		});
-		if (!res.ok) console.warn(`whip-meter emit failed status=${res.status} org=${org}`); // loud, non-blocking
+		if (!res.ok) {
+			console.warn(`whip-meter emit failed status=${res.status} org=${org}`); // loud, non-blocking
+			return false;
+		}
+		return true;
 	} catch (e) {
-		// Fail-open: a usage emit must NEVER affect the live/teardown path (media-safety > metering).
 		console.warn(`whip-meter emit error org=${org}: ${(e as Error)?.message ?? e}`);
+		return false;
 	}
+}
+
+/** One probed resource, ready for the pure sweep planner. */
+export interface WhipSweepEntry {
+	resourceId: string;
+	record: WhipResource;
+	/** SFU liveness verdict (see SfuClient.sessionLiveness). "unknown" ⇒ we could not tell. */
+	verdict: "alive" | "gone" | "unknown";
+	/**
+	 * Epoch ms captured immediately BEFORE this session's own probe. Stamped per-entry rather than once per
+	 * page because a page of probes takes real time: a single post-loop timestamp would credit the first
+	 * session with liveness it was never observed to have, and that inflated lastSeenAt would later be
+	 * billed as real. A conservative pre-probe stamp can only ever under-credit.
+	 */
+	observedAt: number;
+}
+
+/** What the sweeper should DO — computed purely, applied by sweepWhipResources. */
+export interface WhipSweepPlan {
+	/** Still live → persist a refreshed lastSeenAt so a later orphan teardown bills to a VERIFIED instant. */
+	refresh: { resourceId: string; record: WhipResource }[];
+	/** Orphaned (publisher died without a DELETE) → bill, then drop. */
+	meter: { resourceId: string; org: string; line: MeterLine }[];
+	/** Resource ids whose KV record should be deleted (always the billed ones). */
+	drop: string[];
+}
+
+/**
+ * #35 — decide, PURELY, what to do with each probed WHIP resource. No I/O, so the billing rules are
+ * unit-testable in isolation (mirrors buildWhipMeterLine's pure-accounting stance).
+ *
+ * The three verdicts map to deliberately asymmetric actions, because this is a BILLING boundary:
+ *  - "alive"   → refresh lastSeenAt to `now`. We just verified it, so it is safe to bill up to here later.
+ *  - "gone"    → bill `startedAt → lastSeenAt` and drop. NEVER bill to `now`: the publisher died at some
+ *                unknown point since the last verified sighting, so billing to sweep-time would charge for
+ *                dead air. Under-billing by at most one sweep interval is the correct error direction.
+ *  - "unknown" → do NOTHING (no refresh, no bill). Refreshing on an unverified probe would silently inflate
+ *                a later orphan bill; billing on it could close a session that is actually live. The record
+ *                simply survives to the next tick (and the 24h KV TTL bounds it).
+ *
+ * The billed window is floored at 1ms so a session that dies before its first successful probe still bills
+ * the documented ≥1 ceil-minute for a started publish, rather than silently billing zero.
+ */
+export function planWhipSweep(entries: WhipSweepEntry[], now: number): WhipSweepPlan {
+	const plan: WhipSweepPlan = { refresh: [], meter: [], drop: [] };
+	for (const { resourceId, record, verdict, observedAt } of entries) {
+		if (verdict === "unknown") continue; // cannot tell → never act on a guess
+		if (verdict === "alive") {
+			// Stamp the instant THIS session was probed, never the page-wide `now` (see WhipSweepEntry.observedAt).
+			plan.refresh.push({ resourceId, record: { ...record, lastSeenAt: observedAt ?? now } });
+			continue;
+		}
+		// "gone": bill to the last VERIFIED-alive instant, never to `now`. Floor at startedAt+1ms so an
+		// established publish always bills the documented minimum of one ceil-minute.
+		const endedAt = Math.max(record.lastSeenAt ?? 0, record.startedAt + 1);
+		plan.meter.push({
+			resourceId,
+			org: record.org,
+			line: buildWhipMeterLine(resourceId, record.startedAt, endedAt, resolveWhipMeter(record.meter)),
+		});
+		plan.drop.push(resourceId);
+	}
+	return plan;
+}
+
+/**
+ * #35 — the WHIP orphan sweeper (revenue integrity). A publish whose client tears down cleanly is billed by
+ * handleDelete; a publish whose CONTAINER IS EVICTED OR CRASHES never sends that DELETE, so without this
+ * sweep its minutes are never billed at all. This is the "or cron" teardown path the resource record was
+ * designed for (see WhipResource.meter).
+ *
+ * SAFE BY CONSTRUCTION:
+ *  - idempotent — emitWhipTeardownMeter keys on event_id = resourceId, so a sweep that races a late client
+ *    DELETE cannot double-bill.
+ *  - fail-open — every emit is best-effort (a metering blip must never throw out of scheduled()).
+ *  - inert — no KV binding or unconfigured SFU creds ⇒ a no-op, matching the repo's default-off stance.
+ *
+ * Bounded per tick (`limit`) so the cron stays well inside its CPU budget; the remainder is swept next tick.
+ */
+export async function sweepWhipResources(
+	env: WhipEnv,
+	deps: WhipDeps,
+	opts: { limit?: number } = {},
+): Promise<{ scanned: number; billed: number; refreshed: number; skipped: number; deferred: number }> {
+	// `deferred` = orphans whose usage could NOT be confirmed delivered; their records are kept for retry.
+	const stats = { scanned: 0, billed: 0, refreshed: 0, skipped: 0, deferred: 0 };
+	const kv = env.RT_MEETING_ORG;
+	if (!kv) return stats; // no binding → inert
+	let sfu: SfuClient;
+	try {
+		sfu = deps.sfu(env);
+	} catch {
+		return stats; // SFU unconfigured (fail-closed) → nothing can be probed, so sweep nothing
+	}
+	// No billing sink ⇒ nothing this sweep does could be recorded, and dropping records against a dead sink
+	// would destroy usage. Stay inert instead.
+	if (!isEmitProvisioned(env)) return stats;
+
+	const limit = opts.limit ?? 200;
+	// RESUME where the last tick stopped. A sweep that always restarted at the first page would re-probe the
+	// same head of the keyspace every tick, so with more than `limit` live sessions the tail would NEVER be
+	// swept and its orphaned minutes would never bill — the very leak this exists to close.
+	let cursor = (await kv.get(WHIP_SWEEP_CURSOR_KEY)) ?? undefined;
+	// Bound on keys EXAMINED, not on records successfully loaded: counting only valid records would let a run
+	// of corrupt/foreign keys enumerate the whole namespace without ever hitting the limit.
+	let examined = 0;
+	let listComplete = false;
+
+	do {
+		const page = await kv.list({ prefix: WHIP_KV_PREFIX, cursor });
+		const entries: WhipSweepEntry[] = [];
+		for (const { name } of page.keys) {
+			if (examined >= limit) break;
+			examined++;
+			const resourceId = name.slice(WHIP_KV_PREFIX.length);
+			if (!RESOURCE_ID.test(resourceId)) continue; // ignore anything that is not a resource record
+			const record = await loadResource(kv, resourceId);
+			if (!record) continue; // absent/corrupt → nothing to bill
+			stats.scanned++;
+			// Stamp BEFORE the probe: a conservative timestamp can only under-credit liveness, never invent it.
+			const observedAt = deps.now();
+			// A probe failure must never abort the sweep — treat it as "unknown" and move on.
+			let verdict: WhipSweepEntry["verdict"];
+			try {
+				verdict = await sfu.sessionLiveness(record.sessionId);
+			} catch {
+				verdict = "unknown";
+			}
+			entries.push({ resourceId, record, verdict, observedAt });
+		}
+
+		const plan = planWhipSweep(entries, deps.now());
+		stats.skipped += entries.length - plan.refresh.length - plan.meter.length;
+
+		// Bill the orphans FIRST (while org/startedAt/meter are still in hand), and DROP ONLY WHAT WAS ACCEPTED.
+		// An unconfirmed emit leaves the record in place so the next tick retries it; that retry is safe because
+		// the emit is idempotent on event_id = resourceId.
+		for (const { resourceId, org, line } of plan.meter) {
+			const delivered = await deliverWhipTeardownMeter(env, org, line, deps.fetch);
+			if (!delivered) {
+				stats.deferred++;
+				continue; // keep the record — it is the ONLY remaining evidence of this session's usage
+			}
+			stats.billed++;
+			try {
+				await kv.delete(`${WHIP_KV_PREFIX}${resourceId}`);
+			} catch (e) {
+				console.warn(`whip-sweep drop failed resourceId=${resourceId}: ${(e as Error)?.message ?? e}`);
+			}
+		}
+		// Persist refreshed sightings (preserving the original TTL window).
+		for (const { resourceId, record } of plan.refresh) {
+			try {
+				await kv.put(`${WHIP_KV_PREFIX}${resourceId}`, JSON.stringify(record), {
+					expirationTtl: WHIP_KV_TTL_SECONDS,
+				});
+				stats.refreshed++;
+			} catch (e) {
+				console.warn(`whip-sweep refresh failed resourceId=${resourceId}: ${(e as Error)?.message ?? e}`);
+			}
+		}
+		listComplete = page.list_complete;
+		cursor = page.list_complete ? undefined : page.cursor;
+	} while (cursor && examined < limit);
+
+	// Park the cursor for the next tick; clear it once a full pass has wrapped so the next sweep starts fresh.
+	try {
+		if (listComplete || !cursor) await kv.delete(WHIP_SWEEP_CURSOR_KEY);
+		else await kv.put(WHIP_SWEEP_CURSOR_KEY, cursor, { expirationTtl: WHIP_KV_TTL_SECONDS });
+	} catch (e) {
+		console.warn(`whip-sweep cursor persist failed: ${(e as Error)?.message ?? e}`);
+	}
+
+	if (stats.billed > 0 || stats.scanned > 0) {
+		console.log(JSON.stringify({ msg: "whip-sweep", ...stats }));
+	}
+	return stats;
 }
 
 /** Parse a `whip:`-prefixed KV record back into a typed WhipResource, or null on absent/corrupt. */
@@ -186,6 +429,8 @@ async function loadResource(kv: WhipKv | undefined, resourceId: string): Promise
 				meter: typeof r.meter === "string" ? r.meter : undefined,
 				// #145: carry the room forward so DELETE can address the recorder-holding DO to finalize.
 				room: typeof r.room === "string" ? r.room : undefined,
+				// #35: carry the sweeper's last observed-alive stamp so an orphan teardown bills to it.
+				lastSeenAt: typeof r.lastSeenAt === "number" ? r.lastSeenAt : undefined,
 			};
 		}
 	} catch {

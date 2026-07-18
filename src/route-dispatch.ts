@@ -6,7 +6,7 @@ import { join, turn, RtkError } from "./realtimekit";
 import { selectEncoder } from "./encoders/factory";
 import { verifyRecorderToken } from "./encoders/recorder-auth";
 import { pullRecordingConfigured } from "./encoders/managed";
-import { handleRecordingWebhook, reconcilePending } from "./rtk-webhook";
+import { handleRecordingWebhook } from "./rtk-webhook";
 // B3 (#98) — IETF WHIP v1 ingest surface (/v1/whip/*). INERT behind WHIP_INGEST_ENABLED ([vars], default off
 // → the 501 catch-all is unchanged). See src/whip.ts + whip-v1-frozen-contract.md §3/§4/§6-B3.
 import { handleWhip, whipIngestEnabled, type WhipEnv } from "./whip";
@@ -16,7 +16,7 @@ import { handleWhep, whepEgressEnabled, type WhepEnv } from "./whep";
 import { maybeHandleWhepSources, type WhepSourcesEnv } from "./whep-sources";
 // B1 (#91-a) — CF Stream Live → SFU bridge CONTROL PLANE. INERT behind STREAM_BRIDGE_ENABLED. worker.ts only
 // DELEGATES; all matching/auth/dispatch lives in src/stream-bridge.ts (+ cf-stream-bridge-frozen-contract).
-import { maybeHandleStreamBridge, scheduledStreamReconcile } from "./stream-bridge";
+import { maybeHandleStreamBridge } from "./stream-bridge";
 // #88 M2 — Zoom RTMS webhook receiver (control-only). INERT behind WAVE_ZOOM_RTMS ([vars], default off →
 // the 501 catch-all is unchanged). Self-verifies x-zm-signature; the outbound media WS dial-out is a ◆ follow-up.
 import { maybeHandleZoomRtms } from "./zoom-rtms-bridge";
@@ -26,7 +26,7 @@ import { zoomRtmsSeams, maybeHandleZoomRtmsIngest } from "./zoom-rtms-bridge-do"
 // F (#55) — Direct (Plane-2) any-protocol ingest → SFU bridge CONTROL PLANE. INERT behind INGEST_BRIDGE_ENABLED
 // + per-protocol container binding. worker.ts only DELEGATES; matching/auth/dispatch lives in src/ingest-bridge.ts
 // (+ any-protocol-ingest-frozen-contract). Sibling of the Plane-1 cf-stream bridge; gateway-forwarded start trigger.
-import { maybeHandleIngestBridge, scheduledIngestReconcile } from "./ingest-bridge";
+import { maybeHandleIngestBridge } from "./ingest-bridge";
 // Task #81 (LK-rip Phase 6b) — voice-agent runtime. INERT behind VOICE_AGENT_PROVIDER==="wave": every new
 // route/DO behavior is gated by voiceAgentEnabled(env); absent/anything-else → the 501 catch-all is unchanged.
 import { voiceAgentEnabled, type AgentSessionConfig } from "./agent-session";
@@ -774,26 +774,6 @@ export async function dispatch(
 	return Response.json({ error: "REALTIME_NOT_IMPLEMENTED", path: url.pathname }, { status: 501 });
 }
 
-/**
- * Cron handler body. Extracted alongside dispatch() so worker.ts stays under 800 lines.
- * Cron (wrangler.toml [triggers]) — durable recovery for PULL-mode recordings. RTK fires the UPLOADED
- * webhook once and never re-delivers after our 200, so a POST-ack pull failure would silently lose the
- * recording. handleRecordingWebhook enqueues a pending-pull record on failure; this reconcile re-pulls each
- * with a freshly resolved download URL (idempotent key) and clears it on success. Best-effort; never throws.
- */
-export async function scheduledHandler(
-	_event: ScheduledEvent,
-	env: Env,
-	ctx: ExecutionContext,
-): Promise<void> {
-	const sink = buildPullSink(env);
-	if (sink && env.RT_MEETING_ORG) {
-		ctx.waitUntil(
-			reconcilePending(env.RT_MEETING_ORG, sink, (msg, fields) => console.log(JSON.stringify({ msg, ...fields }))),
-		);
-	}
-	// B1 (#91-a) — CF Stream bridge lifecycle-poll backstop (INERT unless enabled + KV bound). Best-effort.
-	scheduledStreamReconcile(env, ctx);
-	// F (#55) — Plane-2 ingest-bridge pending-start reconcile backstop (INERT unless enabled + KV bound). Best-effort.
-	scheduledIngestReconcile(env, ctx);
-}
+// Cron handler body — moved to its own leaf module (./scheduled) so this file stays under 800 lines.
+// Re-exported here so worker.ts, the only external consumer, keeps its import unchanged.
+export { scheduledHandler } from "./scheduled";
