@@ -160,7 +160,7 @@ describe("parseStreamEvent — tolerant of field-name variants", () => {
       "disconnected",
     );
     expect(parseStreamEvent(JSON.stringify({ event: "live_input.connected", live_input: { uid: "u3", live: true } }))).toEqual(
-      { uid: "u3", lifecycle: "connected", live: true, keys: ["event", "live_input"] },
+      { uid: "u3", lifecycle: "connected", live: true, keys: ["event", "live_input", "live_input.uid", "live_input.live"] },
     );
   });
   it("no uid → null; bad json → null", () => {
@@ -197,6 +197,76 @@ describe("parseStreamEvent — tolerant of field-name variants", () => {
     const evt = parseStreamEvent(JSON.stringify({ event_type: "live_input.connected", input_id: "u8", meta: "secret-ish" }));
     expect(evt?.keys).toEqual(["event_type", "input_id", "meta"]);
     expect(JSON.stringify(evt?.keys)).not.toContain("secret-ish");
+  });
+
+  // THE REAL CF SHAPE, verbatim from the Stream Live webhooks docs. Both the uid and the event name are
+  // nested under `data` — the root-only parser found NEITHER, which is why a real push dispatched nothing.
+  // This is the one test in this file written against CF's documented body rather than our invention.
+  it("parses CF's documented nested live webhook body", () => {
+    const real = JSON.stringify({
+      name: "Live Webhook Test",
+      text: "Notification type: Stream Live Input\nEvent type: live_input.connected",
+      data: {
+        notification_name: "Stream Live Input",
+        input_id: "eb222fcca08eeb1ae84c981ebe8aeeb6",
+        event_type: "live_input.connected",
+        updated_at: "2022-01-13T11:43:41.855717910Z",
+      },
+      ts: 1642074233,
+    });
+    expect(parseStreamEvent(real)).toMatchObject({
+      uid: "eb222fcca08eeb1ae84c981ebe8aeeb6",
+      lifecycle: "connected",
+    });
+    // replaceAll, not replace: the human-readable `text` field repeats the event name, so a single
+    // replace would flip only that copy and leave data.event_type saying "connected".
+    expect(parseStreamEvent(real.replaceAll("live_input.connected", "live_input.disconnected"))?.lifecycle).toBe(
+      "disconnected",
+    );
+  });
+
+  it("finds fields at ARBITRARY depth, not just one known envelope", () => {
+    const deep = JSON.stringify({ a: { b: { c: { event_type: "live_input.connected", input_id: "deep1" } } } });
+    expect(parseStreamEvent(deep)).toMatchObject({ uid: "deep1", lifecycle: "connected" });
+  });
+
+  it("walks arrays too — a field inside a list is still found", () => {
+    const inArray = JSON.stringify({ events: [{ event_type: "live_input.disconnected", input_id: "arr1" }] });
+    expect(parseStreamEvent(inArray)).toMatchObject({ uid: "arr1", lifecycle: "disconnected" });
+  });
+
+  it("shallower field wins over a deeper one of the same name (breadth-first)", () => {
+    const both = JSON.stringify({ input_id: "root", data: { input_id: "nested" } });
+    expect(parseStreamEvent(both)?.uid).toBe("root");
+  });
+
+  it("keys reports DOTTED PATHS so the failing shape is identifiable", () => {
+    const evt = parseStreamEvent(JSON.stringify({ ts: 1, data: { input_id: "u9", event_type: "video.ready" } }));
+    expect(evt?.lifecycle).toBe("other");
+    expect(evt?.keys).toContain("data.event_type");
+    expect(evt?.keys).toContain("data.input_id");
+  });
+
+  // The payload is unvetted third-party input: bounded on depth AND node count so it cannot become a CPU sink.
+  it("survives a pathological payload without hanging", () => {
+    let deep: Record<string, unknown> = { input_id: "bomb" };
+    for (let i = 0; i < 200; i++) deep = { nest: deep };
+    expect(() => parseStreamEvent(JSON.stringify(deep))).not.toThrow();
+
+    const wide: Record<string, unknown> = { input_id: "wide" };
+    for (let i = 0; i < 5000; i++) wide[`k${i}`] = `v${i}`;
+    const started = Date.now();
+    parseStreamEvent(JSON.stringify(wide));
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it("is cycle-safe (a self-referential object cannot loop the walk)", () => {
+    // JSON.parse can't produce a cycle, so drive the walk through a body with heavy shared nesting.
+    const shared = { event_type: "live_input.connected", input_id: "cyc1" };
+    expect(parseStreamEvent(JSON.stringify({ a: shared, b: shared, c: { d: shared } }))).toMatchObject({
+      uid: "cyc1",
+      lifecycle: "connected",
+    });
   });
 });
 

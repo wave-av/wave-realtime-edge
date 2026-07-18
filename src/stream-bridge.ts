@@ -140,11 +140,58 @@ export interface StreamBridgeEvent {
  */
 const LIFECYCLE_NAME_RE = /^live[._]?input\.(connected|disconnected)$/;
 
-/** Top-level string values that look like a lifecycle event name, whatever key they arrived under. */
+/**
+ * Depth/size bounds for the payload walk. The body is UNVETTED third-party input, so the walk is
+ * bounded on both axes: a hostile or pathological payload must not turn parsing into a CPU sink.
+ * Depth 6 comfortably covers CF's observed 2-level shape with headroom for future nesting.
+ */
+const MAX_DEPTH = 6;
+const MAX_NODES = 500;
+
+interface Field {
+  path: string; // dotted path, e.g. "data.event_type"
+  key: string; // leaf key name
+  value: unknown;
+  depth: number;
+}
+
+/**
+ * Walk EVERY field at EVERY depth (objects and arrays), breadth-first so shallower matches win.
+ *
+ * Deliberately generic rather than a list of known envelope keys: CF's documented body nests the
+ * real fields under `data` ({ name, text, ts, data: { input_id, event_type, ... } }), which is what
+ * defeated the original root-only parser — but hardcoding `data` just relocates the same guess one
+ * level down. We do not control this schema and cannot know what a future shape nests under, so we
+ * search by field identity at any depth instead of by assumed position. Cycle-safe via `seen`.
+ */
+function walkFields(root: Record<string, unknown>): Field[] {
+  const out: Field[] = [];
+  const seen = new WeakSet<object>();
+  let queue: { obj: unknown; path: string; depth: number }[] = [{ obj: root, path: "", depth: 0 }];
+
+  while (queue.length && out.length < MAX_NODES) {
+    const next: typeof queue = [];
+    for (const { obj, path, depth } of queue) {
+      if (!obj || typeof obj !== "object" || depth > MAX_DEPTH) continue;
+      if (seen.has(obj)) continue; // guards self-referential payloads
+      seen.add(obj);
+      for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+        if (out.length >= MAX_NODES) break;
+        const p = path ? `${path}.${key}` : key;
+        out.push({ path: p, key, value, depth });
+        if (value && typeof value === "object") next.push({ obj: value, path: p, depth: depth + 1 });
+      }
+    }
+    queue = next;
+  }
+  return out;
+}
+
+/** String values that look like a lifecycle event name, whatever key OR nesting depth they arrived under. */
 function nameCandidates(j: Record<string, unknown>): string[] {
-  return Object.values(j)
-    .filter((v): v is string => typeof v === "string")
-    .map((v) => v.toLowerCase())
+  return walkFields(j)
+    .filter((f): f is Field & { value: string } => typeof f.value === "string")
+    .map((f) => f.value.toLowerCase())
     .filter((v) => LIFECYCLE_NAME_RE.test(v));
 }
 
@@ -155,10 +202,22 @@ function lifecycleOf(j: Record<string, unknown>): StreamLifecycle {
   }
   // Legacy key-keyed fallback: tolerates shapes that carry a bare name (`connected`) with no `live_input.` prefix.
   const name = String(
-    j.notificationName ?? j.eventType ?? j.event_type ?? j.event ?? j.notification_name ?? "",
+    firstOf(j, ["notificationName", "eventType", "event_type", "event", "notification_name"]) ?? "",
   ).toLowerCase();
   if (!name.includes("connected")) return "other";
   return name.includes("disconnect") ? "disconnected" : "connected";
+}
+
+/**
+ * First non-empty string whose KEY is one of `keys`, at any depth. `walkFields` is breadth-first, so a
+ * root-level field wins over a deeper one of the same name; `keys` order breaks ties within a level.
+ */
+function firstOf(j: Record<string, unknown>, keys: string[]): string | undefined {
+  const fields = walkFields(j).filter((f) => typeof f.value === "string" && f.value !== "");
+  for (const f of fields) {
+    if (keys.includes(f.key)) return f.value as string;
+  }
+  return undefined;
 }
 
 /**
@@ -173,19 +232,20 @@ export function parseStreamEvent(rawText: string): StreamBridgeEvent | null {
   } catch {
     return null;
   }
-  const li = (j.live_input ?? null) as Record<string, unknown> | null;
-  const uid = String(
-    j.input_id ?? j.uid ?? j.inputId ?? (li && typeof li.uid === "string" ? li.uid : "") ?? "",
-  );
+  // CF's real body nests the uid at `data.input_id`; earlier shapes carry it at the root or under
+  // `live_input`. Search every scope rather than assuming one — reading only the root is what made a
+  // real push parse to nothing.
+  const uid = firstOf(j, ["input_id", "uid", "inputId"]) ?? "";
   if (!uid) return null;
   const lifecycle = lifecycleOf(j);
-  const live =
-    typeof j.live === "boolean"
-      ? j.live
-      : li && typeof li.live === "boolean"
-        ? (li.live as boolean)
-        : undefined;
-  return { uid, lifecycle, live, keys: Object.keys(j) };
+  const fields = walkFields(j);
+  const live = fields.find((f) => f.key === "live" && typeof f.value === "boolean")?.value as
+    | boolean
+    | undefined;
+  // Dotted key PATHS at every depth (names only, never values) so an unmatched lifecycle names the
+  // shape that failed — that log line is how the next schema change gets diagnosed in one read.
+  const keys = fields.map((f) => f.path);
+  return { uid, lifecycle, live, keys };
 }
 
 /**
