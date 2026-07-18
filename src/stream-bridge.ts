@@ -352,7 +352,12 @@ export async function liveStreamDispatchStart(
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ room, uid }),
   });
-  if (!res.ok) throw new Error(`stream-bridge container /start → ${res.status}`);
+  if (!res.ok) {
+    // Fold the container's 502 body ({error:<msg>}) into the thrown Error so the real relay/werift
+    // failure (§7.6 WHIP-out establishment) surfaces in worker obs, not just a bare status code.
+    const body = await res.text().catch(() => "");
+    throw new Error(`stream-bridge container /start → ${res.status}${body ? `: ${body}` : ""}`);
+  }
 }
 
 /** Build the live StreamBridgeDeps (KV org-resolve + pending; container start/stop; ctx.waitUntil). */
