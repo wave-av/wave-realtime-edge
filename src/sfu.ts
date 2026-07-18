@@ -177,15 +177,24 @@ export class SfuClient {
    * #35 — liveness probe for one SFU session: `GET /sessions/{id}`. Used by the WHIP orphan sweeper to
    * decide whether a publish session whose client never sent a teardown DELETE is actually over.
    *
-   * TRI-STATE by design (this is a BILLING decision, so ambiguity must never close a live session):
-   *   "gone"    — the SFU 404s the session (CF Realtime GCs sessions on idle), or every track is inactive.
+   * FOUR-STATE by design (this is a BILLING decision, so ambiguity must never close a live session):
+   *   "gone"    — the SFU 404s the session, or every track is inactive. Unambiguously over.
    *   "alive"   — the session answers and still has a non-inactive track.
-   *   "unknown" — any transport/parse/non-404 upstream failure. The sweeper treats this as ALIVE.
+   *   "idle"    — the session answers but reports ZERO tracks.
+   *   "unknown" — any transport/parse/non-5xx-classifiable failure. The sweeper treats this as ALIVE.
+   *
+   * "idle" exists because of a LIVE-OBSERVED CF behaviour (#35, 2026-07-18): when a publisher dies without
+   * a teardown, CF Realtime does NOT 404 the session — it keeps answering 200 with `tracks: []`, observed
+   * still doing so 35 minutes later. Collapsing that into "alive" (the original assumption that CF would
+   * eventually GC) meant an orphaned session was refreshed forever and NEVER billed, defeating the sweeper
+   * entirely. It is reported separately rather than as "gone" because a session probed moments after
+   * publish can legitimately have no tracks yet — only the caller knows the session's age, so only the
+   * caller can safely age it out.
    *
    * Deliberately does NOT reuse `call()`: that helper throws one uniform SfuError on every non-2xx, which
    * cannot distinguish "404 → the session is legitimately over" from "502 → we simply could not tell".
    */
-  async sessionLiveness(sessionId: string): Promise<"alive" | "gone" | "unknown"> {
+  async sessionLiveness(sessionId: string): Promise<"alive" | "gone" | "idle" | "unknown"> {
     if (!SESSIONID.test(sessionId)) return "unknown"; // never bill/close on a malformed id
     const doFetch = this.fetchImpl; // detach from `this` (see call() — global fetch rejects a bound receiver)
     let res: Response;
@@ -206,10 +215,11 @@ export class SfuClient {
       return "unknown"; // non-JSON upstream — cannot tell
     }
     const tracks = (json as { tracks?: { status?: string }[] } | null)?.tracks;
-    // An answered session with tracks that are ALL inactive is unambiguously finished. A session with no
-    // tracks array (or an empty one) may simply be mid-negotiation, so it stays ALIVE — under-closing is the
-    // safe error direction: the next sweep tick re-probes, and CF's own idle GC eventually 404s it.
+    // All tracks inactive ⇒ unambiguously finished.
     if (Array.isArray(tracks) && tracks.length > 0 && tracks.every((t) => t?.status === "inactive")) return "gone";
+    // Answered with no tracks ⇒ either mid-negotiation (young session) or a publisher that died without a
+    // teardown (CF keeps answering 200 with `tracks: []` indefinitely). The caller ages this out.
+    if (!Array.isArray(tracks) || tracks.length === 0) return "idle";
     return "alive";
   }
 

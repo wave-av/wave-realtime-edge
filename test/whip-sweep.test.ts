@@ -71,6 +71,40 @@ describe("planWhipSweep — billing rules", () => {
 		expect(plan).toEqual({ refresh: [], meter: [], drop: [] });
 	});
 
+	// LIVE-OBSERVED (#35, 2026-07-18): when a publisher dies without a teardown, CF Realtime does NOT 404 the
+	// session — it keeps answering 200 with `tracks: []`, still doing so 35 minutes later. Treating that as
+	// "alive" refreshed the orphan forever and NEVER billed it, defeating the whole sweeper.
+	it("bills an idle (zero-track) session once past the grace window — CF never 404s these", () => {
+		const observedAt = START + 20 * MIN;
+		const plan = planWhipSweep(
+			[entry({ verdict: "idle", observedAt, record: { lastSeenAt: START + 4 * MIN } as never })],
+			observedAt,
+		);
+		expect(plan.meter).toHaveLength(1);
+		expect(plan.meter[0].line.meter_value).toBe(4); // billed to the last VERIFIED sighting, not to now
+		expect(plan.drop).toEqual(["res00000abc"]);
+	});
+
+	it("leaves a freshly-published zero-track session completely alone (mid-negotiation)", () => {
+		// Within the grace window an empty track list is normal negotiation, so it must not be billed —
+		// and must NOT be refreshed either, or dead air would later be billed as real.
+		const observedAt = START + 30_000; // 30s old
+		const plan = planWhipSweep([entry({ verdict: "idle", observedAt })], observedAt);
+		expect(plan).toEqual({ refresh: [], meter: [], drop: [] });
+	});
+
+	it("NEVER refreshes lastSeenAt on an idle session (that pollution would bill dead air)", () => {
+		// A session can sit idle indefinitely; bumping lastSeenAt each tick would silently convert every
+		// idle minute into a billable one. This is the regression that made the first live proof overbill.
+		const observedAt = START + 50 * MIN;
+		const plan = planWhipSweep(
+			[entry({ verdict: "idle", observedAt, record: { lastSeenAt: START + 2 * MIN } as never })],
+			observedAt,
+		);
+		expect(plan.refresh).toHaveLength(0);
+		expect(plan.meter[0].line.meter_value).toBe(2); // still only the 2 verified minutes
+	});
+
 	it("carries the sealed per-session meter SKU onto the orphan bill (bridge vs bare WHIP)", () => {
 		const plan = planWhipSweep(
 			[entry({ verdict: "gone", record: { meter: "wave_stream_bridge_minutes" } as never })],
