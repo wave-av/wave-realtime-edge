@@ -75,6 +75,15 @@ RT_RESIDENCY = "1"   # ARMED 2026-06-28 — #127 ◆ crossing (Jake-named, full-
 # enabling customers stays a deliberate per-key scope-grant — flipping this exposes nothing broken to customers.
 WHIP_INGEST_ENABLED = "1"
 
+# WHIP_SWEEP_ENABLED (#35) arms the WHIP orphan sweeper on the */5 cron (src/whip.ts sweepWhipResources).
+# A publish torn down cleanly bills via handleDelete; a publish whose CONTAINER IS EVICTED OR CRASHES never
+# sends that teardown DELETE, so without this sweep its minutes are never billed at all. Absent/"0" → the
+# cron tick is a no-op. ARMED "1" ◆ 2026-07-18 (Jake-named: "Merge + deploy + arm the sweeper").
+# SAFE: bills only sessions the SFU reports GONE, only up to a VERIFIED lastSeenAt (never to sweep-time),
+# is idempotent on event_id=resourceId (cannot double-bill a racing client DELETE), and defers rather than
+# drops when a usage emit is not confirmed. Inert on its own if GATEWAY_BASE_URL/WAVE_SERVICE_TOKEN are unset.
+WHIP_SWEEP_ENABLED = "1"
+
 # ── #53 — IETF WHEP v1 egress surface (/v1/whep/*). DEFAULT OFF / INERT. ──
 # WHEP_EGRESS_ENABLED gates the whole /v1/whep/{subscribe,resource/{id}} listener (src/whep.ts) — the egress
 # SIBLING of WHIP above. Absent/"0" → the surface is inert: a /v1/whep/* request falls through to the honest
