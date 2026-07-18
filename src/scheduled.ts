@@ -4,7 +4,7 @@
 import { reconcilePending } from "./rtk-webhook";
 import { scheduledStreamReconcile } from "./stream-bridge";
 import { scheduledIngestReconcile } from "./ingest-bridge";
-import { scheduledWhipSweep, WHIP_SWEEP_CRON } from "./whip";
+import { scheduledWhipSweep, WHIP_SWEEP_CRON } from "./whip-sweep";
 import { buildPullSink, type Env } from "./dispatch-helpers";
 
 /**
