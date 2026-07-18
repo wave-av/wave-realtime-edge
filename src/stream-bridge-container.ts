@@ -28,22 +28,28 @@ import { Container } from "@cloudflare/containers";
  * `[vars]` bindings on the WORKER — `@cloudflare/containers` does NOT inherit Worker bindings into the
  * container, so each must be handed across explicitly via `envVars` (see constructor). Names match exactly
  * what `containers/stream-bridge/server/index.mjs` reads (`process.env.*`).
+ *
+ * SOURCE = LL-HLS (#35/#211, v5 image): the container reads LLHLS_SRC_URL_TEMPLATE (or LLHLS_SRC_URL) for
+ * the live_input manifest URL. The old WHEP_SRC_URL_TEMPLATE / WHEP_SRC_URL names are REMOVED — those were
+ * the pre-v5 WHEP-pull source vars; the v5 image never reads them (index.mjs only reads LLHLS_* keys). A
+ * mismatch here (forwarding WHEP_* when the image reads LLHLS_*) = empty sourceUrl → relay throws
+ * "hlsPull: srcUrl is required" on every /start → bridge silently fails while the container appears healthy.
  */
 export interface StreamBridgeContainerEnv {
-  WHEP_SRC_URL_TEMPLATE?: string; // SECRET. Stream WHEP playback URL template ({uid} placeholder) — primary source
-  WHEP_SRC_URL?: string; // SECRET. Explicit WHEP source URL — fallback when no template
+  LLHLS_SRC_URL_TEMPLATE?: string; // SECRET. LL-HLS manifest URL template ({uid} placeholder) — primary source
+  LLHLS_SRC_URL?: string; // SECRET. Explicit LL-HLS manifest URL — fallback when no template (single input)
   WHIP_DST_URL?: string; // SECRET. SFU WHIP publish endpoint the relay republishes into
   WHIP_KEY?: string; // SECRET. Bridge wk_ key authorizing the WHIP publish (resolved server-side by the gateway)
-  WHEP_AUTH?: string; // SECRET (optional). Bearer/authorization for the upstream WHEP pull
+  SOURCE_AUTH?: string; // SECRET (optional). Bearer for a signed/token-gated LL-HLS source manifest (contract Q-2)
 }
 
 /** The container env keys, in the order the server reads them; only DEFINED values are forwarded. */
 const FORWARDED_ENV_KEYS = [
-  "WHEP_SRC_URL_TEMPLATE",
-  "WHEP_SRC_URL",
+  "LLHLS_SRC_URL_TEMPLATE",
+  "LLHLS_SRC_URL",
   "WHIP_DST_URL",
   "WHIP_KEY",
-  "WHEP_AUTH",
+  "SOURCE_AUTH",
 ] as const satisfies readonly (keyof StreamBridgeContainerEnv)[];
 
 /** Path A — the WAVE-owned whep-to-whip republisher container. Same image self-hosts for Path B (no DO there). */
