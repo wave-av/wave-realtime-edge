@@ -2,7 +2,7 @@
 // Proves the ORCHESTRATION (ffmpeg argv, socket binding, track production, state transitions, teardown);
 // the live RTP forwarding fidelity is a ◆ go-live proof (§7.6), out of unit-test scope.
 import { describe, it, expect, vi } from "vitest";
-import { hlsPull, ffmpegArgs, VIDEO_RTP_PORT, AUDIO_RTP_PORT } from "../server/hls-source.mjs";
+import { hlsPull, ffmpegArgs, probeHasAudio, VIDEO_RTP_PORT, AUDIO_RTP_PORT } from "../server/hls-source.mjs";
 
 const SRC = "https://customer-abc.cloudflarestream.com/uid123/manifest/video.m3u8?protocol=llhls";
 
@@ -39,8 +39,31 @@ function harness() {
   const socketFactory = () => { const s = makeFakeSocket(); sockets.push(s); return s; };
   const ff = makeFakeFfmpeg();
   const spawnFn = vi.fn(() => ff);
-  const base = { srcUrl: SRC, makeTrack, parseRtp, spawnFn, socketFactory };
+  // `hasAudio: true` pins the audio-bearing source these orchestration tests were written for, bypassing the ffprobe
+  // round-trip. The probe itself and the video-only path get their own dedicated blocks below.
+  const base = { srcUrl: SRC, makeTrack, parseRtp, spawnFn, socketFactory, hasAudio: true };
   return { sockets, socketFactory, ff, spawnFn, base };
+}
+
+/** A fake ffprobe handle: `stdoutData` is emitted, then `exit` fires with `code`. */
+function makeFakeProbe(stdoutData, code) {
+  const h = {};
+  const so = {};
+  const proc = {
+    stdout: { on: (ev, cb) => { so[ev] = cb; } },
+    on: (ev, cb) => {
+      h[ev] = cb;
+      // Drive the probe to completion on the next tick, once both listeners are attached.
+      if (ev === "exit") {
+        queueMicrotask(() => {
+          if (stdoutData) so.data?.(stdoutData);
+          h.exit?.(code);
+        });
+      }
+    },
+    kill: vi.fn(),
+  };
+  return proc;
 }
 
 describe("ffmpegArgs — pure argv builder", () => {
@@ -60,6 +83,59 @@ describe("ffmpegArgs — pure argv builder", () => {
     const authed = ffmpegArgs(SRC, "tok_signed");
     expect(authed).toContain("-headers");
     expect(authed[authed.indexOf("-headers") + 1]).toContain("Bearer tok_signed");
+  });
+
+  it("omits the ENTIRE audio output leg for a video-only source (#2 — the 502 bug)", () => {
+    const args = ffmpegArgs(SRC, undefined, false);
+    // The video leg is untouched...
+    expect(args).toContain("libvpx");
+    expect(args).toContain(`rtp://127.0.0.1:${VIDEO_RTP_PORT}`);
+    // ...and NOTHING audio remains. A bare `-map 0:a:0?` would leave an output that maps zero streams, which makes
+    // ffmpeg abort with "Output file #1 does not contain any stream" — the startup failure this fix exists to kill.
+    expect(args).not.toContain("libopus");
+    expect(args).not.toContain(`rtp://127.0.0.1:${AUDIO_RTP_PORT}`);
+    expect(args.filter((a) => a === "-f")).toHaveLength(1);
+  });
+
+  it("marks the audio map optional when audio IS expected (tolerates a mid-flight re-ladder)", () => {
+    expect(ffmpegArgs(SRC, undefined, true)).toContain("0:a:0?");
+  });
+});
+
+describe("probeHasAudio — video-only detection", () => {
+  it("returns false when ffprobe exits 0 listing no audio streams", async () => {
+    const spawnFn = vi.fn(() => makeFakeProbe("", 0));
+    await expect(probeHasAudio(SRC, undefined, { spawnFn })).resolves.toBe(false);
+    expect(spawnFn.mock.calls[0][0]).toBe("ffprobe");
+    expect(spawnFn.mock.calls[0][1]).toContain("a"); // -select_streams a
+  });
+
+  it("returns true when ffprobe reports an audio stream index", async () => {
+    const spawnFn = vi.fn(() => makeFakeProbe("1\n", 0));
+    await expect(probeHasAudio(SRC, undefined, { spawnFn })).resolves.toBe(true);
+  });
+
+  it("FAILS SAFE to true on a non-zero probe exit — never silently drops real audio", async () => {
+    const spawnFn = vi.fn(() => makeFakeProbe("", 1));
+    await expect(probeHasAudio(SRC, undefined, { spawnFn })).resolves.toBe(true);
+  });
+
+  it("FAILS SAFE to true when ffprobe cannot be spawned at all", async () => {
+    const spawnFn = vi.fn(() => { throw new Error("ENOENT ffprobe"); });
+    await expect(probeHasAudio(SRC, undefined, { spawnFn })).resolves.toBe(true);
+  });
+
+  it("FAILS SAFE to true on timeout, and kills the hung probe", async () => {
+    const proc = { stdout: { on: vi.fn() }, on: vi.fn(), kill: vi.fn() };
+    const spawnFn = vi.fn(() => proc);
+    await expect(probeHasAudio(SRC, undefined, { spawnFn, timeoutMs: 5 })).resolves.toBe(true);
+    expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+  });
+
+  it("mirrors the signed-source Bearer into the probe", async () => {
+    const spawnFn = vi.fn(() => makeFakeProbe("1\n", 0));
+    await probeHasAudio(SRC, "tok_signed", { spawnFn });
+    expect(spawnFn.mock.calls[0][1].join(" ")).toContain("Bearer tok_signed");
   });
 });
 
@@ -139,5 +215,38 @@ describe("hlsPull — source leg orchestration", () => {
       .rejects.toThrow(/makeTrack is required/);
     await expect(hlsPull({ ...base, parseRtp: undefined, onTrack: vi.fn(), onState: vi.fn() }))
       .rejects.toThrow(/parseRtp is required/);
+  });
+
+  it("bridges a VIDEO-ONLY source: one track, one socket, no audio args (#2 regression)", async () => {
+    const { sockets, ff } = harness();
+    const spawnFn = vi.fn(() => ff);
+    const socketFactory = () => { const s = makeFakeSocket(); sockets.push(s); return s; };
+    const onTrack = vi.fn();
+    const onState = vi.fn();
+
+    await hlsPull({
+      srcUrl: SRC, makeTrack, parseRtp, spawnFn, socketFactory, onTrack, onState,
+      probeFn: async () => false, // the source carries no audio
+    });
+
+    // Exactly one track and one bound socket — and crucially NO onState('failed'): the old hard `-map 0:a:0`
+    // made ffmpeg exit at startup here, which surfaced as the container /start 502.
+    expect(onTrack).toHaveBeenCalledTimes(1);
+    expect(onTrack.mock.calls[0][0].kind).toBe("video");
+    expect(sockets.map((s) => s.boundPort)).toEqual([VIDEO_RTP_PORT]);
+    expect(onState).not.toHaveBeenCalledWith("failed");
+    expect(spawnFn.mock.calls[0][1]).not.toContain("libopus");
+  });
+
+  it("consults the probe when hasAudio is not pre-declared", async () => {
+    const { base } = harness();
+    const probeFn = vi.fn(async () => true);
+    const { hasAudio: _pinned, ...noPin } = base;
+    const onTrack = vi.fn();
+    await hlsPull({ ...noPin, onTrack, onState: vi.fn(), probeFn });
+
+    expect(probeFn).toHaveBeenCalledOnce();
+    expect(probeFn.mock.calls[0][0]).toBe(SRC);
+    expect(onTrack).toHaveBeenCalledTimes(2);
   });
 });
