@@ -205,8 +205,30 @@ export function scheduledStreamPoll(
     dispatchStop(org: string, uid: string): Promise<void>;
   },
 ): void {
-  if (!streamBridgeEnabled(env)) return;
+  // Every exit path from here is LOUD. The first cut of this function returned early in silence when a
+  // precondition was missing, and when the first live tick produced nothing there was no way to tell
+  // "inert" from "ran and found nothing" from "threw" — which is the exact silent-no-op failure mode
+  // that made #8 take three diagnoses. An unobservable control plane is the bug, not a detail of it.
+  const log = (msg: string, fields: Record<string, unknown>) => console.log(JSON.stringify({ msg, ...fields }));
+
+  const enabled = streamBridgeEnabled(env);
+  const hasKv = Boolean(env.RT_MEETING_ORG);
+  const hasCode = Boolean(env.CF_STREAM_CUSTOMER_CODE ?? env.CLOUDFLARE_STREAM_CUSTOMER_CODE);
+
+  if (!enabled || !hasKv || !hasCode) {
+    log("stream-poll-inert", { enabled, hasKv, hasCode });
+    return;
+  }
+
   const deps = livePollDeps(env, dispatch);
-  if (!deps) return;
-  ctx.waitUntil(pollStreamLifecycles(deps));
+  if (!deps) {
+    log("stream-poll-inert", { enabled, hasKv, hasCode, reason: "livePollDeps-null" });
+    return;
+  }
+
+  // A throw anywhere in the tick (e.g. KV list failing) must surface, not vanish into a rejected
+  // waitUntil — the tick's own summary log only runs on the success path.
+  ctx.waitUntil(
+    pollStreamLifecycles(deps).catch((err) => log("stream-poll-tick-failed", { error: String(err) })),
+  );
 }
