@@ -3,12 +3,18 @@
 #   • Path B — self-host (`docker run` on Studio / on-prem behind a CF-Tunnel for the gateway-reachable WHIP-out).
 # Same image, same control contract; the runtime is chosen Worker-side (the [[containers]] binding), not here.
 #
-# NO ffmpeg: this is a PASSTHROUGH relay (no transcode, contract §9.4) — it pipes received RTP straight onto
-# the WHIP-out sender. Node 22 + werift (Node WebRTC) is the whole runtime. Lightweight by design.
+# ffmpeg: the source leg is LL-HLS, not WHEP (#211 — CF `/webRTC/play` serves only WHIP-ingested inputs, 409 for
+# RTMP/SRT). ffmpeg decodes the HLS ladder → VP8/Opus → localhost RTP, which werift ingests and republishes on the
+# WHIP-out leg VERBATIM (no second transcode, §9.4). ffmpeg is this image's only system dep beyond Node+werift.
 #
-# INERT: this image is NOT built or attached by the inert B2 PR. The [[containers]] StreamBridgeContainer block
-# in wrangler.toml stays COMMENTED; building (Path A) or running (Path B) is a Jake-named ◆ go-live crossing.
+# INERT: this image is NOT built or attached by the inert PR. The [[containers]] StreamBridgeContainer block in
+# wrangler.toml stays COMMENTED; building (Path A) or running (Path B) is a Jake-named ◆ go-live crossing.
 FROM node:22-bookworm-slim
+
+# ffmpeg from the bookworm repo (has libvpx + libopus encoders the source leg needs). Clean the apt lists to
+# keep the layer small. Installed as root before the USER drop below.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
