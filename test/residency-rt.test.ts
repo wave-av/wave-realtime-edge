@@ -18,8 +18,12 @@ describe("residency-rt zone resolver (#127)", () => {
     expect(zoneFromContinent("eu")).toBe("eu-west");
   });
 
-  it("returns null for any unmapped/absent continent (→ default path, never an invented zone)", () => {
-    for (const c of ["AS", "SA", "AF", "OC", "AN", "", "  ", undefined, null]) {
+  it("#114 T3: AS/OC→ap-southeast, SA→sa-east now resolve; truly-unmapped continents still → null", () => {
+    expect(zoneFromContinent("AS")).toBe("ap-southeast");
+    expect(zoneFromContinent("OC")).toBe("ap-southeast");
+    expect(zoneFromContinent("SA")).toBe("sa-east");
+    // AF/AN have no region entry; blank/absent inputs never invent a zone.
+    for (const c of ["AF", "AN", "", "  ", undefined, null]) {
       expect(zoneFromContinent(c as string | null | undefined)).toBeNull();
     }
   });
@@ -32,7 +36,10 @@ describe("residency-rt zone resolver (#127)", () => {
   it("placementForContinent pairs zone + binding, null for unmapped", () => {
     expect(placementForContinent("NA")).toEqual({ zone: "us-east", binding: "RT_RECORDINGS_ENAM" });
     expect(placementForContinent("EU")).toEqual({ zone: "eu-west", binding: "RT_RECORDINGS_EU" });
-    expect(placementForContinent("AS")).toBeNull();
+    // #114 T3: AS/SA now resolve to their region's binding; AF stays unmapped → null.
+    expect(placementForContinent("AS")).toEqual({ zone: "ap-southeast", binding: "RT_RECORDINGS_APAC" });
+    expect(placementForContinent("SA")).toEqual({ zone: "sa-east", binding: "RT_RECORDINGS_SAM" });
+    expect(placementForContinent("AF")).toBeNull();
   });
 
   it("bucketForBinding returns the bound R2 bucket or null when unbound", () => {

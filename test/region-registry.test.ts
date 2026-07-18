@@ -10,9 +10,9 @@ import {
 } from "../src/region-registry.js";
 
 describe("region-registry (#114 N-region SSOT)", () => {
-	it("the two LIVE (#127) regions are enabled and reproduce the proven us-east/eu-west pair", () => {
+	it("the four LIVE regions (us-east/eu-west + #114 T3 apac/sam) are enabled with the proven bindings", () => {
 		const zones = activeZones();
-		expect(zones).toEqual(["us-east", "eu-west"]);
+		expect(zones).toEqual(["us-east", "eu-west", "ap-southeast", "sa-east"]);
 		const na = regionForContinent("NA");
 		expect(na?.zone).toBe("us-east");
 		expect(na?.binding).toBe("RT_RECORDINGS_ENAM");
@@ -25,17 +25,27 @@ describe("region-registry (#114 N-region SSOT)", () => {
 		expect(eu?.bucketName).toBe("wave-recordings-eu");
 		expect(eu?.jurisdiction).toBe("eu");
 		expect(eu?.cascadeHint).toBe("weur");
+		const apac = regionForContinent("AS");
+		expect(apac?.zone).toBe("ap-southeast");
+		expect(apac?.binding).toBe("RT_RECORDINGS_APAC");
+		expect(apac?.bucketName).toBe("wave-recordings-apac");
+		expect(apac?.jurisdiction).toBe("default");
+		expect(apac?.cascadeHint).toBe("apac");
+		const sam = regionForContinent("SA");
+		expect(sam?.zone).toBe("sa-east");
+		expect(sam?.binding).toBe("RT_RECORDINGS_SAM");
+		expect(sam?.bucketName).toBe("wave-recordings-sam");
+		expect(sam?.cascadeHint).toBe("sam");
 	});
 
-	it("staged regions are INERT: enabled:false → continents fall to the default path (null)", () => {
-		// APAC / SAM are authored but disabled — behavior-identical to today (no residency for AS/OC/SA).
-		expect(regionForContinent("AS")).toBeNull();
-		expect(regionForContinent("OC")).toBeNull();
-		expect(regionForContinent("SA")).toBeNull();
+	it("#114 T3 LIVE: AS/OC → apac, SA → sam; unstaged continents still fall to default (null)", () => {
+		// APAC / SAM are now enabled (#114 T3) — AS/OC/SA resolve to their region; AF has no region → null.
+		expect(regionForContinent("AS")?.zone).toBe("ap-southeast");
+		expect(regionForContinent("OC")?.zone).toBe("ap-southeast");
+		expect(regionForContinent("SA")?.zone).toBe("sa-east");
 		expect(regionForContinent("AF")).toBeNull();
-		// The staged entries EXIST in the raw registry (ready to flip) but are not active.
-		expect(REGION_REGISTRY.some((r) => r.zone === "ap-southeast" && !r.enabled)).toBe(true);
-		expect(REGION_REGISTRY.some((r) => r.zone === "sa-east" && !r.enabled)).toBe(true);
+		expect(REGION_REGISTRY.some((r) => r.zone === "ap-southeast" && r.enabled)).toBe(true);
+		expect(REGION_REGISTRY.some((r) => r.zone === "sa-east" && r.enabled)).toBe(true);
 		expect(activeRegions().every((r) => r.enabled)).toBe(true);
 	});
 
@@ -50,10 +60,10 @@ describe("region-registry (#114 N-region SSOT)", () => {
 		expect(regionForZone("us-east")?.binding).toBe("RT_RECORDINGS_ENAM");
 		expect(regionForBinding("RT_RECORDINGS_EU")?.zone).toBe("eu-west");
 		expect(isActiveZone("eu-west")).toBe(true);
-		// staged/disabled zone + binding do not resolve while inert
-		expect(regionForZone("ap-southeast")).toBeNull();
-		expect(regionForBinding("RT_RECORDINGS_APAC")).toBeNull();
-		expect(isActiveZone("ap-southeast")).toBe(false);
+		// #114 T3: apac zone + binding now resolve (region enabled)
+		expect(regionForZone("ap-southeast")?.binding).toBe("RT_RECORDINGS_APAC");
+		expect(regionForBinding("RT_RECORDINGS_APAC")?.zone).toBe("ap-southeast");
+		expect(isActiveZone("ap-southeast")).toBe(true);
 	});
 
 	it("each continent appears in at most one enabled region (no residency ambiguity)", () => {

@@ -1,104 +1,214 @@
-// #35-B / #78 — the concrete CfStreamLiveClient adapter. Proves it creates a CF Stream live_input with
-// recording.mode:"automatic" (REQUIRED for the LL-HLS the bridge pulls — #211), parses uid + push endpoints,
-// writes the uid→org binding the receiver resolves server-side, and surfaces EVERY failure (CF non-2xx, missing
-// uid, KV bind failure, network) as a discriminated non-ok result — never a fake success. Fake fetch + fake KV.
-import { describe, it, expect, vi } from "vitest";
-import { makeCfStreamLiveClient, type StreamInputOrgKv } from "../src/cf-stream-live-client.js";
-import type { CfStreamLiveIngestRequest } from "../src/ingress-cf-stream-live.js";
+// WHEP-A — the concrete CfStreamLiveClient adapter. Proves it: creates a CF Stream Live input, surfaces the
+// RTMPS/SRT push endpoints, writes the FORWARD org binding (bare org string the WHEP subscribe reads) + the
+// REVERSE per-org discovery index, compensates (deletes the orphan input) when the required forward write fails,
+// and maps every CF/KV failure to a typed non-2xx — never a half-provisioned success. Pure: injected fake fetch
+// + fake KV, no real network/CF-API/KV.
+import { describe, it, expect } from "vitest";
+import {
+  CfStreamLiveClientImpl,
+  readOrgStreamInputs,
+  ORG_STREAM_INPUTS_PREFIX,
+  ORG_INDEX_MAX_ENTRIES,
+  type StreamInputKv,
+} from "../src/cf-stream-live-client.js";
 import { STREAM_INPUT_ORG_PREFIX } from "../src/stream-bridge.js";
+import type { CfStreamLiveIngestRequest } from "../src/ingress-cf-stream-live.js";
 
-const ACCT = "d674452f756fe46885a0d6ce7bc23f0a";
-const TOKEN = "cf-stream-token-not-a-secret";
-const REQ: CfStreamLiveIngestRequest = { room: "room-1", org: "org-acme", feed: { mode: "push", protocol: "rtmp" } };
+const UID = "28064cd43cee30dd62c728da2152c61d";
 
-const CF_OK = {
-  result: {
-    uid: "li-abc123",
-    rtmps: { url: "rtmps://live.cloudflare.com:443/live/", streamKey: "sk-xyz" },
-    srt: { url: "srt://live.cloudflare.com:778", streamId: "sid-xyz" },
-  },
-};
-
-function fakeKv(): StreamInputOrgKv & { puts: Array<[string, string]> } {
-  const puts: Array<[string, string]> = [];
-  return { puts, put: vi.fn(async (k: string, v: string) => { puts.push([k, v]); }) };
+/** A fake KV with an optional set of keys whose `put` throws (to exercise compensation). */
+function fakeKv(opts: { seed?: Record<string, string>; failPutPrefix?: string } = {}): StreamInputKv & {
+  store: Map<string, string>;
+} {
+  const store = new Map<string, string>(Object.entries(opts.seed ?? {}));
+  return {
+    store,
+    async get(k) {
+      return store.get(k) ?? null;
+    },
+    async put(k, v) {
+      if (opts.failPutPrefix && k.startsWith(opts.failPutPrefix)) throw new Error(`KV put boom for ${k}`);
+      store.set(k, v);
+    },
+  };
 }
 
-/** A fake fetch returning a real Response with the given status/body. */
-function fetchReturning(status: number, body: unknown) {
-  return vi.fn(async () => new Response(JSON.stringify(body), { status })) as unknown as typeof fetch;
+/** A fake CF `fetch`: canned create-input success (+ optional override), records every call, 200 on DELETE. */
+function fakeFetch(
+  createReply: { status?: number; body?: unknown } = {},
+): typeof fetch & { calls: { url: string; method: string }[] } {
+  const calls: { url: string; method: string }[] = [];
+  const fn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    const method = (init?.method ?? "GET").toUpperCase();
+    calls.push({ url, method });
+    if (method === "DELETE") return new Response("{}", { status: 200 });
+    // POST create
+    const status = createReply.status ?? 200;
+    const body =
+      createReply.body ??
+      {
+        success: true,
+        errors: [],
+        result: {
+          uid: UID,
+          rtmps: { url: "rtmps://live.cloudflare.com:443/live/", streamKey: "sk-abc" },
+          srt: { url: "srt://live.cloudflare.com:778", streamId: UID },
+          webRTC: { url: "https://customer-x.cloudflarestream.com/xyz/webRTC/publish" },
+        },
+      };
+    return new Response(JSON.stringify(body), { status });
+  }) as typeof fetch & { calls: { url: string; method: string }[] };
+  fn.calls = calls;
+  return fn;
 }
 
-describe("makeCfStreamLiveClient — create + bind", () => {
-  it("POSTs live_inputs with recording.mode:automatic + meta.name, Bearer-authed, to the right account", async () => {
-    const fetchImpl = fetchReturning(200, CF_OK);
+const req = (over: Partial<CfStreamLiveIngestRequest> = {}): CfStreamLiveIngestRequest => ({
+  room: "room-1",
+  org: "acme",
+  feed: { mode: "push", protocol: "rtmp" },
+  ...over,
+});
+
+describe("CfStreamLiveClientImpl — createLiveInput", () => {
+  it("creates the input, returns uid + rtmp/srt endpoints, writes forward + reverse KV", async () => {
     const kv = fakeKv();
-    const client = makeCfStreamLiveClient({ accountId: ACCT, apiToken: TOKEN, kv, fetchImpl });
-    await client.createLiveInput(REQ);
+    const fetchFn = fakeFetch();
+    const client = new CfStreamLiveClientImpl({ accountId: "acct1", apiToken: "tok", kv, fetchFn, now: () => 1000 });
 
-    expect(fetchImpl).toHaveBeenCalledOnce();
-    const [url, init] = (fetchImpl as unknown as { mock: { calls: [string, RequestInit][] } }).mock.calls[0];
-    expect(url).toBe(`https://api.cloudflare.com/client/v4/accounts/${ACCT}/stream/live_inputs`);
-    expect(init.method).toBe("POST");
-    expect((init.headers as Record<string, string>).authorization).toBe(`Bearer ${TOKEN}`);
-    const sent = JSON.parse(init.body as string);
-    expect(sent.recording).toEqual({ mode: "automatic" });
-    expect(sent.meta).toEqual({ name: "room-1" });
+    const res = await client.createLiveInput(req());
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.input.uid).toBe(UID);
+    const protocols = res.input.endpoints.map((e) => e.protocol).sort();
+    expect(protocols).toEqual(["rtmp", "srt"]);
+    const rtmp = res.input.endpoints.find((e) => e.protocol === "rtmp");
+    expect(rtmp?.streamKey).toBe("sk-abc");
+
+    // Forward binding is the BARE org string (what whep.ts resolveInputOrgMatch compares ===).
+    expect(kv.store.get(`${STREAM_INPUT_ORG_PREFIX}${UID}`)).toBe("acme");
+    // Reverse index has the entry.
+    const idx = await readOrgStreamInputs(kv, "acme");
+    expect(idx).toEqual([{ uid: UID, room: "room-1", createdAt: 1000 }]);
+    // The POST create call targeted the account's live_inputs.
+    expect(fetchFn.calls[0].url).toContain("/accounts/acct1/stream/live_inputs");
+    expect(fetchFn.calls[0].method).toBe("POST");
   });
 
-  it("returns the uid + parsed rtmp/srt endpoints and writes the uid→org binding", async () => {
-    const kv = fakeKv();
-    const client = makeCfStreamLiveClient({ accountId: ACCT, apiToken: TOKEN, kv, fetchImpl: fetchReturning(200, CF_OK) });
-    const result = await client.createLiveInput(REQ);
-
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.input.uid).toBe("li-abc123");
-      expect(result.input.endpoints).toEqual([
-        { protocol: "rtmp", url: "rtmps://live.cloudflare.com:443/live/", streamKey: "sk-xyz" },
-        { protocol: "srt", url: "srt://live.cloudflare.com:778", streamKey: "sid-xyz" },
-      ]);
+  it("uses the DEFAULT global fetch bound to globalThis (regression: Illegal invocation)", async () => {
+    // Reproduces the real runtime: Workers/undici `fetch` throws "Illegal invocation" unless called with
+    // `this === globalThis`. The adapter must bind the default fetch, else `this.fetchFn(...)` leaks the
+    // instance as `this`. Injected-fetch tests can't catch this — only the DEFAULT (uninjected) path does.
+    const original = globalThis.fetch;
+    const strictFetch = function (this: unknown, _input: RequestInfo | URL, init?: RequestInit) {
+      if (this !== globalThis && this !== undefined) {
+        throw new TypeError("Illegal invocation: function called with incorrect `this` reference.");
+      }
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (method === "DELETE") return Promise.resolve(new Response("{}", { status: 200 }));
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            success: true,
+            errors: [],
+            result: { uid: UID, rtmps: { url: "rtmps://x/live/", streamKey: "k" }, srt: { url: "srt://x:778" } },
+          }),
+          { status: 200 },
+        ),
+      );
+    } as unknown as typeof fetch;
+    globalThis.fetch = strictFetch;
+    try {
+      const kv = fakeKv();
+      // NO fetchFn injected → exercises the constructor's `fetch.bind(globalThis)` default.
+      const client = new CfStreamLiveClientImpl({ accountId: "acct1", apiToken: "tok", kv, now: () => 1 });
+      const res = await client.createLiveInput(req());
+      expect(res.ok).toBe(true);
+    } finally {
+      globalThis.fetch = original;
     }
-    expect(kv.puts).toEqual([[`${STREAM_INPUT_ORG_PREFIX}li-abc123`, "org-acme"]]);
   });
 
-  it("surfaces a CF non-2xx (401) as a non-ok result and writes NO binding", async () => {
+  it("reverse index is newest-first, deduped by uid, capped", async () => {
     const kv = fakeKv();
-    const client = makeCfStreamLiveClient({ accountId: ACCT, apiToken: TOKEN, kv, fetchImpl: fetchReturning(401, { errors: [] }) });
-    const result = await client.createLiveInput(REQ);
+    let t = 0;
+    const client = new CfStreamLiveClientImpl({ accountId: "a", apiToken: "t", kv, fetchFn: fakeFetch(), now: () => ++t });
+    // Seed the reverse index past the cap with distinct uids.
+    const seeded = Array.from({ length: ORG_INDEX_MAX_ENTRIES }, (_, i) => ({
+      uid: `old${i}`.padEnd(32, "0"),
+      room: "r",
+      createdAt: i,
+    }));
+    kv.store.set(`${ORG_STREAM_INPUTS_PREFIX}acme`, JSON.stringify(seeded));
 
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.status).toBe(401);
-    expect(kv.puts).toHaveLength(0);
+    await client.createLiveInput(req());
+    const idx = await readOrgStreamInputs(kv, "acme");
+    expect(idx.length).toBe(ORG_INDEX_MAX_ENTRIES); // capped
+    expect(idx[0].uid).toBe(UID); // newest-first (prepended)
+    // Newest-first + cap: the OLDEST seeded entry (old99, last in the list) fell off; old0 is still present.
+    expect(idx.some((e) => e.uid === "old99".padEnd(32, "0"))).toBe(false);
+    expect(idx.some((e) => e.uid === "old0".padEnd(32, "0"))).toBe(true);
   });
 
-  it("is non-ok when the CF response is missing a uid — never binds a phantom input", async () => {
+  it("maps a CF non-2xx to a typed {ok:false} with the status", async () => {
     const kv = fakeKv();
-    const client = makeCfStreamLiveClient({ accountId: ACCT, apiToken: TOKEN, kv, fetchImpl: fetchReturning(200, { result: { rtmps: { url: "x" } } }) });
-    const result = await client.createLiveInput(REQ);
-
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.reason).toMatch(/uid/);
-    expect(kv.puts).toHaveLength(0);
+    const client = new CfStreamLiveClientImpl({
+      accountId: "a",
+      apiToken: "t",
+      kv,
+      fetchFn: fakeFetch({ status: 403, body: { success: false, errors: [{ code: 9109, message: "forbidden" }] } }),
+    });
+    const res = await client.createLiveInput(req());
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.status).toBe(403);
+    expect(res.reason).toContain("9109");
+    // No KV written on a failed create.
+    expect(kv.store.size).toBe(0);
   });
 
-  it("surfaces a KV bind failure (orphan input) as non-ok, not a fake success", async () => {
-    const kv: StreamInputOrgKv = { put: vi.fn(async () => { throw new Error("kv down"); }) };
-    const client = makeCfStreamLiveClient({ accountId: ACCT, apiToken: TOKEN, kv, fetchImpl: fetchReturning(200, CF_OK) });
-    const result = await client.createLiveInput(REQ);
-
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.reason).toMatch(/KV bind failed/);
-  });
-
-  it("surfaces a network failure as status 0", async () => {
+  it("rejects a create reply with no/invalid uid (502) and writes no KV", async () => {
     const kv = fakeKv();
-    const fetchImpl = vi.fn(async () => { throw new Error("ECONNREFUSED"); }) as unknown as typeof fetch;
-    const client = makeCfStreamLiveClient({ accountId: ACCT, apiToken: TOKEN, kv, fetchImpl });
-    const result = await client.createLiveInput(REQ);
+    const client = new CfStreamLiveClientImpl({
+      accountId: "a",
+      apiToken: "t",
+      kv,
+      fetchFn: fakeFetch({ body: { success: true, result: { uid: "not-hex" } } }),
+    });
+    const res = await client.createLiveInput(req());
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.status).toBe(502);
+    expect(kv.store.size).toBe(0);
+  });
 
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.status).toBe(0);
-    expect(kv.puts).toHaveLength(0);
+  it("compensates (deletes the orphan input) when the required forward KV write fails → {ok:false,500}", async () => {
+    const kv = fakeKv({ failPutPrefix: STREAM_INPUT_ORG_PREFIX });
+    const fetchFn = fakeFetch();
+    const client = new CfStreamLiveClientImpl({ accountId: "acct1", apiToken: "t", kv, fetchFn });
+    const res = await client.createLiveInput(req());
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.status).toBe(500);
+    // The just-created input was DELETEd (compensation) — no orphan on CF.
+    const del = fetchFn.calls.find((c) => c.method === "DELETE");
+    expect(del?.url).toContain(`/stream/live_inputs/${UID}`);
+  });
+
+  it("a reverse-index failure does NOT fail a valid provision (forward binding already subscribable)", async () => {
+    const kv = fakeKv({ failPutPrefix: ORG_STREAM_INPUTS_PREFIX });
+    const client = new CfStreamLiveClientImpl({ accountId: "a", apiToken: "t", kv, fetchFn: fakeFetch() });
+    const res = await client.createLiveInput(req());
+    expect(res.ok).toBe(true); // provision succeeds despite reverse-index write throwing
+    expect(kv.store.get(`${STREAM_INPUT_ORG_PREFIX}${UID}`)).toBe("acme");
+  });
+});
+
+describe("readOrgStreamInputs", () => {
+  it("returns [] for absent and tolerates corrupt / non-array values", async () => {
+    const kv = fakeKv({ seed: { [`${ORG_STREAM_INPUTS_PREFIX}bad`]: "{not json", [`${ORG_STREAM_INPUTS_PREFIX}obj`]: "{}" } });
+    expect(await readOrgStreamInputs(kv, "missing")).toEqual([]);
+    expect(await readOrgStreamInputs(kv, "bad")).toEqual([]);
+    expect(await readOrgStreamInputs(kv, "obj")).toEqual([]);
   });
 });

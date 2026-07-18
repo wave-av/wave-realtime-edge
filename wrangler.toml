@@ -136,7 +136,7 @@ EGRESS_ROUTER_ENABLED = "0"  # INERT — #75 P2/P3/P4 backends built; arming is 
 # env and stay COMMENTED until each leg's own go-live (absent → fail-closed 501). It adds the SSRF guard (guardIngestHost
 # /guardPullUrl) the router deferred to P4 — an untrusted inbound host the container may dial is rejected if it targets
 # an internal/loopback/link-local/metadata/CGNAT(tailnet) address before the container-start sink.
-INGRESS_ROUTER_ENABLED = "0"  # INERT — #77 P2+P3+P4 backends built (ingress backend set complete); arming is a ◆ Jake crossing (ARM slice wires the entrypoint)
+INGRESS_ROUTER_ENABLED = "1"  # ARMED 2026-07-15 (Jake-named ◆, whep-live-egress epic): the ONLY runtime caller is maybeHandleWhepSources (whep-sources.ts) → arms POST/GET /v1/whep/sources (gatewayGate + x-wave-org). P3/P4 backends re-export the flag but are never instantiated, so no other live behavior changes. Requires the Stream token bound (CLOUDFLARE_STREAM_API_TOKEN, provisioned).
 
 # ── B1 (#91-a) — CF Stream Live → SFU bridge control plane (POST /v1/stream/bridge/webhook). DEFAULT OFF. ──
 # STREAM_BRIDGE_ENABLED gates the self-authenticating CF Stream webhook receiver (src/stream-bridge.ts). Absent/

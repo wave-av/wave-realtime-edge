@@ -11,6 +11,7 @@ import { describe, it, expect } from "vitest";
 import worker from "../src/worker.js";
 import {
 	handleWhep,
+	liveWhepDeps,
 	buildWhepMeterLine,
 	whepEgressEnabled,
 	useCloudflareStream,
@@ -132,6 +133,37 @@ describe("handleWhep — POST /v1/whep/subscribe (happy path, Stream relay)", ()
 		expect(relayCalls[0].method).toBe("POST");
 		expect(relayCalls[0].ct).toMatch(/application\/sdp/);
 		expect(String(relayCalls[0].body)).toBe(OFFER_SDP.trim() + "\r\n");
+	});
+
+	it("uses the DEFAULT liveWhepDeps fetch bound to globalThis (regression: 503 Illegal invocation)", async () => {
+		// Reproduces the LIVE bug: the Workers/undici global `fetch` throws "Illegal invocation" unless called with
+		// `this === globalThis`. liveWhepDeps() stored the UNBOUND global, so `deps.fetch(...)` (this === deps) threw
+		// → caught → REALTIME_UPSTREAM 503, silently 503'ing the real Stream relay. Mocked-deps tests can't catch it —
+		// only the DEFAULT (uninjected) liveWhepDeps path does. The bind fix keeps `this` correct.
+		const original = globalThis.fetch;
+		const strictFetch = function (this: unknown, input: RequestInfo | URL, init?: RequestInit) {
+			if (this !== globalThis && this !== undefined) {
+				throw new TypeError("Illegal invocation: function called with incorrect `this` reference.");
+			}
+			if ((init?.method ?? "GET").toUpperCase() === "POST") {
+				return Promise.resolve(
+					new Response(ANSWER_SDP, {
+						status: 201,
+						headers: { "content-type": "application/sdp", location: STREAM_RESOURCE },
+					}),
+				);
+			}
+			return Promise.resolve(new Response(null, { status: 204 }));
+		} as unknown as typeof fetch;
+		globalThis.fetch = strictFetch;
+		try {
+			// NO deps injected → exercises liveWhepDeps()'s `fetch.bind(globalThis)` default through the worker seam.
+			const res = await handleWhep(whepReq("POST", SUB, { "content-type": "application/sdp" }, OFFER_SDP), whepEnv(), "org_A", liveWhepDeps());
+			expect(res!.status).toBe(201);
+			expect(await res!.text()).toBe(ANSWER_SDP);
+		} finally {
+			globalThis.fetch = original;
+		}
 	});
 
 	it("400 when ?resource is missing/invalid (not a 32-hex uid)", async () => {
