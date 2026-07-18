@@ -173,6 +173,46 @@ export class SfuClient {
     return { sessionId, sessionDescription: data.sessionDescription };
   }
 
+  /**
+   * #35 — liveness probe for one SFU session: `GET /sessions/{id}`. Used by the WHIP orphan sweeper to
+   * decide whether a publish session whose client never sent a teardown DELETE is actually over.
+   *
+   * TRI-STATE by design (this is a BILLING decision, so ambiguity must never close a live session):
+   *   "gone"    — the SFU 404s the session (CF Realtime GCs sessions on idle), or every track is inactive.
+   *   "alive"   — the session answers and still has a non-inactive track.
+   *   "unknown" — any transport/parse/non-404 upstream failure. The sweeper treats this as ALIVE.
+   *
+   * Deliberately does NOT reuse `call()`: that helper throws one uniform SfuError on every non-2xx, which
+   * cannot distinguish "404 → the session is legitimately over" from "502 → we simply could not tell".
+   */
+  async sessionLiveness(sessionId: string): Promise<"alive" | "gone" | "unknown"> {
+    if (!SESSIONID.test(sessionId)) return "unknown"; // never bill/close on a malformed id
+    const doFetch = this.fetchImpl; // detach from `this` (see call() — global fetch rejects a bound receiver)
+    let res: Response;
+    try {
+      res = await doFetch(`${this.baseUrl}/apps/${this.appId}/sessions/${sessionId}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${this.appSecret}`, "User-Agent": "wave-realtime-edge/1.0" },
+      });
+    } catch {
+      return "unknown"; // transport failure — cannot tell, so the sweeper must assume the session is live
+    }
+    if (res.status === 404) return "gone"; // the SFU no longer knows this session → the publish is over
+    if (!res.ok) return "unknown";
+    let json: unknown = null;
+    try {
+      json = await res.json();
+    } catch {
+      return "unknown"; // non-JSON upstream — cannot tell
+    }
+    const tracks = (json as { tracks?: { status?: string }[] } | null)?.tracks;
+    // An answered session with tracks that are ALL inactive is unambiguously finished. A session with no
+    // tracks array (or an empty one) may simply be mid-negotiation, so it stays ALIVE — under-closing is the
+    // safe error direction: the next sweep tick re-probes, and CF's own idle GC eventually 404s it.
+    if (Array.isArray(tracks) && tracks.length > 0 && tracks.every((t) => t?.status === "inactive")) return "gone";
+    return "alive";
+  }
+
   /** Push local tracks into a session (publish). `offer` carries the renegotiation SDP when required. */
   async pushTracks(sessionId: string, tracks: LocalTrack[], offer?: SessionDescription): Promise<TracksResult> {
     return this.tracksNew(sessionId, tracks, offer);

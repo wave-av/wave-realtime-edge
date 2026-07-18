@@ -22,8 +22,14 @@ enabled = true
 # webhook pull failed POST-ack (RTK won't re-deliver after our 200), so a transient blip can't silently lose a
 # customer recording. Idempotent (deterministic R2 key); clears the pending KV record on success. Cheap (KV
 # list of a normally-empty set). No-op when RT_RECORDINGS/RT_MEETING_ORG are unbound.
+#
+# #35 — the second (*/5) trigger drives the WHIP orphan sweeper: a publish whose container is EVICTED or
+# crashes never sends its teardown DELETE, so without a sweep its minutes are never billed at all. The
+# interval bounds how much of a dead session's tail goes unbilled, hence the tighter cadence. scheduledHandler
+# gates the reconciles above to the */15 tick (whip.ts WHIP_SWEEP_CRON), so their behaviour is unchanged.
+# The sweep itself stays INERT until [vars] WHIP_SWEEP_ENABLED = "1".
 [triggers]
-crons = ["*/15 * * * *"]
+crons = ["*/15 * * * *", "*/5 * * * *"]
 
 [vars]
 # CF-3.1.2 — RealtimeKit (CF Realtime) config. RTK_APP_ID is a non-secret app identifier.

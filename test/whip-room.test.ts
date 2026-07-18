@@ -230,6 +230,11 @@ describe("#144 Signaling.whipPublish", () => {
 function memKv(): WhipKv {
   const store = new Map<string, string>();
   return {
+    // #35: the sweeper enumerates records; the stub lists the in-memory store in one complete page.
+    async list({ prefix = "" } = {}) {
+      const keys = [...store.keys()].filter((n) => n.startsWith(prefix)).map((name) => ({ name }));
+      return { keys, list_complete: true };
+    },
     async get(k) {
       return store.get(k) ?? null;
     },
