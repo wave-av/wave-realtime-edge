@@ -11,9 +11,9 @@ import {
 	sweepWhipResources,
 	whipSweepEnabled,
 	WHIP_SWEEP_CRON,
-	type WhipKv,
 	type WhipSweepEntry,
-} from "../src/whip";
+} from "../src/whip-sweep";
+import type { WhipKv } from "../src/whip";
 
 const ORG = "18e9224a-0e81-4c05-a336-5b9cb118d48a";
 const START = 1_700_000_000_000;
