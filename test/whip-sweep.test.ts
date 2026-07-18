@@ -24,6 +24,7 @@ function entry(over: Partial<WhipSweepEntry> & { verdict: WhipSweepEntry["verdic
 		resourceId: over.resourceId ?? "res00000abc",
 		record: { sessionId: "s".repeat(32), org: ORG, startedAt: START, ...over.record },
 		verdict: over.verdict,
+		observedAt: over.observedAt ?? START,
 	};
 }
 
@@ -54,12 +55,14 @@ describe("planWhipSweep — billing rules", () => {
 		expect(plan.meter[0].line.event_id).toBe("abc12345xyz");
 	});
 
-	it("refreshes lastSeenAt for a live session and bills nothing", () => {
-		const now = START + 7 * MIN;
-		const plan = planWhipSweep([entry({ verdict: "alive" })], now);
+	it("refreshes lastSeenAt to the session's OWN probe time, not the page-wide sweep clock", () => {
+		// observedAt is stamped just before this session's probe; the page-wide `now` is later because other
+		// sessions were probed in between. Crediting `now` would bill liveness that was never observed.
+		const observedAt = START + 7 * MIN;
+		const plan = planWhipSweep([entry({ verdict: "alive", observedAt })], START + 30 * MIN);
 		expect(plan.meter).toHaveLength(0);
 		expect(plan.drop).toHaveLength(0);
-		expect(plan.refresh[0].record.lastSeenAt).toBe(now);
+		expect(plan.refresh[0].record.lastSeenAt).toBe(observedAt);
 	});
 
 	it("does NOTHING on an unknown verdict — no bill, no drop, and no unverified lastSeenAt refresh", () => {
@@ -171,7 +174,7 @@ describe("sweepWhipResources — applying the plan", () => {
 	it("is inert with no KV binding (no throw, nothing billed)", async () => {
 		const emits: unknown[] = [];
 		const stats = await sweepWhipResources({ ...PROVISIONED } as never, depsFor("gone", START, emits) as never);
-		expect(stats).toEqual({ scanned: 0, billed: 0, refreshed: 0, skipped: 0 });
+		expect(stats).toEqual({ scanned: 0, billed: 0, refreshed: 0, skipped: 0, deferred: 0 });
 	});
 
 	it("is inert when the SFU is unconfigured (fail-closed: probe nothing rather than guess)", async () => {
@@ -181,6 +184,87 @@ describe("sweepWhipResources — applying the plan", () => {
 		const stats = await sweepWhipResources({ ...PROVISIONED, RT_MEETING_ORG: kv } as never, throwingDeps as never);
 		expect(stats.billed).toBe(0);
 		expect(kv.store.has("whip:res00000abc")).toBe(true);
+	});
+});
+
+describe("sweepWhipResources — usage is never destroyed", () => {
+	/** Deps whose usage emit FAILS (gateway down), so the sweeper must not drop the evidence. */
+	function failingDeps(now: number, attempts: unknown[]) {
+		return {
+			sfu: () => ({ sessionLiveness: async () => "gone" }) as never,
+			now: () => now,
+			mintResourceId: () => "unused",
+			fetch: (async (_url: string, init?: RequestInit) => {
+				attempts.push(JSON.parse(String(init?.body ?? "{}")));
+				return new Response("upstream down", { status: 503 });
+			}) as unknown as typeof fetch,
+		};
+	}
+
+	it("KEEPS an orphan record when the usage emit is not confirmed, so the next tick retries", async () => {
+		// The regression that matters: emitting fail-open and deleting anyway would lose these minutes
+		// forever — reintroducing the exact revenue leak this sweeper exists to close.
+		const kv = memKv({ "whip:res00000abc": { sessionId: "s".repeat(32), org: ORG, startedAt: START } });
+		const attempts: unknown[] = [];
+		const stats = await sweepWhipResources(
+			{ ...PROVISIONED, RT_MEETING_ORG: kv } as never,
+			failingDeps(START + 10 * MIN, attempts) as never,
+		);
+
+		expect(attempts).toHaveLength(1); // it did try
+		expect(stats.billed).toBe(0);
+		expect(stats.deferred).toBe(1);
+		expect(kv.store.has("whip:res00000abc")).toBe(true); // evidence preserved for retry
+	});
+
+	it("is inert without a billing sink rather than dropping records against a dead sink", async () => {
+		const kv = memKv({ "whip:res00000abc": { sessionId: "s".repeat(32), org: ORG, startedAt: START } });
+		const emits: unknown[] = [];
+		// No GATEWAY_BASE_URL / WAVE_SERVICE_TOKEN → nothing can be recorded.
+		const stats = await sweepWhipResources(
+			{ CF_CALLS_APP_ID: "a", CF_CALLS_APP_SECRET: "s", RT_MEETING_ORG: kv } as never,
+			depsFor("gone", START + MIN, emits) as never,
+		);
+		expect(stats.billed).toBe(0);
+		expect(emits).toHaveLength(0);
+		expect(kv.store.has("whip:res00000abc")).toBe(true);
+	});
+
+	it("stamps each live sighting at ITS OWN probe time, not one page-wide timestamp", async () => {
+		// A page of probes takes real time; a single post-loop `now` would credit the first session with
+		// liveness it was never observed to have, and that inflated lastSeenAt would later be billed.
+		const kv = memKv({
+			"whip:resaaaaaaaa": { sessionId: "a".repeat(32), org: ORG, startedAt: START },
+			"whip:resbbbbbbbb": { sessionId: "b".repeat(32), org: ORG, startedAt: START },
+		});
+		let tick = START;
+		const deps = {
+			sfu: () => ({ sessionLiveness: async () => "alive" }) as never,
+			now: () => (tick += MIN), // clock advances on every read, as a real probe loop would
+			mintResourceId: () => "unused",
+			fetch: (async () => new Response(null, { status: 202 })) as unknown as typeof fetch,
+		};
+		await sweepWhipResources({ ...PROVISIONED, RT_MEETING_ORG: kv } as never, deps as never);
+
+		const seenA = JSON.parse(kv.store.get("whip:resaaaaaaaa")!).lastSeenAt;
+		const seenB = JSON.parse(kv.store.get("whip:resbbbbbbbb")!).lastSeenAt;
+		expect(seenA).not.toBe(seenB); // distinct per-probe stamps, not one shared value
+	});
+
+	it("parks a pagination cursor so a later page cannot starve, and clears it when the pass wraps", async () => {
+		const kv = memKv({ "whip:res00000abc": { sessionId: "s".repeat(32), org: ORG, startedAt: START } });
+		const emits: unknown[] = [];
+		await sweepWhipResources({ ...PROVISIONED, RT_MEETING_ORG: kv } as never, depsFor("alive", START + MIN, emits) as never);
+		// This stub returns list_complete on the first page, so a full pass wrapped → no stale cursor parked.
+		expect(kv.store.has("whipsweep:cursor")).toBe(false);
+	});
+
+	it("does not enumerate its own cursor bookkeeping as a resource record", async () => {
+		const kv = memKv({ "whip:res00000abc": { sessionId: "s".repeat(32), org: ORG, startedAt: START } });
+		kv.store.set("whipsweep:cursor", "somecursor");
+		const emits: unknown[] = [];
+		const stats = await sweepWhipResources({ ...PROVISIONED, RT_MEETING_ORG: kv } as never, depsFor("gone", START + MIN, emits) as never);
+		expect(stats.scanned).toBe(1); // only the real record, never the cursor key
 	});
 });
 
