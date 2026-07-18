@@ -330,7 +330,13 @@ new_sqlite_classes = ["RecorderContainer"]
 # Dockerfile (no private dep) — wrangler supports a mixed build/reference set.
 [[containers]]
 class_name = "StreamBridgeContainer"
-image = "registry.cloudflare.com/d674452f756fe46885a0d6ce7bc23f0a/wave-stream-bridge:v5-55261de"
+# v6-83543bb (◆ 2026-07-18, Jake-named "Rebuild stream-bridge image") — carries the #2 fix: a VIDEO-ONLY
+# source no longer 502s. The old image hard-required audio (`-map 0:a:0`), so any customer pushing a
+# video-only RTMP/SRT feed got no bridge and therefore no billable minutes at all. v6 probes with ffprobe
+# (verified present at /usr/bin/ffprobe in this exact image) and omits the whole audio output leg when the
+# source has none. Registry digest sha256:ba496be0b7f13dd66bde322c4c4cf534933671fb9f19a8e62d22639cee9e35e9
+# matches the locally-built amd64 image ID.
+image = "registry.cloudflare.com/d674452f756fe46885a0d6ce7bc23f0a/wave-stream-bridge:v6-83543bb"
 max_instances = 5
 
 [[durable_objects.bindings]]
