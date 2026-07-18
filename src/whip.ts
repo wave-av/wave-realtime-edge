@@ -67,6 +67,14 @@ const WHIP_KV_TTL_SECONDS = 60 * 60 * 24; // 24h
  * own bookkeeping is never enumerated as a resource record by `list({ prefix: WHIP_KV_PREFIX })`.
  */
 const WHIP_SWEEP_CURSOR_KEY = "whipsweep:cursor";
+/**
+ * #35 — how long a session may answer with ZERO tracks before the sweeper treats it as a dead publisher.
+ * Tracks appear within seconds of a successful publish, so anything past this window is not negotiation —
+ * it is CF holding an empty session open for a publisher that died without a teardown (live-observed still
+ * answering 200 with `tracks: []` 35 minutes after the publisher was killed). Generous on purpose: the cost
+ * of waiting is delayed revenue, while the cost of being too eager is closing a real session.
+ */
+const WHIP_IDLE_GRACE_MS = 3 * 60_000; // 3 min
 
 /** The minimal KV surface this module needs (read/write/delete/list the resource record). Matches CF KV. */
 export interface WhipKv {
@@ -242,7 +250,7 @@ export interface WhipSweepEntry {
 	resourceId: string;
 	record: WhipResource;
 	/** SFU liveness verdict (see SfuClient.sessionLiveness). "unknown" ⇒ we could not tell. */
-	verdict: "alive" | "gone" | "unknown";
+	verdict: "alive" | "gone" | "idle" | "unknown";
 	/**
 	 * Epoch ms captured immediately BEFORE this session's own probe. Stamped per-entry rather than once per
 	 * page because a page of probes takes real time: a single post-loop timestamp would credit the first
@@ -286,6 +294,14 @@ export function planWhipSweep(entries: WhipSweepEntry[], now: number): WhipSweep
 			// Stamp the instant THIS session was probed, never the page-wide `now` (see WhipSweepEntry.observedAt).
 			plan.refresh.push({ resourceId, record: { ...record, lastSeenAt: observedAt ?? now } });
 			continue;
+		}
+		if (verdict === "idle") {
+			// The SFU answers but reports no tracks. Below the grace window that is normal mid-negotiation, so
+			// leave it entirely alone; past it, the publisher is gone (CF never 404s these — see sessionLiveness).
+			// CRITICALLY, an idle session is NEVER refreshed: bumping lastSeenAt here would silently convert dead
+			// air into billable minutes, since the session can sit idle indefinitely.
+			if ((observedAt ?? now) - record.startedAt <= WHIP_IDLE_GRACE_MS) continue;
+			// else: fall through and bill it exactly like a "gone" session.
 		}
 		// "gone": bill to the last VERIFIED-alive instant, never to `now`. Floor at startedAt+1ms so an
 		// established publish always bills the documented minimum of one ceil-minute.
