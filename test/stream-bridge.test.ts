@@ -154,17 +154,49 @@ describe("parseStreamEvent — tolerant of field-name variants", () => {
       uid: "u1",
       lifecycle: "connected",
       live: undefined,
+      keys: ["notificationName", "input_id"],
     });
     expect(parseStreamEvent(JSON.stringify({ eventType: "live_input.disconnected", uid: "u2" }))?.lifecycle).toBe(
       "disconnected",
     );
     expect(parseStreamEvent(JSON.stringify({ event: "live_input.connected", live_input: { uid: "u3", live: true } }))).toEqual(
-      { uid: "u3", lifecycle: "connected", live: true },
+      { uid: "u3", lifecycle: "connected", live: true, keys: ["event", "live_input"] },
     );
   });
   it("no uid → null; bad json → null", () => {
     expect(parseStreamEvent(JSON.stringify({ notificationName: "live_input.connected" }))).toBeNull();
     expect(parseStreamEvent("{not json")).toBeNull();
+  });
+
+  // #8 regression. The 2026-07-18 outage: a real CF push landed in `other`, so the container bridge never
+  // dispatched and nothing billed — while every test above stayed green, because they only ever asserted our
+  // OWN invented key names back at us. These pin the property that actually matters: the lifecycle is found
+  // by the event-name VALUE, under a key this parser has never heard of.
+  it("finds the lifecycle under an UNKNOWN key (value-keyed match)", () => {
+    expect(
+      parseStreamEvent(JSON.stringify({ some_future_field: "live_input.connected", input_id: "u4" }))?.lifecycle,
+    ).toBe("connected");
+    expect(
+      parseStreamEvent(JSON.stringify({ some_future_field: "live_input.disconnected", input_id: "u5" }))?.lifecycle,
+    ).toBe("disconnected");
+  });
+
+  it("handles the snake_case `event_type` key CF uses on the live surface", () => {
+    expect(parseStreamEvent(JSON.stringify({ event_type: "live_input.connected", input_id: "u6" }))?.lifecycle).toBe(
+      "connected",
+    );
+  });
+
+  it("a genuinely unrelated event still parses as `other` and carries the payload keys for diagnosis", () => {
+    const evt = parseStreamEvent(JSON.stringify({ event_type: "video.ready", input_id: "u7" }));
+    expect(evt?.lifecycle).toBe("other");
+    expect(evt?.keys).toEqual(["event_type", "input_id"]);
+  });
+
+  it("keys carries NAMES only — never values (unvetted third-party input must not reach logs)", () => {
+    const evt = parseStreamEvent(JSON.stringify({ event_type: "live_input.connected", input_id: "u8", meta: "secret-ish" }));
+    expect(evt?.keys).toEqual(["event_type", "input_id", "meta"]);
+    expect(JSON.stringify(evt?.keys)).not.toContain("secret-ish");
   });
 });
 

@@ -127,12 +127,44 @@ export interface StreamBridgeEvent {
   uid: string; // the live_input uid (the dispatch lookup key — NEVER an org claim)
   lifecycle: StreamLifecycle;
   live?: boolean; // input is currently receiving a contribution feed (used by the cron lifecycle-poll)
+  keys: string[]; // top-level payload key NAMES (never values) — diagnostics for an unmatched lifecycle
 }
 
 /**
- * Parse a CF Stream live webhook body. Tolerant of `notificationName`/`eventType`/`event` for the lifecycle
- * name and `input_id`/`uid`/`live_input.uid` for the input id — CF's payload shape varies across the live
- * webhook surfaces (contract Q-3 pins the exact one at provision). Returns null if there is no usable uid.
+ * The lifecycle event NAME as CF Stream writes it, e.g. `live_input.connected`. We match on this VALUE
+ * rather than on a guessed key name: the 2026-07-18 dispatch outage (#8) was a live push landing in the
+ * `other` branch because the payload carried its name under a key this parser did not list, so the whole
+ * container-bridge control plane silently no-opped while every unit test stayed green (the tests asserted
+ * our own invented shape back at us). A value-keyed match cannot regress that way — CF may rename the
+ * FIELD, but `live_input.connected` is the documented event identifier.
+ */
+const LIFECYCLE_NAME_RE = /^live[._]?input\.(connected|disconnected)$/;
+
+/** Top-level string values that look like a lifecycle event name, whatever key they arrived under. */
+function nameCandidates(j: Record<string, unknown>): string[] {
+  return Object.values(j)
+    .filter((v): v is string => typeof v === "string")
+    .map((v) => v.toLowerCase())
+    .filter((v) => LIFECYCLE_NAME_RE.test(v));
+}
+
+function lifecycleOf(j: Record<string, unknown>): StreamLifecycle {
+  // Value-keyed match first — key-name-independent, so a CF field rename cannot silently stop dispatch.
+  for (const v of nameCandidates(j)) {
+    return v.endsWith(".disconnected") ? "disconnected" : "connected";
+  }
+  // Legacy key-keyed fallback: tolerates shapes that carry a bare name (`connected`) with no `live_input.` prefix.
+  const name = String(
+    j.notificationName ?? j.eventType ?? j.event_type ?? j.event ?? j.notification_name ?? "",
+  ).toLowerCase();
+  if (!name.includes("connected")) return "other";
+  return name.includes("disconnect") ? "disconnected" : "connected";
+}
+
+/**
+ * Parse a CF Stream live webhook body. Tolerant of the lifecycle name arriving under ANY key (matched by
+ * value, see `lifecycleOf`) and of `input_id`/`uid`/`live_input.uid` for the input id — CF's payload shape
+ * varies across the live webhook surfaces. Returns null if there is no usable uid.
  */
 export function parseStreamEvent(rawText: string): StreamBridgeEvent | null {
   let j: Record<string, unknown>;
@@ -146,19 +178,14 @@ export function parseStreamEvent(rawText: string): StreamBridgeEvent | null {
     j.input_id ?? j.uid ?? j.inputId ?? (li && typeof li.uid === "string" ? li.uid : "") ?? "",
   );
   if (!uid) return null;
-  const name = String(j.notificationName ?? j.eventType ?? j.event ?? "").toLowerCase();
-  const lifecycle: StreamLifecycle = name.includes("connected")
-    ? name.includes("disconnect")
-      ? "disconnected"
-      : "connected"
-    : "other";
+  const lifecycle = lifecycleOf(j);
   const live =
     typeof j.live === "boolean"
       ? j.live
       : li && typeof li.live === "boolean"
         ? (li.live as boolean)
         : undefined;
-  return { uid, lifecycle, live };
+  return { uid, lifecycle, live, keys: Object.keys(j) };
 }
 
 /**
@@ -252,7 +279,10 @@ export async function handleStreamBridge(
     return jsonResponse({ ok: true, lifecycle: evt.lifecycle, room }, 200);
   }
 
-  deps.log?.("stream-bridge-lifecycle-other", base);
+  // Self-diagnosing: an unmatched lifecycle is the exact shape of the #8 dispatch outage, and the old log
+  // ("lifecycle-other" + uid) could not tell you WHY. Carry the payload's top-level KEY NAMES (names only —
+  // never values, which are unvetted third-party input) so one log line names the shape that failed to match.
+  deps.log?.("stream-bridge-lifecycle-other", { ...base, payloadKeys: evt.keys });
   return jsonResponse({ ok: true, lifecycle: evt.lifecycle }, 200);
 }
 
