@@ -4,6 +4,7 @@ import {
   lifecycleUrl,
   livePollDeps,
   customerCodeOf,
+  mediaIsFlowing,
   MAX_INPUTS_PER_TICK,
   type PollDeps,
   type LifecycleState,
@@ -173,6 +174,41 @@ describe("pollStreamLifecycles — failure semantics (never guess, never strand)
   });
 });
 
+describe("mediaIsFlowing — live:true alone is NOT a broadcast", () => {
+  // Captured from the real endpoint 2026-07-18: an idle input answers
+  // {"isInput":true,"videoUID":"unknown","live":true,"status":"ready"}. Dispatching on that made the
+  // container return `502 source leg failed (no live media)` for 5 inputs on EVERY tick.
+  it("rejects the idle-input response CF actually returns (live:true, videoUID:'unknown')", () => {
+    expect(mediaIsFlowing({ live: true, videoUID: "unknown", status: "ready" })).toBe(false);
+  });
+
+  it("accepts a real broadcast (live:true with a concrete videoUID)", () => {
+    expect(mediaIsFlowing({ live: true, videoUID: "abc123", status: "connected" })).toBe(true);
+  });
+
+  it("rejects a disconnected input", () => {
+    expect(mediaIsFlowing({ live: false, videoUID: null, status: "disconnected" })).toBe(false);
+  });
+
+  it("rejects live:false even if a stale videoUID lingers", () => {
+    expect(mediaIsFlowing({ live: false, videoUID: "abc123" })).toBe(false);
+  });
+
+  it("an idle input is NOT dispatched — the container-thrash regression", async () => {
+    const h = harness({ states: { u1: { live: true, videoUID: "unknown", status: "ready" } } });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(h.starts).toHaveLength(0); // the critical assertion: no container spun up
+    expect(r).toMatchObject({ scanned: 1, started: 0, failed: 0, skipped: 0 });
+  });
+
+  it("an input that goes idle mid-session is STOPPED (the meter must not stay open)", async () => {
+    const h = harness({ states: { u1: { live: true, videoUID: "unknown", status: "ready" } }, sessions: ["u1"] });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(h.stops).toEqual([{ org: "org1", uid: "u1" }]);
+    expect(r).toMatchObject({ stopped: 1 });
+  });
+});
+
 describe("customerCodeOf — an EMPTY binding must not shadow a working one", () => {
   // This is the defect that kept #8 open after the poll shipped: `??` falls through only on
   // null/undefined, so CF_STREAM_CUSTOMER_CODE bound to "" shadowed the fallback and the poll
@@ -233,9 +269,15 @@ describe("lifecycleUrl / livePollDeps", () => {
 
     expect(await mk(new Response("nope", { status: 404 }))!.probeLifecycle("u1")).toBeNull();
     expect(await mk(new Response(JSON.stringify({ isInput: true })))!.probeLifecycle("u1")).toBeNull();
+    expect(
+      await mk(new Response(JSON.stringify({ live: true, videoUID: "v9", status: "connected" })))!.probeLifecycle("u1"),
+    ).toEqual({ live: true, videoUID: "v9", status: "connected" });
+
+    // `status` is diagnostic and optional — a body without it still parses, as null.
     expect(await mk(new Response(JSON.stringify({ live: true, videoUID: "v9" })))!.probeLifecycle("u1")).toEqual({
       live: true,
       videoUID: "v9",
+      status: null,
     });
   });
 });

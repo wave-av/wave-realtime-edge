@@ -39,10 +39,38 @@ export const MAX_INPUTS_PER_TICK = 200;
 /** Explicit timeout on every lifecycle probe — an unbounded hang would stall the whole tick. */
 export const LIFECYCLE_TIMEOUT_MS = 5_000;
 
-/** The CF lifecycle endpoint's shape: `{ isInput, videoUID, live }`. */
+/**
+ * The CF lifecycle endpoint's OBSERVED shape: `{ isInput, videoUID, live, status, chunked }`.
+ *
+ * `live: true` alone does NOT mean media is flowing — that misreading cost a round of container
+ * thrash. Two real responses, captured 2026-07-18:
+ *
+ *   idle input   -> {"isInput":true,"videoUID":"unknown","live":true, "status":"ready"}
+ *   disconnected -> {"isInput":true,"videoUID":null,     "live":false,"status":"disconnected"}
+ *
+ * The first is an input that merely EXISTS and is ready to receive. Dispatching on it made the
+ * container answer `502 source leg failed (no live media)` on every tick, for every idle input.
+ * A concrete `videoUID` is the signal that a broadcast is actually running — see `mediaIsFlowing`.
+ */
 export interface LifecycleState {
   live: boolean;
   videoUID: string | null;
+  /** Diagnostic only ("ready" / "disconnected" / …). Optional so callers need not synthesise it. */
+  status?: string | null;
+}
+
+/** The sentinel CF returns in `videoUID` for an input that is ready but carrying no broadcast. */
+export const VIDEO_UID_UNKNOWN = "unknown";
+
+/**
+ * Is a broadcast ACTUALLY running on this input?
+ *
+ * Requires BOTH `live` and a concrete `videoUID`. Fail-safe direction matters here: a false positive
+ * spins up a container that 502s and is retried every tick forever (cost + noise), while a false
+ * negative costs at most one 5-minute tick of latency, because the next poll re-evaluates.
+ */
+export function mediaIsFlowing(state: LifecycleState): boolean {
+  return state.live && typeof state.videoUID === "string" && state.videoUID !== VIDEO_UID_UNKNOWN;
 }
 
 /** Injected seam so every path unit-tests with no network and no KV. */
@@ -94,8 +122,9 @@ export async function pollStreamLifecycles(deps: PollDeps): Promise<PollResult> 
     }
 
     const active = await deps.hasSession(uid).catch(() => false);
+    const flowing = mediaIsFlowing(state);
 
-    if (state.live && !active) {
+    if (flowing && !active) {
       const room = bridgeRoomFor(uid); // deterministic → a duplicate start joins the same room
       try {
         await deps.dispatchStart(org, uid, room);
@@ -110,7 +139,7 @@ export async function pollStreamLifecycles(deps: PollDeps): Promise<PollResult> 
       continue;
     }
 
-    if (!state.live && active) {
+    if (!flowing && active) {
       try {
         await deps.dispatchStop(org, uid);
         await deps.closeSession(uid);
@@ -187,9 +216,13 @@ export function livePollDeps(
       try {
         const res = await fetchFn(lifecycleUrl(code, uid), { signal: ac.signal });
         if (!res.ok) return null;
-        const j = (await res.json()) as { live?: unknown; videoUID?: unknown };
+        const j = (await res.json()) as { live?: unknown; videoUID?: unknown; status?: unknown };
         if (typeof j.live !== "boolean") return null; // unrecognised shape → skip, never guess
-        return { live: j.live, videoUID: typeof j.videoUID === "string" ? j.videoUID : null };
+        return {
+          live: j.live,
+          videoUID: typeof j.videoUID === "string" ? j.videoUID : null,
+          status: typeof j.status === "string" ? j.status : null,
+        };
       } catch {
         return null;
       } finally {
