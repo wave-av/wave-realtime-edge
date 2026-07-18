@@ -48,8 +48,11 @@ const AUDIO_PT = 111; // Opus
  * VP8 deadline keeps latency low; `-muxdelay/-muxpreload 0` avoid RTP muxer buffering.
  * @param {string} srcUrl - the LL-HLS manifest URL (CF `.../manifest/video.m3u8?protocol=llhls`).
  * @param {string} [auth] - optional Bearer for a signed/token-gated source (unused for the unsigned dogfood manifest).
+ * @param {boolean} [hasAudio=true] - whether the source carries an audio stream (see `probeHasAudio`). When false the
+ *   ENTIRE audio output leg is omitted: `-map 0:a:0?` alone is NOT enough, because a second `-f rtp` output that maps
+ *   zero streams makes ffmpeg abort with "Output file #1 does not contain any stream" — the very 502 this fixes.
  */
-export function ffmpegArgs(srcUrl, auth) {
+export function ffmpegArgs(srcUrl, auth, hasAudio = true) {
   const args = ["-hide_banner", "-loglevel", "warning", "-re"];
   if (auth) args.push("-headers", `Authorization: Bearer ${auth}\r\n`);
   args.push(
@@ -57,11 +60,83 @@ export function ffmpegArgs(srcUrl, auth) {
     "-map", "0:v:0", "-c:v", "libvpx", "-b:v", "2M", "-deadline", "realtime", "-cpu-used", "5",
     "-muxdelay", "0", "-muxpreload", "0", "-payload_type", String(VIDEO_PT), "-f", "rtp",
     `rtp://127.0.0.1:${VIDEO_RTP_PORT}`,
-    "-map", "0:a:0", "-c:a", "libopus", "-b:a", "128k",
-    "-muxdelay", "0", "-muxpreload", "0", "-payload_type", String(AUDIO_PT), "-f", "rtp",
-    `rtp://127.0.0.1:${AUDIO_RTP_PORT}`,
   );
+  if (hasAudio) {
+    args.push(
+      // `?` = tolerate the stream vanishing between probe and spawn (live manifests re-ladder mid-flight); the probe
+      // above is what decides whether this leg exists at all.
+      "-map", "0:a:0?", "-c:a", "libopus", "-b:a", "128k",
+      "-muxdelay", "0", "-muxpreload", "0", "-payload_type", String(AUDIO_PT), "-f", "rtp",
+      `rtp://127.0.0.1:${AUDIO_RTP_PORT}`,
+    );
+  }
   return args;
+}
+
+/**
+ * Ask ffprobe whether the source carries an audio stream, so `hlsPull` can drop the audio leg for a video-only feed.
+ *
+ * WHY (real product bug, proven live 2026-07-18): customers push video-only RTMP/SRT all the time (screen shares,
+ * camera-only encoders, silent art feeds). The old hard `-map 0:a:0` made ffmpeg exit at startup for those, which
+ * `hlsPull` surfaced as `onState('failed')` → relay "source leg failed (no live media)" → container `/start` 502.
+ * No bridge, no meter, no product.
+ *
+ * FAIL-SAFE DIRECTION: on ANY probe failure (timeout, ffprobe missing, malformed output) this returns TRUE — the
+ * status-quo behavior. Biasing to false would SILENTLY DROP AUDIO from a source that has it, which is a worse and
+ * quieter failure than the loud 502 it replaces. A probe that cannot reach the source is a source problem that the
+ * ffmpeg spawn will surface loudly a second later anyway.
+ *
+ * @param {string} srcUrl - the LL-HLS manifest URL.
+ * @param {string} [auth] - optional Bearer, mirrored from `ffmpegArgs`.
+ * @param {object} [o]
+ * @param {Function} [o.spawnFn] - injectable spawn (test seam).
+ * @param {Function} [o.log] - structured logger.
+ * @param {number} [o.timeoutMs=8000] - hard cap; a hung probe must not wedge relay startup.
+ * @returns {Promise<boolean>}
+ */
+export function probeHasAudio(srcUrl, auth, o = {}) {
+  const spawnFn = o.spawnFn ?? nodeSpawn;
+  const log = o.log ?? (() => {});
+  const timeoutMs = o.timeoutMs ?? 8_000;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer; // declared before finish() — the spawn-throw path calls finish() before the timer is armed
+    const finish = (hasAudio, why) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      log("hls-probe-audio", { hasAudio, why });
+      resolve(hasAudio);
+    };
+
+    const args = ["-v", "error"];
+    if (auth) args.push("-headers", `Authorization: Bearer ${auth}\r\n`);
+    args.push("-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", srcUrl);
+
+    let proc;
+    try {
+      proc = spawnFn("ffprobe", args, { stdio: ["ignore", "pipe", "ignore"] });
+    } catch (e) {
+      finish(true, `spawn-threw:${String(e).slice(0, 80)}`);
+      return;
+    }
+
+    timer = setTimeout(() => {
+      try { proc.kill("SIGKILL"); } catch { /* already dead */ }
+      finish(true, "timeout");
+    }, timeoutMs);
+
+    let out = "";
+    proc.stdout?.on("data", (d) => { out += String(d); });
+    proc.on("error", (e) => finish(true, `spawn-error:${String(e).slice(0, 80)}`));
+    proc.on("exit", (code) => {
+      // Non-zero ffprobe exit = we learned nothing → status quo (assume audio). Zero exit with empty stdout is a
+      // DEFINITIVE "no audio streams" answer, which is exactly the video-only case we are here to serve.
+      if (code !== 0) return finish(true, `exit:${code}`);
+      finish(out.trim().length > 0, "probed");
+    });
+  });
 }
 
 /**
@@ -102,9 +177,14 @@ export async function hlsPull(o) {
     onState?.("connected");
   };
 
+  // Does the source actually carry audio? A video-only feed gets a video-only bridge (relay.mjs requires >=1 track,
+  // not both) instead of the startup 502 the old hard `-map 0:a:0` produced. Injectable for tests via `probeFn`.
+  const probe = o.probeFn ?? probeHasAudio;
+  const hasAudio = o.hasAudio ?? (await probe(srcUrl, auth, { spawnFn, log }));
+
   // Synthetic sendonly relay tracks — writeRtp() feeds them the deserialized ffmpeg RTP; publish() addTrack()s them.
   const videoTrack = makeTrack("video");
-  const audioTrack = makeTrack("audio");
+  const audioTrack = hasAudio ? makeTrack("audio") : null;
 
   // Every socket the instant it exists — so teardown reaches it even if the OTHER leg's bind rejects mid-Promise.all.
   const openSockets = [];
@@ -145,7 +225,9 @@ export async function hlsPull(o) {
   try {
     await Promise.all([
       bindSocket(VIDEO_RTP_PORT, videoTrack, "video"),
-      bindSocket(AUDIO_RTP_PORT, audioTrack, "audio"),
+      // No audio leg for a video-only source: nothing will ever be sent to this port, and binding it would leave a
+      // socket whose silence is indistinguishable from a stalled audio feed.
+      ...(audioTrack ? [bindSocket(AUDIO_RTP_PORT, audioTrack, "audio")] : []),
     ]);
   } catch (e) {
     for (const s of openSockets) { try { s.close(); } catch { /* already closed */ } }
@@ -154,9 +236,9 @@ export async function hlsPull(o) {
 
   // Produce the tracks up front so runRelay collects both before publish (it requires >=1 track before WHIP-out).
   onTrack?.(videoTrack);
-  onTrack?.(audioTrack);
+  if (audioTrack) onTrack?.(audioTrack);
 
-  const ff = spawnFn("ffmpeg", ffmpegArgs(srcUrl, auth), { stdio: ["ignore", "ignore", "pipe"] });
+  const ff = spawnFn("ffmpeg", ffmpegArgs(srcUrl, auth, hasAudio), { stdio: ["ignore", "ignore", "pipe"] });
   ff.stderr?.on("data", (d) => log("ffmpeg-stderr", { line: String(d).slice(0, 200) }));
   ff.on("exit", (code) => {
     log("ffmpeg-exit", { code });
