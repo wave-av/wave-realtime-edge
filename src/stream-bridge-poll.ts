@@ -138,6 +138,21 @@ interface PollRuntimeEnv extends StreamBridgeRuntimeEnv {
   CLOUDFLARE_STREAM_CUSTOMER_CODE?: string;
 }
 
+/**
+ * Resolve the Stream customer code, skipping EMPTY bindings.
+ *
+ * `??` was wrong here and cost a full diagnosis cycle: it falls through only on null/undefined, so a
+ * secret bound to the EMPTY STRING (which is what `wrangler secret put` does when its input is empty)
+ * SHADOWED the working fallback and made the poll report `hasCode:false` on every tick. The binding
+ * looked correct from outside — the CF API listed the secret as present — while being falsy inside the
+ * isolate. Any config read whose "missing" case is falsy-but-not-nullish needs truthiness, not `??`.
+ */
+export function customerCodeOf(env: PollRuntimeEnv): string | undefined {
+  return [env.CF_STREAM_CUSTOMER_CODE, env.CLOUDFLARE_STREAM_CUSTOMER_CODE].find(
+    (v): v is string => typeof v === "string" && v.trim() !== "",
+  );
+}
+
 /** Live PollDeps: KV for inventory + session state, the public lifecycle endpoint for the probe. */
 export function livePollDeps(
   env: PollRuntimeEnv,
@@ -148,7 +163,7 @@ export function livePollDeps(
   fetchFn: typeof fetch = fetch,
 ): PollDeps | null {
   const kv = env.RT_MEETING_ORG;
-  const code = env.CF_STREAM_CUSTOMER_CODE ?? env.CLOUDFLARE_STREAM_CUSTOMER_CODE;
+  const code = customerCodeOf(env);
   if (!kv || !code) return null; // unconfigured → inert, never a half-working poll
 
   const log = (msg: string, fields: Record<string, unknown>) => console.log(JSON.stringify({ msg, ...fields }));
@@ -213,7 +228,7 @@ export function scheduledStreamPoll(
 
   const enabled = streamBridgeEnabled(env);
   const hasKv = Boolean(env.RT_MEETING_ORG);
-  const hasCode = Boolean(env.CF_STREAM_CUSTOMER_CODE ?? env.CLOUDFLARE_STREAM_CUSTOMER_CODE);
+  const hasCode = Boolean(customerCodeOf(env));
 
   if (!enabled || !hasKv || !hasCode) {
     log("stream-poll-inert", { enabled, hasKv, hasCode });

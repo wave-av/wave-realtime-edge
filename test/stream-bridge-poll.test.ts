@@ -3,6 +3,7 @@ import {
   pollStreamLifecycles,
   lifecycleUrl,
   livePollDeps,
+  customerCodeOf,
   MAX_INPUTS_PER_TICK,
   type PollDeps,
   type LifecycleState,
@@ -169,6 +170,40 @@ describe("pollStreamLifecycles — failure semantics (never guess, never strand)
     const h = harness({ inputs: many, states: {} });
     const r = await pollStreamLifecycles(h.deps);
     expect(r.scanned).toBe(MAX_INPUTS_PER_TICK);
+  });
+});
+
+describe("customerCodeOf — an EMPTY binding must not shadow a working one", () => {
+  // This is the defect that kept #8 open after the poll shipped: `??` falls through only on
+  // null/undefined, so CF_STREAM_CUSTOMER_CODE bound to "" shadowed the fallback and the poll
+  // reported hasCode:false forever. The CF API listed the secret as present the whole time.
+  it("skips an empty-string binding and falls through to the next candidate", () => {
+    expect(customerCodeOf({ CF_STREAM_CUSTOMER_CODE: "", CLOUDFLARE_STREAM_CUSTOMER_CODE: "good" })).toBe("good");
+  });
+
+  it("skips a whitespace-only binding too", () => {
+    expect(customerCodeOf({ CF_STREAM_CUSTOMER_CODE: "   ", CLOUDFLARE_STREAM_CUSTOMER_CODE: "good" })).toBe("good");
+  });
+
+  it("prefers the primary when it is genuinely set", () => {
+    expect(customerCodeOf({ CF_STREAM_CUSTOMER_CODE: "primary", CLOUDFLARE_STREAM_CUSTOMER_CODE: "fallback" })).toBe(
+      "primary",
+    );
+  });
+
+  it("is undefined when every candidate is missing or empty", () => {
+    expect(customerCodeOf({})).toBeUndefined();
+    expect(customerCodeOf({ CF_STREAM_CUSTOMER_CODE: "", CLOUDFLARE_STREAM_CUSTOMER_CODE: "" })).toBeUndefined();
+  });
+
+  it("livePollDeps is INERT — not half-configured — when the code is bound but empty", () => {
+    const kv = { list: async () => ({ keys: [] }), get: async () => null } as unknown as KVNamespace;
+    expect(
+      livePollDeps(
+        { STREAM_BRIDGE_ENABLED: "1", RT_MEETING_ORG: kv, CF_STREAM_CUSTOMER_CODE: "" },
+        { dispatchStart: async () => {}, dispatchStop: async () => {} },
+      ),
+    ).toBeNull();
   });
 });
 
