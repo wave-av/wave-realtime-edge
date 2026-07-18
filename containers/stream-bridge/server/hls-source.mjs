@@ -106,9 +106,14 @@ export async function hlsPull(o) {
   const videoTrack = makeTrack("video");
   const audioTrack = makeTrack("audio");
 
+  // Every socket the instant it exists — so teardown reaches it even if the OTHER leg's bind rejects mid-Promise.all.
+  const openSockets = [];
+
   const bindSocket = (port, track, kind) =>
     new Promise((resolve, reject) => {
       const sock = socketFactory();
+      openSockets.push(sock);
+      let settled = false; // the bind promise resolves/rejects ONCE; later socket errors take the live-relay path
       sock.on("message", (buf) => {
         // Media is flowing the instant the FIRST datagram lands — signal 'connected' BEFORE writeRtp, because
         // runRelay awaits 'connected' before publish()→addTrack() attaches the track (gating on writeRtp success
@@ -121,14 +126,31 @@ export async function hlsPull(o) {
           /* a single malformed datagram must not kill the relay; the SFU tolerates loss */
         }
       });
-      sock.on("error", (e) => reject(new Error(`hls ${kind} socket error: ${String(e).slice(0, 160)}`)));
-      sock.bind(port, "127.0.0.1", () => resolve(sock));
+      sock.on("error", (e) => {
+        const msg = `hls ${kind} socket error: ${String(e).slice(0, 160)}`;
+        if (!settled) {
+          settled = true;
+          reject(new Error(msg)); // bind-time failure → reject so hlsPull throws (and the catch below closes sockets)
+          return;
+        }
+        // Mid-relay socket error (post-bind): fail LOUD so index.mjs surfaces 5xx and B1 reconciles — never silently
+        // drop it onto an already-settled promise (which Node would discard, wedging the relay `active`).
+        log("hls-socket-error", { kind, message: msg });
+        if (!stopping) onState?.("failed");
+        try { sock.close(); } catch { /* already closed */ }
+      });
+      sock.bind(port, "127.0.0.1", () => { settled = true; resolve(sock); });
     });
 
-  const [videoSock, audioSock] = await Promise.all([
-    bindSocket(VIDEO_RTP_PORT, videoTrack, "video"),
-    bindSocket(AUDIO_RTP_PORT, audioTrack, "audio"),
-  ]);
+  try {
+    await Promise.all([
+      bindSocket(VIDEO_RTP_PORT, videoTrack, "video"),
+      bindSocket(AUDIO_RTP_PORT, audioTrack, "audio"),
+    ]);
+  } catch (e) {
+    for (const s of openSockets) { try { s.close(); } catch { /* already closed */ } }
+    throw e; // fail loud — a source that can't bind its RTP sockets can't relay
+  }
 
   // Produce the tracks up front so runRelay collects both before publish (it requires >=1 track before WHIP-out).
   onTrack?.(videoTrack);
@@ -138,8 +160,10 @@ export async function hlsPull(o) {
   ff.stderr?.on("data", (d) => log("ffmpeg-stderr", { line: String(d).slice(0, 200) }));
   ff.on("exit", (code) => {
     log("ffmpeg-exit", { code });
-    // A non-zero exit we did NOT trigger via stop() = the source died → fail loud so B1's reconcile re-dispatches.
-    if (!stopping && code !== 0) onState?.("failed");
+    // ANY ffmpeg exit we did NOT trigger via stop() = the live source ended → fail loud so B1's reconcile
+    // re-dispatches. A clean exit (code 0) is NOT success for a live relay: it means the source stopped
+    // sending (EXT-X-ENDLIST / silent origin), which must surface, not leave the relay wedged `active`.
+    if (!stopping) onState?.("failed");
   });
   ff.on("error", (e) => {
     log("ffmpeg-spawn-error", { message: String(e).slice(0, 200) });
@@ -151,7 +175,7 @@ export async function hlsPull(o) {
     if (stopping) return;
     stopping = true;
     try { ff.kill("SIGTERM"); } catch { /* already dead */ }
-    for (const s of [videoSock, audioSock]) {
+    for (const s of openSockets) {
       try { s.close(); } catch { /* already closed */ }
     }
     log("hls-stopped", {});

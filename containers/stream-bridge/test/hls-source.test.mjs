@@ -97,6 +97,25 @@ describe("hlsPull — source leg orchestration", () => {
     expect(onState).toHaveBeenCalledWith("failed");
   });
 
+  it("treats a CLEAN ffmpeg exit (code 0) mid-relay as a failure — a live source ending is not success", async () => {
+    const { base, ff } = harness();
+    const onState = vi.fn();
+    await hlsPull({ ...base, onTrack: vi.fn(), onState });
+
+    ff._emit("exit", 0);
+    expect(onState).toHaveBeenCalledWith("failed");
+  });
+
+  it("fires onState('failed') + closes the socket on a MID-RELAY (post-bind) socket error, not silently", async () => {
+    const { base, sockets } = harness();
+    const onState = vi.fn();
+    await hlsPull({ ...base, onTrack: vi.fn(), onState }); // bind resolved → settled
+
+    sockets[0].emit("error", new Error("EADDRNOTAVAIL mid-stream"));
+    expect(onState).toHaveBeenCalledWith("failed");
+    expect(sockets[0].close).toHaveBeenCalled();
+  });
+
   it("stop() kills ffmpeg + closes both sockets, and suppresses the ensuing exit as NOT a failure", async () => {
     const { base, sockets, ff } = harness();
     const onState = vi.fn();
