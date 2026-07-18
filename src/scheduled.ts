@@ -2,7 +2,8 @@
 // this file nor route-dispatch.ts exceeds 800 lines. Imports only leaf modules, so there is no cycle:
 // route-dispatch.ts re-exports scheduledHandler from here, and worker.ts's import is unchanged.
 import { reconcilePending } from "./rtk-webhook";
-import { scheduledStreamReconcile } from "./stream-bridge";
+import { scheduledStreamReconcile, liveStreamBridgeDeps } from "./stream-bridge";
+import { scheduledStreamPoll } from "./stream-bridge-poll";
 import { scheduledIngestReconcile } from "./ingest-bridge";
 import { scheduledWhipSweep, WHIP_SWEEP_CRON } from "./whip-sweep";
 import { buildPullSink, type Env } from "./dispatch-helpers";
@@ -34,6 +35,16 @@ export async function scheduledHandler(
 		scheduledStreamReconcile(env, ctx);
 		// F (#55) — Plane-2 ingest-bridge pending-start reconcile backstop (INERT unless enabled + KV bound). Best-effort.
 		scheduledIngestReconcile(env, ctx);
+	}
+
+	// #8 — CF Stream lifecycle POLL: the PRIMARY dispatch trigger for the container bridge. The
+	// `live_input.connected` webhook this bridge was built around was never subscribed on the account
+	// (we had the VOD video-ready webhook instead), so nothing ever dispatched or billed. Polling the
+	// input's own lifecycle endpoint needs no CF-side subscription and self-heals a missed event.
+	// Runs on EVERY tick so go-live latency is the tight */5 cadence, not the 15-minute one.
+	{
+		const deps = liveStreamBridgeDeps(env);
+		scheduledStreamPoll(env, ctx, { dispatchStart: deps.dispatchStart, dispatchStop: deps.dispatchStop });
 	}
 
 	// #35 — WHIP orphan sweeper: bills publish sessions whose container died without sending a teardown
