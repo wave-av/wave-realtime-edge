@@ -144,6 +144,34 @@ describe("checkContainerHealth — sustain, inertness, and failure modes", () =>
 		expect(log).toHaveBeenCalledWith("container-health-tick", { apps: 1, wedged: 1, atCapacity: 0, alarmed: 0 });
 	});
 
+	it("survives a fetch that enforces the Workers `this` contract (the bug that shipped)", async () => {
+		// scheduledContainerHealth originally passed the bare global `fetch` by reference, which the Workers
+		// runtime rejects with "Illegal invocation: function called with incorrect `this` reference". The alarm
+		// was 100% dead in production from its first tick. This models the runtime's actual contract: the
+		// function throws unless invoked with the correct receiver, so passing it unbound fails here too.
+		const realFetch = fetchReturning([app()]) as unknown as (i: unknown, x?: unknown) => Promise<Response>;
+		const host = {
+			fetch(input: unknown, init?: unknown) {
+				if (this !== host) throw new TypeError("Illegal invocation: function called with incorrect `this` reference");
+				return realFetch(input, init);
+			},
+		};
+		const log = vi.fn();
+		// Bare reference — must fail, exactly as it did in prod.
+		await checkContainerHealth(okEnv, { fetch: host.fetch as unknown as typeof fetch, kv: fakeKv(), log });
+		expect(log).toHaveBeenCalledWith("container-health-probe-failed", expect.objectContaining({ error: expect.stringContaining("Illegal invocation") }));
+
+		// Wrapped the way scheduledContainerHealth now does it — must work.
+		const log2 = vi.fn();
+		const r = await checkContainerHealth(okEnv, {
+			fetch: ((i: unknown, x?: unknown) => host.fetch(i, x)) as unknown as typeof fetch,
+			kv: fakeKv(),
+			log: log2,
+		});
+		expect(r.verdicts).toHaveLength(1);
+		expect(log2).not.toHaveBeenCalledWith("container-health-probe-failed", expect.anything());
+	});
+
 	it("carries the rollup verbatim into the alarm line — the counts ARE the diagnosis", async () => {
 		const kv = fakeKv();
 		const log = vi.fn();

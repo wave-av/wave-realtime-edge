@@ -193,7 +193,14 @@ export async function checkContainerHealth(env: AlarmEnv, deps: AlarmDeps): Prom
  */
 export function scheduledContainerHealth(env: AlarmEnv, ctx: ExecutionContext, kv?: KVNamespace): void {
 	ctx.waitUntil(
-		checkContainerHealth(env, { fetch, kv }).then(
+		// `fetch` MUST be wrapped, not passed by reference. The Workers runtime rejects a bare global `fetch`
+		// invoked through another binding with:
+		//   TypeError: Illegal invocation: function called with incorrect `this` reference
+		// This shipped unbound and the alarm was 100% non-functional in production from its first tick — every
+		// run died inside the try/catch. The ONLY reason it was caught within the hour is that the catch logs
+		// `container-health-probe-failed` loudly instead of returning quietly, which is the whole thesis of
+		// this module. A silent catch here would have left a watchdog that looked deployed and did nothing.
+		checkContainerHealth(env, { fetch: (input, init) => fetch(input, init), kv }).then(
 			() => undefined,
 			(e) => {
 				console.log(JSON.stringify({ msg: "container-health-alarm-error", error: String(e).slice(0, 160) }));
