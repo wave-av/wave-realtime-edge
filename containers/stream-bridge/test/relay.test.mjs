@@ -126,3 +126,73 @@ describe("runRelay — orchestration", () => {
       .rejects.toThrow(/whipKey is required/);
   });
 });
+
+// A publish() that hands the caller's onState callback back, so a test can drive the WHIP leg's
+// lifecycle the way the real transport does (state changes arrive AFTER publish resolves).
+function fakePublishControllable() {
+  const ctl = {};
+  const fn = vi.fn(async ({ onState }) => {
+    ctl.emit = onState;
+    return { stop: vi.fn(async () => {}), resourceUrl: "https://gateway.wave.online/v1/whip/resource/abc" };
+  });
+  return [fn, ctl];
+}
+
+describe("relay liveness — a dead WHIP leg must not report healthy (#235)", () => {
+  it("is alive once both legs are up", async () => {
+    const [publish] = fakePublishControllable();
+    const relay = await runRelay({
+      sourceUrl: SRC, whipUrl: WHIP, whipKey: KEY, pull: fakePull([{ kind: "video" }]), publish, pcFactory,
+    });
+    expect(relay.alive).toBe(true);
+    expect(relay.state).toMatchObject({ source: "connected", stopped: false });
+  });
+
+  it.each(["closed", "failed", "disconnected"])(
+    "goes NOT-alive when the WHIP leg reports %s — the silent-death regression",
+    async (deadState) => {
+      const [publish, ctl] = fakePublishControllable();
+      const relay = await runRelay({
+        sourceUrl: SRC, whipUrl: WHIP, whipKey: KEY, pull: fakePull([{ kind: "video" }]), publish, pcFactory,
+      });
+      expect(relay.alive).toBe(true);
+
+      ctl.emit(deadState); // the transport that used to be swallowed into a log line
+
+      expect(relay.alive).toBe(false);
+      expect(relay.state.whip).toBe(deadState);
+    },
+  );
+
+  it("logs relay-whip-dead LOUDLY on a terminal WHIP state", async () => {
+    const logs = [];
+    const [publish, ctl] = fakePublishControllable();
+    await runRelay({
+      sourceUrl: SRC, whipUrl: WHIP, whipKey: KEY, pull: fakePull([{ kind: "video" }]), publish, pcFactory,
+      log: (msg, fields) => logs.push({ msg, fields }),
+    });
+    ctl.emit("failed");
+    expect(logs.map((l) => l.msg)).toContain("relay-whip-dead");
+  });
+
+  it("a non-terminal WHIP state does NOT kill liveness (no false teardown)", async () => {
+    const [publish, ctl] = fakePublishControllable();
+    const relay = await runRelay({
+      sourceUrl: SRC, whipUrl: WHIP, whipKey: KEY, pull: fakePull([{ kind: "video" }]), publish, pcFactory,
+    });
+    ctl.emit("connecting");
+    // Fail-safe direction: a transient state must not tear down a working broadcast. Only the
+    // terminal set counts as dead — the inverse mistake (over-eager teardown) costs a live stream.
+    expect(relay.alive).toBe(true);
+  });
+
+  it("reports NOT-alive after stop()", async () => {
+    const [publish] = fakePublishControllable();
+    const relay = await runRelay({
+      sourceUrl: SRC, whipUrl: WHIP, whipKey: KEY, pull: fakePull([{ kind: "video" }]), publish, pcFactory,
+    });
+    await relay.stop();
+    expect(relay.alive).toBe(false);
+    expect(relay.state.stopped).toBe(true);
+  });
+});

@@ -78,7 +78,18 @@ const server = createServer(async (req, res) => {
     res.end(typeof body === "string" ? body : JSON.stringify(body));
   };
   try {
-    if (req.method === "GET" && req.url === "/health") return send(200, { ok: true });
+    // /health reports the RELAY's real state, not a constant. A health check that cannot fail tells
+    // the control plane nothing — this one returned `{ok:true}` while the WHIP leg was dead, which is
+    // how a dead media path went unnoticed for minutes (#235). `bridging` is the field callers act on:
+    // true only when a relay exists AND both legs are non-terminal.
+    if (req.method === "GET" && req.url === "/health") {
+      return send(200, {
+        ok: true, // the SERVER is up — distinct from whether it is bridging
+        bridging: Boolean(active?.alive),
+        tracks: active?.trackCount ?? 0,
+        relay: active?.state ?? null,
+      });
+    }
 
     if (req.method === "POST" && req.url === "/start") {
       const { room, uid } = await readJson(req);
