@@ -337,7 +337,13 @@ class_name = "StreamBridgeContainer"
 # source has none. Registry digest sha256:ba496be0b7f13dd66bde322c4c4cf534933671fb9f19a8e62d22639cee9e35e9
 # matches the locally-built amd64 image ID.
 image = "registry.cloudflare.com/d674452f756fe46885a0d6ce7bc23f0a/wave-stream-bridge:v6-83543bb"
-max_instances = 5
+# 30, not 5 (#231). One bridge instance = one concurrent customer broadcast, so 5 was both a hard
+# multi-tenant ceiling AND a fragility: five leaked instances wedged bridging account-wide with no
+# self-healing. Account limits are nowhere near binding (total_vcpu 1500 vs 0.0625 per default
+# instance), so the cap's only job is to bound blast radius — 30 does that without being a ceiling a
+# real customer can hit. Pairs with the release-on-failed-start fix in stream-bridge-poll.ts; the cap
+# alone would only have delayed the wedge, not prevented it.
+max_instances = 30
 
 [[durable_objects.bindings]]
 name = "STREAM_BRIDGE"
