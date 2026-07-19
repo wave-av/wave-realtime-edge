@@ -36,6 +36,9 @@ export interface Env extends EncoderEnv, ResidencySinkEnv, IngestBridgeRuntimeEn
 	// CF API call is made. "1" → each tick reads the container-applications health rollup and alarms on
 	// `active > 0 && healthy == 0` sustained across ticks. Read-only; also inert without CF_API_TOKEN.
 	CONTAINER_HEALTH_ALARM_ENABLED?: string;
+	// #234 — token scoped to Containers:Read ONLY (wrangler SECRET). Kept separate from CF_API_TOKEN so a
+	// read-only watchdog does not force the customer-facing Calls/Realtime token to carry a wider scope.
+	CONTAINERS_API_TOKEN?: string;
 	// E-ROOMS P4 (#73) client presence/state-sync + data channel flag ([vars], default off). Falsy/absent →
 	// GET /v1/realtime/rooms/:room/presence is inert (falls through to the 501 catch-all, UNCHANGED). Truthy
 	// ("1"/"true") → the WS-upgrade presence surface is served (the DO owns the hibernatable socket).
