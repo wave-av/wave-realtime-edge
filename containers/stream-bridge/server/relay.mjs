@@ -59,6 +59,22 @@ export async function runRelay(o) {
   let sourceSession = null;
   let stopped = false;
 
+  // Liveness of each leg, so /health can answer truthfully instead of a static ok:true.
+  //
+  // Both legs' state callbacks used to be LOG-ONLY. When the WHIP leg died mid-session nothing
+  // reacted: the relay handle still existed, /health still said ok, and the poll — which infers
+  // health purely from the CF input being live — kept believing it was bridging. Observed
+  // 2026-07-19: the media path was dead ~4 minutes with nothing reporting it (#235).
+  //
+  // "closed"/"failed"/"disconnected" are terminal for our purposes: a WHIP publish does not
+  // self-recover here, so the honest answer is dead, and the control plane restarts us.
+  let whipState = "new";
+  let sourceState = "new";
+  const TERMINAL = new Set(["closed", "failed", "disconnected"]);
+
+  /** Is media ACTUALLY flowing end to end? Both legs must be non-terminal and the relay not stopped. */
+  const isAlive = () => !stopped && !TERMINAL.has(whipState) && !TERMINAL.has(sourceState);
+
   const stop = async () => {
     if (stopped) return;
     stopped = true;
@@ -85,6 +101,7 @@ export async function runRelay(o) {
         log("relay-source-track", { kind: track?.kind, total: tracks.length });
       };
       const onState = (state) => {
+        sourceState = state;
         log("relay-source-state", { state });
         if (state === "connected") resolve();
         else if (state === "failed") reject(new Error("source leg failed (no live media)"));
@@ -109,11 +126,28 @@ export async function runRelay(o) {
       key: whipKey,
       source: { tracks },
       pcFactory,
-      onState: (state) => log("relay-whip-state", { state }),
+      onState: (state) => {
+        whipState = state;
+        log("relay-whip-state", { state });
+        // Loud on death. Previously this transition was swallowed into a debug line and the bridge
+        // stayed "up" forever from the control plane's point of view.
+        if (TERMINAL.has(state)) log("relay-whip-dead", { state, tracks: tracks.length });
+      },
     });
     log("relay-up", { tracks: tracks.length, resource: whipSession?.resourceUrl });
 
-    return { stop, get trackCount() { return tracks.length; } };
+    return {
+      stop,
+      get trackCount() {
+        return tracks.length;
+      },
+      get alive() {
+        return isAlive();
+      },
+      get state() {
+        return { whip: whipState, source: sourceState, stopped };
+      },
+    };
   } catch (err) {
     // Fail-loud: tear down whatever came up, then rethrow the original cause.
     await stop().catch(() => {});
