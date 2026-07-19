@@ -338,20 +338,21 @@ new_sqlite_classes = ["RecorderContainer"]
 # Dockerfile (no private dep) — wrangler supports a mixed build/reference set.
 [[containers]]
 class_name = "StreamBridgeContainer"
-# v9-86b42e2 (◆ 2026-07-19) — carries #235: the container now DRAINS on SIGTERM (stop accepting, then
+# v10-21ba593 (◆ 2026-07-19) — same container code as v9; the tag moves so a rollout can be triggered
+# deliberately to PROVE the #235 drain against a live bridge. Carries #235: the container now DRAINS on SIGTERM (stop accepting, then
 # await relay.stop() so the WHIP DELETE books the session's real duration) instead of dying at exit 137
 # on every rollout. Paired with rollout_active_grace_period below. Also carries #230: the relay's localhost RTP ports are now OS-assigned per
 # relay instead of a fixed 5004/5006. The fixed pair meant a SECOND concurrent relay on an instance died
 # with `bind EADDRINUSE 127.0.0.1:5004` (surfaced as a /start 502), so two customers broadcasting at once
 # could not both be bridged — a hard multi-tenant ceiling — and a half-torn-down relay held the port until
-# the instance was recycled. Local amd64 image sha256:7c750397e8ac784498a59c9704adb9536703c0d49f3fd465133181312a8f5f2d.
+# the instance was recycled. Local amd64 image sha256:763adf49e3e425a90e540d3304c1953cc2c01a1f8a7736574b6b10e90fe814f6.
 #
 # Also carries v7's #236 (truthful /health) and v6's #2 (video-only sources no longer 502).
 #
 # NOTE: a container image change triggers a ROLLOUT. As of v9 that is DRAINED, not a SIGKILL (#235) — an
 # in-flight bridge is torn down cleanly and bills its real duration — but the broadcast still ENDS, since
 # the instance is being replaced. Prefer deploying with nothing live; it is no longer data-destructive.
-image = "registry.cloudflare.com/d674452f756fe46885a0d6ce7bc23f0a/wave-stream-bridge:v9-86b42e2"
+image = "registry.cloudflare.com/d674452f756fe46885a0d6ce7bc23f0a/wave-stream-bridge:v10-21ba593"
 # #235 — leave an ACTIVE instance alone for 5 minutes before a rollout may touch it, instead of the
 # default 0 (immediately eligible). Paired with the container's SIGTERM drain handler: the grace period
 # buys short broadcasts a chance to simply finish, and the handler makes the ones that don't end CLEANLY
