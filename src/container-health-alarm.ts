@@ -170,6 +170,20 @@ export async function checkContainerHealth(env: AlarmEnv, deps: AlarmDeps): Prom
 		out.push({ app: app.name, verdict, alarmed });
 	}
 
+	// HEARTBEAT — one line per tick, even when everything is fine.
+	//
+	// Without this the module is SILENT on success, which makes "the alarm never fired" and "the alarm never
+	// ran" produce byte-identical logs. That is the exact failure this file was written to end (#231's wedge
+	// hid behind `failed:0`; #235 behind `{ok:true}`; #241 behind `started:0`), and it would have been
+	// self-inflicted here: an unprovable watchdog is not a watchdog. The counts also make the all-clear a
+	// POSITIVE observation you can query for, rather than an absence you have to trust.
+	log("container-health-tick", {
+		apps: out.length,
+		wedged: out.filter((v) => v.verdict === "wedged").length,
+		atCapacity: out.filter((v) => v.verdict === "at-capacity").length,
+		alarmed: out.filter((v) => v.alarmed).length,
+	});
+
 	return { verdicts: out };
 }
 
@@ -179,7 +193,14 @@ export async function checkContainerHealth(env: AlarmEnv, deps: AlarmDeps): Prom
  */
 export function scheduledContainerHealth(env: AlarmEnv, ctx: ExecutionContext, kv?: KVNamespace): void {
 	ctx.waitUntil(
-		checkContainerHealth(env, { fetch, kv }).then(
+		// `fetch` MUST be wrapped, not passed by reference. The Workers runtime rejects a bare global `fetch`
+		// invoked through another binding with:
+		//   TypeError: Illegal invocation: function called with incorrect `this` reference
+		// This shipped unbound and the alarm was 100% non-functional in production from its first tick — every
+		// run died inside the try/catch. The ONLY reason it was caught within the hour is that the catch logs
+		// `container-health-probe-failed` loudly instead of returning quietly, which is the whole thesis of
+		// this module. A silent catch here would have left a watchdog that looked deployed and did nothing.
+		checkContainerHealth(env, { fetch: (input, init) => fetch(input, init), kv }).then(
 			() => undefined,
 			(e) => {
 				console.log(JSON.stringify({ msg: "container-health-alarm-error", error: String(e).slice(0, 160) }));
