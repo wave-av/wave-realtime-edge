@@ -84,6 +84,14 @@ WHIP_INGEST_ENABLED = "1"
 # drops when a usage emit is not confirmed. Inert on its own if GATEWAY_BASE_URL/WAVE_SERVICE_TOKEN are unset.
 WHIP_SWEEP_ENABLED = "1"
 
+# CONTAINER_HEALTH_ALARM_ENABLED (#234) arms the container-app WEDGE alarm on the */15 cron
+# (src/container-health-alarm.ts). The signature it watches — `active > 0 && healthy == 0` — is what
+# wedged stream bridging account-wide with EVERY existing telemetry reading green (`failed:0` the whole
+# time, because zombie instances are not counted as failures). It was found by hand, by accident.
+# READ-ONLY: one authenticated GET of the container-applications list per 15 min, no mutation of anything.
+# Absent/"0" → the tick is a no-op and no API call is made. Also inert without CF_API_TOKEN/CF_ACCOUNT_ID.
+CONTAINER_HEALTH_ALARM_ENABLED = "1"
+
 # ── #53 — IETF WHEP v1 egress surface (/v1/whep/*). DEFAULT OFF / INERT. ──
 # WHEP_EGRESS_ENABLED gates the whole /v1/whep/{subscribe,resource/{id}} listener (src/whep.ts) — the egress
 # SIBLING of WHIP above. Absent/"0" → the surface is inert: a /v1/whep/* request falls through to the honest

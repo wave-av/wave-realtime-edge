@@ -6,6 +6,7 @@ import { scheduledStreamReconcile, liveStreamBridgeDeps } from "./stream-bridge"
 import { scheduledStreamPoll } from "./stream-bridge-poll";
 import { scheduledIngestReconcile } from "./ingest-bridge";
 import { scheduledWhipSweep, WHIP_SWEEP_CRON } from "./whip-sweep";
+import { scheduledContainerHealth } from "./container-health-alarm";
 import { buildPullSink, type Env } from "./dispatch-helpers";
 
 /**
@@ -50,4 +51,10 @@ export async function scheduledHandler(
 	// #35 — WHIP orphan sweeper: bills publish sessions whose container died without sending a teardown
 	// DELETE (revenue integrity). Runs on EVERY tick. INERT unless WHIP_SWEEP_ENABLED + KV bound. Best-effort.
 	scheduledWhipSweep(env, ctx);
+
+	// #234 — container-app WEDGE alarm (`active > 0 && healthy == 0`). Gated to the FIFTEEN-minute tick, not
+	// every tick: the signature must be SUSTAINED to mean anything, and two 15-min samples is the ~2-poll-
+	// interval dwell #234 asks for while keeping this to 4 CF API reads an hour. INERT unless
+	// CONTAINER_HEALTH_ALARM_ENABLED=1 + CF_API_TOKEN/CF_ACCOUNT_ID bound. Never throws.
+	if (!isSweepOnlyTick) scheduledContainerHealth(env, ctx, env.RT_MEETING_ORG);
 }

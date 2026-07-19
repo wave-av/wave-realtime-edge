@@ -32,6 +32,10 @@ export interface Env extends EncoderEnv, ResidencySinkEnv, IngestBridgeRuntimeEn
 	// leg's ◆). Off/absent → /v1/ingest/{proto}/session falls through to the 501 catch-all, UNCHANGED. The flag,
 	// bindings, WHIP endpoint, and bridge key REF fields all come from IngestBridgeRuntimeEnv (src/ingest-bridge.ts).
 	WAVE_INTERNAL_SECRET?: string; // wrangler SECRET — when set, ONLY the gateway (x-wave-internal) may /rtk/* AND /v1/realtime/*
+	// #234 container-app WEDGE alarm flag ([vars], default off). Absent/"0" → the */15 tick is a no-op and no
+	// CF API call is made. "1" → each tick reads the container-applications health rollup and alarms on
+	// `active > 0 && healthy == 0` sustained across ticks. Read-only; also inert without CF_API_TOKEN.
+	CONTAINER_HEALTH_ALARM_ENABLED?: string;
 	// E-ROOMS P4 (#73) client presence/state-sync + data channel flag ([vars], default off). Falsy/absent →
 	// GET /v1/realtime/rooms/:room/presence is inert (falls through to the 501 catch-all, UNCHANGED). Truthy
 	// ("1"/"true") → the WS-upgrade presence surface is served (the DO owns the hibernatable socket).
