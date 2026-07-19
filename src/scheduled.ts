@@ -2,7 +2,7 @@
 // this file nor route-dispatch.ts exceeds 800 lines. Imports only leaf modules, so there is no cycle:
 // route-dispatch.ts re-exports scheduledHandler from here, and worker.ts's import is unchanged.
 import { reconcilePending } from "./rtk-webhook";
-import { scheduledStreamReconcile, liveStreamBridgeDeps } from "./stream-bridge";
+import { scheduledStreamReconcile, liveStreamBridgeDeps, liveStreamProbeHealth } from "./stream-bridge";
 import { scheduledStreamPoll } from "./stream-bridge-poll";
 import { scheduledIngestReconcile } from "./ingest-bridge";
 import { scheduledWhipSweep, WHIP_SWEEP_CRON } from "./whip-sweep";
@@ -45,7 +45,13 @@ export async function scheduledHandler(
 	// Runs on EVERY tick so go-live latency is the tight */5 cadence, not the 15-minute one.
 	{
 		const deps = liveStreamBridgeDeps(env);
-		scheduledStreamPoll(env, ctx, { dispatchStart: deps.dispatchStart, dispatchStop: deps.dispatchStop });
+		// #247 — probeHealth lets the poll detect a bridge whose container died (crash, eviction, or a #235
+		// rollout drain) while the input is still live, and clear the stale session so the next tick re-dispatches.
+		scheduledStreamPoll(env, ctx, {
+			dispatchStart: deps.dispatchStart,
+			dispatchStop: deps.dispatchStop,
+			probeHealth: (org, uid) => liveStreamProbeHealth(env, org, uid),
+		});
 	}
 
 	// #35 — WHIP orphan sweeper: bills publish sessions whose container died without sending a teardown

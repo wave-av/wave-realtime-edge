@@ -31,6 +31,9 @@ function harness(o: {
   sessions?: string[];
   failStart?: boolean;
   failStop?: boolean;
+  /** #247 — container self-report. `undefined` omits the dep entirely (pre-#247 behaviour). */
+  health?: { bridging: boolean; tracks: number } | null;
+  omitProbeHealth?: boolean;
 }): Harness {
   const starts: Harness["starts"] = [];
   const stops: Harness["stops"] = [];
@@ -55,6 +58,7 @@ function harness(o: {
         if (o.failStop) throw new Error("container /stop → 500");
         stops.push({ org, uid });
       },
+      ...(o.omitProbeHealth ? {} : { probeHealth: async () => o.health ?? null }),
       log: (msg, fields) => logs.push({ msg, fields }),
     },
   };
@@ -328,5 +332,82 @@ describe("a failed start must RELEASE its container instance — the wedge regre
     // Exactly the scenario that wedged prod: 5 failing inputs against max_instances. Every one is
     // released, so capacity returns to zero-held rather than five-held.
     expect(h.stops).toHaveLength(5);
+  });
+});
+
+describe("pollStreamLifecycles — dead-bridge reconcile (#247)", () => {
+  const LIVE = { live: true, videoUID: "v1" };
+
+  it("clears the session when the container reports it is NOT bridging, so the next tick re-dispatches", async () => {
+    // The failure this fixes: a container that crashed, was evicted, or was DRAINED by a rollout (#235)
+    // leaves the KV session record behind. hasSession keeps answering true, the poll never re-dispatches,
+    // and the broadcast stays dark until the TTL expires — while stream-poll-tick reports a clean started:0.
+    const h = harness({ states: { u1: LIVE }, sessions: ["u1"], health: { bridging: false, tracks: 0 } });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(r.revived).toBe(1);
+    expect(h.sessions.has("u1")).toBe(false);
+    expect(h.stops).toEqual([{ org: "org1", uid: "u1" }]); // dead instance's slot released (#231)
+    expect(h.logs.some((l) => l.msg === "stream-poll-bridge-dead")).toBe(true);
+  });
+
+  it("re-dispatches on the FOLLOWING tick — one start path, not a second", async () => {
+    const h = harness({ states: { u1: LIVE }, sessions: ["u1"], health: { bridging: false, tracks: 0 } });
+    await pollStreamLifecycles(h.deps);
+    expect(h.starts).toHaveLength(0); // the revive tick itself does NOT start
+    const h2 = harness({ states: { u1: LIVE }, sessions: [], health: { bridging: true, tracks: 2 } });
+    const r2 = await pollStreamLifecycles(h2.deps);
+    expect(r2.started).toBe(1);
+  });
+
+  it("leaves a HEALTHY bridge completely alone", async () => {
+    const h = harness({ states: { u1: LIVE }, sessions: ["u1"], health: { bridging: true, tracks: 2 } });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(r).toMatchObject({ revived: 0, started: 0, stopped: 0, failed: 0 });
+    expect(h.sessions.has("u1")).toBe(true);
+    expect(h.stops).toHaveLength(0);
+  });
+
+  it("FAILS SAFE on an unreadable probe — null must never be read as dead", async () => {
+    // Tearing down a healthy customer broadcast on a transient blip is far worse than a late re-dispatch.
+    // This is the same reasoning-from-absence trap as #229 (empty instance list), #233 (empty track list)
+    // and #241 (missing videoUID) — the most repeated defect in this subsystem.
+    const h = harness({ states: { u1: LIVE }, sessions: ["u1"], health: null });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(r.revived).toBe(0);
+    expect(h.sessions.has("u1")).toBe(true);
+    expect(h.stops).toHaveLength(0);
+  });
+
+  it("FAILS SAFE when the probe throws", async () => {
+    const h = harness({ states: { u1: LIVE }, sessions: ["u1"] });
+    (h.deps as { probeHealth: () => Promise<never> }).probeHealth = async () => { throw new Error("DO unreachable"); };
+    const r = await pollStreamLifecycles(h.deps);
+    expect(r.revived).toBe(0);
+    expect(h.sessions.has("u1")).toBe(true);
+  });
+
+  it("still clears the session even if releasing the dead instance fails", async () => {
+    // The stale record is the thing blocking re-dispatch; a failed release must not strand the broadcast.
+    const h = harness({ states: { u1: LIVE }, sessions: ["u1"], health: { bridging: false, tracks: 0 }, failStop: true });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(r.revived).toBe(1);
+    expect(h.sessions.has("u1")).toBe(false);
+    expect(h.logs.some((l) => l.msg === "stream-poll-revive-stop-failed")).toBe(true);
+  });
+
+  it("is byte-identical to pre-#247 when no probeHealth dep is supplied", async () => {
+    const h = harness({ states: { u1: LIVE }, sessions: ["u1"], omitProbeHealth: true });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(r).toMatchObject({ revived: 0, started: 0, stopped: 0, failed: 0 });
+    expect(h.sessions.has("u1")).toBe(true);
+  });
+
+  it("does NOT probe health for an input that is not flowing — teardown still owns that edge", async () => {
+    let probed = false;
+    const h = harness({ states: { u1: { live: false, videoUID: null } }, sessions: ["u1"] });
+    (h.deps as { probeHealth: () => Promise<null> }).probeHealth = async () => { probed = true; return null; };
+    const r = await pollStreamLifecycles(h.deps);
+    expect(probed).toBe(false);
+    expect(r.stopped).toBe(1);
   });
 });
