@@ -450,6 +450,48 @@ export async function liveStreamDispatchStart(
   }
 }
 
+/**
+ * The container's own view of whether it is ACTUALLY relaying (#247 / #236).
+ *
+ * `null` means "could not tell" and callers MUST treat it as such — never as "dead".
+ *
+ * WHY THIS SHAPE. #236 made the container's /health report the relay's real state
+ * (`{ok, bridging, tracks, relay}`) instead of a constant `{ok:true}`, but until now NOTHING in the worker
+ * called it: the poll inferred bridge health purely from the CF input being live. So a dead WHIP leg stayed
+ * invisible to the control plane — the exact defect #236 was written to fix, with the sensor built and
+ * never wired up.
+ *
+ * The `null` case is the load-bearing one. A probe that times out, 5xxs, or hits an absent binding tells us
+ * NOTHING, and reading it as "dead" would tear down a healthy customer broadcast on a transient blip. That
+ * reasoning-from-absence mistake is the single most repeated defect in this subsystem (#229's empty instance
+ * list, #233's empty track list, #241's missing videoUID) — so this returns three states, not two.
+ */
+export interface BridgeHealth {
+	/** True only when the container reports a live relay with both legs non-terminal. */
+	bridging: boolean;
+	tracks: number;
+}
+
+export async function liveStreamProbeHealth(
+	env: StreamBridgeRuntimeEnv,
+	org: string,
+	uid: string,
+): Promise<BridgeHealth | null> {
+	if (!env.STREAM_BRIDGE) return null; // binding absent → cannot tell (NOT dead)
+	try {
+		const stub = env.STREAM_BRIDGE.get(env.STREAM_BRIDGE.idFromName(`${org}:${uid}`));
+		const res = await stub.fetch("https://stream-bridge/health");
+		if (!res.ok) return null; // a 5xx tells us nothing about the relay
+		const body = (await res.json()) as { bridging?: unknown; tracks?: unknown };
+		// An OLD image answers `{ok:true}` with NO `bridging` field. That is not evidence of death either —
+		// it is evidence of a stale image, and must not trigger a teardown. Demand the field explicitly.
+		if (typeof body.bridging !== "boolean") return null;
+		return { bridging: body.bridging, tracks: typeof body.tracks === "number" ? body.tracks : 0 };
+	} catch {
+		return null; // unreachable → cannot tell
+	}
+}
+
 /** Build the live StreamBridgeDeps (KV org-resolve + pending; container start/stop; ctx.waitUntil). */
 export function liveStreamBridgeDeps(env: StreamBridgeRuntimeEnv, ctx?: WaitUntilCtx): StreamBridgeDeps {
   const kv = env.RT_MEETING_ORG;

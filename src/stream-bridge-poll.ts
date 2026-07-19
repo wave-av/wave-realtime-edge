@@ -86,6 +86,12 @@ export interface PollDeps {
   closeSession(uid: string): Promise<void>;
   dispatchStart(org: string, uid: string, room: string): Promise<void>;
   dispatchStop(org: string, uid: string): Promise<void>;
+  /**
+   * Ask the CONTAINER whether it is actually relaying (#247). `null` = could not tell, and is treated as
+   * such — never as dead. Optional so existing callers/tests are unaffected; absent → the reconcile below
+   * is skipped entirely and behaviour is byte-identical to before.
+   */
+  probeHealth?(org: string, uid: string): Promise<{ bridging: boolean; tracks: number } | null>;
   log?(msg: string, fields: Record<string, unknown>): void;
 }
 
@@ -95,6 +101,8 @@ export interface PollResult {
   stopped: number;
   failed: number;
   skipped: number;
+  /** Sessions the CONTAINER reported dead while the input was still live → record cleared for re-dispatch (#247). */
+  revived: number;
 }
 
 /**
@@ -109,7 +117,7 @@ export interface PollResult {
  * inventing `live:false` would tear down a healthy broadcast.
  */
 export async function pollStreamLifecycles(deps: PollDeps): Promise<PollResult> {
-  const out: PollResult = { scanned: 0, started: 0, stopped: 0, failed: 0, skipped: 0 };
+  const out: PollResult = { scanned: 0, started: 0, stopped: 0, failed: 0, skipped: 0, revived: 0 };
   const inputs = (await deps.listInputs()).slice(0, MAX_INPUTS_PER_TICK);
 
   for (const { uid, org } of inputs) {
@@ -148,6 +156,39 @@ export async function pollStreamLifecycles(deps: PollDeps): Promise<PollResult> 
           .catch((releaseErr) =>
             deps.log?.("stream-poll-start-release-failed", { uid, org, error: String(releaseErr) }),
           );
+      }
+      continue;
+    }
+
+    // LIVE INPUT, SESSION RECORDED — previously a total no-op, and that silence hid two real failures (#247).
+    //
+    // The session record alone was treated as proof the bridge was working. It is not: it only proves a
+    // /start once succeeded. If the container has since died — crashed, been evicted, or been DRAINED by a
+    // rollout (#235, now the expected path on every deploy) — the record SURVIVES, `hasSession` keeps
+    // answering true, and the poll never re-dispatches. The customer's broadcast stays dark until the KV
+    // TTL expires, while `stream-poll-tick` reports a clean `started:0` throughout.
+    //
+    // So ask the container itself. This is the first consumer of the truthful /health #236 shipped — until
+    // now that sensor was built, deployed, and read by nothing.
+    //
+    // FAIL SAFE, DELIBERATELY: only an explicit `bridging:false` clears the record. `null` (timeout, 5xx,
+    // absent binding, or an OLD image that answers `{ok:true}` with no `bridging` field) means "cannot tell"
+    // and changes nothing. Tearing down a healthy broadcast on a transient blip is far worse than a late
+    // re-dispatch, and reading absence as death is the single most repeated defect in this subsystem.
+    if (flowing && active && deps.probeHealth) {
+      const health = await deps.probeHealth(org, uid).catch(() => null);
+      if (health && !health.bridging) {
+        // Clear the record only. The NEXT tick's `flowing && !active` edge does the actual re-dispatch, so
+        // this reuses the one start path that already handles failure, instance release, and logging —
+        // rather than opening a second way to start a bridge.
+        try {
+          await deps.dispatchStop(org, uid); // release the dead instance's slot (#231) before re-starting
+        } catch (err) {
+          deps.log?.("stream-poll-revive-stop-failed", { uid, org, error: String(err) });
+        }
+        await deps.closeSession(uid);
+        out.revived++;
+        deps.log?.("stream-poll-bridge-dead", { uid, org, tracks: health.tracks, videoUID: state.videoUID });
       }
       continue;
     }
@@ -201,6 +242,8 @@ export function livePollDeps(
   dispatch: {
     dispatchStart(org: string, uid: string, room: string): Promise<void>;
     dispatchStop(org: string, uid: string): Promise<void>;
+    /** #247 — container self-report. Optional: absent → the dead-bridge reconcile is skipped entirely. */
+    probeHealth?(org: string, uid: string): Promise<{ bridging: boolean; tracks: number } | null>;
   },
   fetchFn: typeof fetch = fetch,
 ): PollDeps | null {
@@ -211,6 +254,7 @@ export function livePollDeps(
   const log = (msg: string, fields: Record<string, unknown>) => console.log(JSON.stringify({ msg, ...fields }));
 
   return {
+    probeHealth: dispatch.probeHealth,
     listInputs: async () => {
       const listed = await kv.list({ prefix: STREAM_INPUT_ORG_PREFIX, limit: MAX_INPUTS_PER_TICK });
       const rows = await Promise.all(
@@ -264,6 +308,8 @@ export function scheduledStreamPoll(
   dispatch: {
     dispatchStart(org: string, uid: string, room: string): Promise<void>;
     dispatchStop(org: string, uid: string): Promise<void>;
+    /** #247 — container self-report. Optional: absent → the dead-bridge reconcile is skipped entirely. */
+    probeHealth?(org: string, uid: string): Promise<{ bridging: boolean; tracks: number } | null>;
   },
 ): void {
   // Every exit path from here is LOUD. The first cut of this function returned early in silence when a
