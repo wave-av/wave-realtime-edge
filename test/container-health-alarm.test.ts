@@ -130,6 +130,20 @@ describe("checkContainerHealth — sustain, inertness, and failure modes", () =>
 		expect(url).not.toMatch(/\/instances$/);
 	});
 
+	it("emits a heartbeat EVERY tick, so all-clear is a positive observation not an absence", async () => {
+		// Without this line, "never fired" and "never ran" are byte-identical in the logs — the exact
+		// failure class (#231/#235/#241) this module exists to end.
+		const log = vi.fn();
+		await checkContainerHealth(okEnv, { fetch: fetchReturning([app()]), kv: fakeKv(), log });
+		expect(log).toHaveBeenCalledWith("container-health-tick", { apps: 1, wedged: 0, atCapacity: 0, alarmed: 0 });
+	});
+
+	it("the heartbeat counts the wedge even on the pre-sustain tick that does not alarm", async () => {
+		const log = vi.fn();
+		await checkContainerHealth(okEnv, { fetch: fetchReturning(wedged), kv: fakeKv(), log });
+		expect(log).toHaveBeenCalledWith("container-health-tick", { apps: 1, wedged: 1, atCapacity: 0, alarmed: 0 });
+	});
+
 	it("carries the rollup verbatim into the alarm line — the counts ARE the diagnosis", async () => {
 		const kv = fakeKv();
 		const log = vi.fn();

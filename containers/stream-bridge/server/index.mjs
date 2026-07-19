@@ -29,6 +29,7 @@ import { RTCPeerConnection, MediaStreamTrack, RtpPacket } from "werift";
 import { publish } from "@wave-av/whip-publish";
 import { hlsPull } from "./hls-source.mjs";
 import { runRelay } from "./relay.mjs";
+import { makeDrain } from "./drain.mjs";
 
 const PORT = Number(process.env.PORT || 8080);
 
@@ -131,3 +132,14 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => log("stream-bridge-listening", { port: PORT }));
+
+// #235 — drain in-flight bridges on rollout instead of being SIGKILLed. The handler body lives in the
+// werift-free drain.mjs so it is unit-testable; this file only wires it to the real process/server.
+const drain = makeDrain({
+  getActive: () => active,
+  setActive: (v) => { active = v; },
+  closeServer: () => server.close(),
+  log,
+  exit: (code) => process.exit(code),
+});
+for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => void drain(sig));

@@ -170,6 +170,20 @@ export async function checkContainerHealth(env: AlarmEnv, deps: AlarmDeps): Prom
 		out.push({ app: app.name, verdict, alarmed });
 	}
 
+	// HEARTBEAT — one line per tick, even when everything is fine.
+	//
+	// Without this the module is SILENT on success, which makes "the alarm never fired" and "the alarm never
+	// ran" produce byte-identical logs. That is the exact failure this file was written to end (#231's wedge
+	// hid behind `failed:0`; #235 behind `{ok:true}`; #241 behind `started:0`), and it would have been
+	// self-inflicted here: an unprovable watchdog is not a watchdog. The counts also make the all-clear a
+	// POSITIVE observation you can query for, rather than an absence you have to trust.
+	log("container-health-tick", {
+		apps: out.length,
+		wedged: out.filter((v) => v.verdict === "wedged").length,
+		atCapacity: out.filter((v) => v.verdict === "at-capacity").length,
+		alarmed: out.filter((v) => v.alarmed).length,
+	});
+
 	return { verdicts: out };
 }
 
