@@ -363,10 +363,13 @@ describe("pollStreamLifecycles — dead-bridge reconcile (#247)", () => {
     expect(r2.started).toBe(1);
   });
 
-  it("leaves a HEALTHY bridge completely alone", async () => {
+  it("leaves a HEALTHY bridge completely alone, and SAYS it confirmed health", async () => {
+    // `revived:0` alone is ambiguous — it reads identically whether the probe said healthy or could not
+    // answer. That ambiguity made the first live proof of this feature unfalsifiable, so the tick must
+    // distinguish the two. Same silence-is-not-evidence defect as #231/#235/#241.
     const h = harness({ states: { u1: LIVE }, sessions: ["u1"], health: { bridging: true, tracks: 2 } });
     const r = await pollStreamLifecycles(h.deps);
-    expect(r).toMatchObject({ revived: 0, started: 0, stopped: 0, failed: 0 });
+    expect(r).toMatchObject({ revived: 0, healthy: 1, healthUnknown: 0, started: 0, stopped: 0, failed: 0 });
     expect(h.sessions.has("u1")).toBe(true);
     expect(h.stops).toHaveLength(0);
   });
@@ -378,6 +381,8 @@ describe("pollStreamLifecycles — dead-bridge reconcile (#247)", () => {
     const h = harness({ states: { u1: LIVE }, sessions: ["u1"], health: null });
     const r = await pollStreamLifecycles(h.deps);
     expect(r.revived).toBe(0);
+    // ...and it is DISTINGUISHABLE from a confirmed-healthy tick.
+    expect(r).toMatchObject({ healthy: 0, healthUnknown: 1 });
     expect(h.sessions.has("u1")).toBe(true);
     expect(h.stops).toHaveLength(0);
   });

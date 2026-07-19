@@ -115,6 +115,18 @@ export interface PollResult {
   revived: number;
   /** Inputs RTMP-connected but with no concrete videoUID — a customer pushing media we are NOT bridging (#241). */
   connectedNoVideo: number;
+  /**
+   * Bridges the container CONFIRMED alive this tick (an explicit `bridging:true`).
+   *
+   * Without this, `revived:0` is ambiguous: it reads the same whether the probe said "healthy" or could not
+   * answer at all — so a totally broken /health path would look exactly like a fleet of healthy bridges.
+   * That is the same silence-is-not-evidence defect as #231/#235/#241, and it made the first live proof of
+   * this feature unfalsifiable until this counter existed. `healthy + unknown` should equal the number of
+   * active bridges; when `unknown` dominates, the probe itself is broken, not the fleet.
+   */
+  healthy: number;
+  /** Active bridges whose health could NOT be determined (timeout, 5xx, absent binding, stale image). */
+  healthUnknown: number;
 }
 
 /**
@@ -129,7 +141,7 @@ export interface PollResult {
  * inventing `live:false` would tear down a healthy broadcast.
  */
 export async function pollStreamLifecycles(deps: PollDeps): Promise<PollResult> {
-  const out: PollResult = { scanned: 0, started: 0, stopped: 0, failed: 0, skipped: 0, revived: 0, connectedNoVideo: 0 };
+  const out: PollResult = { scanned: 0, started: 0, stopped: 0, failed: 0, skipped: 0, revived: 0, connectedNoVideo: 0, healthy: 0, healthUnknown: 0 };
   // Bound the authenticated status probes per tick. The detector below is diagnostic, not load-bearing, and
   // must not turn a 200-input account into 200 extra API calls every five minutes.
   let stateProbeBudget = MAX_STATE_PROBES_PER_TICK;
@@ -192,6 +204,8 @@ export async function pollStreamLifecycles(deps: PollDeps): Promise<PollResult> 
     // re-dispatch, and reading absence as death is the single most repeated defect in this subsystem.
     if (flowing && active && deps.probeHealth) {
       const health = await deps.probeHealth(org, uid).catch(() => null);
+      if (!health) out.healthUnknown++;
+      else if (health.bridging) out.healthy++;
       if (health && !health.bridging) {
         // Clear the record only. The NEXT tick's `flowing && !active` edge does the actual re-dispatch, so
         // this reuses the one start path that already handles failure, instance release, and logging —
