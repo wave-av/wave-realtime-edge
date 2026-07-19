@@ -104,13 +104,13 @@ export function ffmpegArgs(srcUrl, auth, hasAudio = true, ports) {
  * @param {object} [o]
  * @param {Function} [o.spawnFn] - injectable spawn (test seam).
  * @param {Function} [o.log] - structured logger.
- * @param {number} [o.timeoutMs=8000] - hard cap; a hung probe must not wedge relay startup.
+ * @param {number} [o.timeoutMs=3000] - hard cap; a hung probe must not wedge relay startup.
  * @returns {Promise<boolean>}
  */
 export function probeHasAudio(srcUrl, auth, o = {}) {
   const spawnFn = o.spawnFn ?? nodeSpawn;
   const log = o.log ?? (() => {});
-  const timeoutMs = o.timeoutMs ?? 8_000;
+  const timeoutMs = o.timeoutMs ?? 3_000;
 
   return new Promise((resolve) => {
     let settled = false;

@@ -339,6 +339,14 @@ export async function handleStreamBridge(
     return jsonResponse({ ok: true, lifecycle: evt.lifecycle, room }, 200);
   }
 
+  // CF Stream's VOD "video-ready" webhook (a finished recording) POSTs a VIDEO object to this same endpoint
+  // and carries no live-lifecycle name, so it otherwise falls into lifecycle-other and reads like a defect.
+  // Recognize it by shape (readyToStream / readyToStreamAt keys) and ack it distinctly instead of logging noise.
+  if (evt.keys.some((k) => k.includes("readyToStream") || k.includes("readyToStreamAt"))) {
+    deps.log?.("stream-bridge-video-ready", { uid: evt.uid, payloadKeys: evt.keys });
+    return jsonResponse({ ok: true, kind: "video-ready" }, 200);
+  }
+
   // Self-diagnosing: an unmatched lifecycle is the exact shape of the #8 dispatch outage, and the old log
   // ("lifecycle-other" + uid) could not tell you WHY. Carry the payload's top-level KEY NAMES (names only —
   // never values, which are unvetted third-party input) so one log line names the shape that failed to match.
