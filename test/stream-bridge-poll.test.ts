@@ -6,6 +6,7 @@ import {
   customerCodeOf,
   mediaIsFlowing,
   MAX_INPUTS_PER_TICK,
+  MAX_STATE_PROBES_PER_TICK,
   type PollDeps,
   type LifecycleState,
 } from "../src/stream-bridge-poll";
@@ -34,6 +35,8 @@ function harness(o: {
   /** #247 — container self-report. `undefined` omits the dep entirely (pre-#247 behaviour). */
   health?: { bridging: boolean; tracks: number } | null;
   omitProbeHealth?: boolean;
+  /** #241 — the input's RTMP state from the live_inputs API. undefined → dep omitted. */
+  inputState?: string | null;
 }): Harness {
   const starts: Harness["starts"] = [];
   const stops: Harness["stops"] = [];
@@ -59,6 +62,7 @@ function harness(o: {
         stops.push({ org, uid });
       },
       ...(o.omitProbeHealth ? {} : { probeHealth: async () => o.health ?? null }),
+      ...(o.inputState === undefined ? {} : { probeInputState: async () => o.inputState ?? null }),
       log: (msg, fields) => logs.push({ msg, fields }),
     },
   };
@@ -380,7 +384,7 @@ describe("pollStreamLifecycles — dead-bridge reconcile (#247)", () => {
 
   it("FAILS SAFE when the probe throws", async () => {
     const h = harness({ states: { u1: LIVE }, sessions: ["u1"] });
-    (h.deps as { probeHealth: () => Promise<never> }).probeHealth = async () => { throw new Error("DO unreachable"); };
+    h.deps.probeHealth = async () => { throw new Error("DO unreachable"); };
     const r = await pollStreamLifecycles(h.deps);
     expect(r.revived).toBe(0);
     expect(h.sessions.has("u1")).toBe(true);
@@ -405,9 +409,69 @@ describe("pollStreamLifecycles — dead-bridge reconcile (#247)", () => {
   it("does NOT probe health for an input that is not flowing — teardown still owns that edge", async () => {
     let probed = false;
     const h = harness({ states: { u1: { live: false, videoUID: null } }, sessions: ["u1"] });
-    (h.deps as { probeHealth: () => Promise<null> }).probeHealth = async () => { probed = true; return null; };
+    h.deps.probeHealth = async () => { probed = true; return null; };
     const r = await pollStreamLifecycles(h.deps);
     expect(probed).toBe(false);
     expect(r.stopped).toBe(1);
+  });
+});
+
+describe("pollStreamLifecycles — RTMP-connected but no videoUID (#241)", () => {
+  const NO_VIDEO = { live: true, videoUID: "unknown", status: "ready" };
+
+  it("names the silent condition: input connected, no videoUID, no bridge", async () => {
+    // The 2026-07-19 case: a 13-minute push with CF reporting connected the whole time and ZERO dispatches.
+    // Every tick read {"scanned":7,"started":0,"failed":0,"skipped":0} — byte-identical to a quiet night.
+    const h = harness({ states: { u1: NO_VIDEO }, inputState: "connected" });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(r.connectedNoVideo).toBe(1);
+    const line = h.logs.find((l) => l.msg === "stream-poll-connected-no-video");
+    expect(line?.fields).toMatchObject({ uid: "u1", inputState: "connected", videoUID: "unknown" });
+  });
+
+  it("does NOT dispatch on it — widening mediaIsFlowing would bridge idle inputs and bill dead air", async () => {
+    const h = harness({ states: { u1: NO_VIDEO }, inputState: "connected" });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(h.starts).toHaveLength(0);
+    expect(r.started).toBe(0);
+  });
+
+  it("stays quiet for a genuinely idle input (disconnected) — no false positives", async () => {
+    // An idle-ready input reads IDENTICALLY on the lifecycle endpoint, which is exactly why the
+    // authenticated input-state probe is required to tell them apart.
+    const h = harness({ states: { u1: NO_VIDEO }, inputState: "disconnected" });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(r.connectedNoVideo).toBe(0);
+    expect(h.logs.some((l) => l.msg === "stream-poll-connected-no-video")).toBe(false);
+  });
+
+  it("stays quiet when the state probe is unreadable — a flaky API cannot manufacture a report", async () => {
+    const h = harness({ states: { u1: NO_VIDEO }, inputState: null });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(r.connectedNoVideo).toBe(0);
+  });
+
+  it("does not probe an input that is already bridging", async () => {
+    let probed = false;
+    const h = harness({ states: { u1: { live: true, videoUID: "v1" } }, sessions: ["u1"], health: { bridging: true, tracks: 2 } });
+    h.deps.probeInputState = async () => { probed = true; return "connected"; };
+    await pollStreamLifecycles(h.deps);
+    expect(probed).toBe(false);
+  });
+
+  it("bounds the authenticated probes per tick", async () => {
+    let probes = 0;
+    const inputs = Array.from({ length: 40 }, (_, i) => ({ uid: `u${i}`, org: "org1" }));
+    const states = Object.fromEntries(inputs.map((i) => [i.uid, NO_VIDEO]));
+    const h = harness({ inputs, states });
+    h.deps.probeInputState = async () => { probes++; return "disconnected"; };
+    await pollStreamLifecycles(h.deps);
+    expect(probes).toBe(MAX_STATE_PROBES_PER_TICK);
+  });
+
+  it("is byte-identical to pre-#241 when the dep is absent", async () => {
+    const h = harness({ states: { u1: NO_VIDEO } });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(r).toMatchObject({ connectedNoVideo: 0, started: 0, failed: 0 });
   });
 });

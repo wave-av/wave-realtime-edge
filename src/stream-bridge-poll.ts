@@ -39,6 +39,9 @@ export const MAX_INPUTS_PER_TICK = 200;
 /** Explicit timeout on every lifecycle probe — an unbounded hang would stall the whole tick. */
 export const LIFECYCLE_TIMEOUT_MS = 5_000;
 
+/** Cap on authenticated live_inputs status probes per tick (#241 detector is diagnostic, not load-bearing). */
+export const MAX_STATE_PROBES_PER_TICK = 20;
+
 /**
  * The CF lifecycle endpoint's OBSERVED shape: `{ isInput, videoUID, live, status, chunked }`.
  *
@@ -92,6 +95,13 @@ export interface PollDeps {
    * is skipped entirely and behaviour is byte-identical to before.
    */
   probeHealth?(org: string, uid: string): Promise<{ bridging: boolean; tracks: number } | null>;
+  /**
+   * The INPUT's RTMP connection state from the live_inputs API (#241) — `"connected"`, `"disconnected"`,
+   * or null when unreadable. Distinct from `probeLifecycle`, which reads the unauthenticated lifecycle
+   * endpoint and CANNOT tell an idle input apart from one that is receiving media without a videoUID.
+   * Optional; absent → the mismatch detector below is skipped.
+   */
+  probeInputState?(uid: string): Promise<string | null>;
   log?(msg: string, fields: Record<string, unknown>): void;
 }
 
@@ -103,6 +113,8 @@ export interface PollResult {
   skipped: number;
   /** Sessions the CONTAINER reported dead while the input was still live → record cleared for re-dispatch (#247). */
   revived: number;
+  /** Inputs RTMP-connected but with no concrete videoUID — a customer pushing media we are NOT bridging (#241). */
+  connectedNoVideo: number;
 }
 
 /**
@@ -117,7 +129,10 @@ export interface PollResult {
  * inventing `live:false` would tear down a healthy broadcast.
  */
 export async function pollStreamLifecycles(deps: PollDeps): Promise<PollResult> {
-  const out: PollResult = { scanned: 0, started: 0, stopped: 0, failed: 0, skipped: 0, revived: 0 };
+  const out: PollResult = { scanned: 0, started: 0, stopped: 0, failed: 0, skipped: 0, revived: 0, connectedNoVideo: 0 };
+  // Bound the authenticated status probes per tick. The detector below is diagnostic, not load-bearing, and
+  // must not turn a 200-input account into 200 extra API calls every five minutes.
+  let stateProbeBudget = MAX_STATE_PROBES_PER_TICK;
   const inputs = (await deps.listInputs()).slice(0, MAX_INPUTS_PER_TICK);
 
   for (const { uid, org } of inputs) {
@@ -193,6 +208,37 @@ export async function pollStreamLifecycles(deps: PollDeps): Promise<PollResult> 
       continue;
     }
 
+    // #241 — RTMP-CONNECTED BUT NO videoUID: a customer is pushing real media and we are not bridging it.
+    //
+    // Observed 2026-07-19: a 13-minute push, ffmpeg exit 0, CF reporting {"state":"connected"} the whole
+    // window — and ZERO dispatches, because CF never minted a videoUID. Every tick logged
+    // {"scanned":7,"started":0,"failed":0,"skipped":0}, which is byte-identical to a quiet night. The
+    // customer's stream was up; from our telemetry nothing was wrong.
+    //
+    // The lifecycle endpoint alone CANNOT distinguish this: an idle-ready input and a receiving-but-unminted
+    // input can both read {live:true, videoUID:"unknown"}. Only the authenticated live_inputs API carries the
+    // RTMP connection state (`.result.status.current.state`, verified against the live API), so the detector
+    // needs that second probe — which is exactly why this state was invisible for so long.
+    //
+    // DIAGNOSTIC ONLY. It deliberately does NOT dispatch. Widening mediaIsFlowing to accept the "unknown"
+    // sentinel would bridge idle inputs, burning container instances and billing customers for dead air —
+    // the fail-safe direction is the one already coded, and the real fix belongs upstream of the check.
+    // What this does is turn an ABSENCE into a named, queryable condition.
+    if (!flowing && !active && deps.probeInputState && stateProbeBudget > 0) {
+      stateProbeBudget--;
+      const inputState = await deps.probeInputState(uid).catch(() => null);
+      if (inputState === "connected") {
+        out.connectedNoVideo++;
+        deps.log?.("stream-poll-connected-no-video", {
+          uid,
+          org,
+          inputState,
+          videoUID: state.videoUID,
+          status: state.status ?? null,
+        });
+      }
+    }
+
     if (!flowing && active) {
       try {
         await deps.dispatchStop(org, uid);
@@ -219,6 +265,37 @@ export function lifecycleUrl(code: string, uid: string): string {
 interface PollRuntimeEnv extends StreamBridgeRuntimeEnv {
   CF_STREAM_CUSTOMER_CODE?: string;
   CLOUDFLARE_STREAM_CUSTOMER_CODE?: string;
+  /** #241 — Stream:Read token for the live_inputs status probe. Absent → the detector is inert. */
+  CLOUDFLARE_STREAM_API_TOKEN?: string;
+  CF_ACCOUNT_ID?: string;
+}
+
+/**
+ * Read one input's RTMP connection state (#241).
+ *
+ * Shape verified against the live API 2026-07-19, not assumed:
+ *   {"result":{"status":{"current":{"state":"disconnected","reason":"client_disconnect",...}}}}
+ *
+ * Returns null on ANY failure — the caller treats null as "cannot tell" and does nothing, so a flaky
+ * status API can never manufacture a false #241 report.
+ */
+export async function liveProbeInputState(
+  env: PollRuntimeEnv,
+  uid: string,
+  fetchFn: typeof fetch = fetch,
+): Promise<string | null> {
+  try {
+    const res = await fetchFn(
+      `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/stream/live_inputs/${uid}`,
+      { headers: { authorization: `Bearer ${env.CLOUDFLARE_STREAM_API_TOKEN}` } },
+    );
+    if (!res.ok) return null;
+    const body = (await res.json()) as { result?: { status?: { current?: { state?: unknown } } } };
+    const state = body.result?.status?.current?.state;
+    return typeof state === "string" ? state : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -255,6 +332,11 @@ export function livePollDeps(
 
   return {
     probeHealth: dispatch.probeHealth,
+    // #241 — authenticated input-state probe. Inert without the Stream token, so an env that lacks it keeps
+    // today's behaviour rather than logging a failure every tick.
+    probeInputState: env.CLOUDFLARE_STREAM_API_TOKEN && env.CF_ACCOUNT_ID
+      ? (uid) => liveProbeInputState(env, uid, fetchFn)
+      : undefined,
     listInputs: async () => {
       const listed = await kv.list({ prefix: STREAM_INPUT_ORG_PREFIX, limit: MAX_INPUTS_PER_TICK });
       const rows = await Promise.all(
