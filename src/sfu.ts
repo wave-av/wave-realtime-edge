@@ -217,8 +217,12 @@ export class SfuClient {
     const tracks = (json as { tracks?: { status?: string }[] } | null)?.tracks;
     // All tracks inactive ⇒ unambiguously finished.
     if (Array.isArray(tracks) && tracks.length > 0 && tracks.every((t) => t?.status === "inactive")) return "gone";
-    // Answered with no tracks ⇒ either mid-negotiation (young session) or a publisher that died without a
-    // teardown (CF keeps answering 200 with `tracks: []` indefinitely). The caller ages this out.
+    // Answered with no tracks. This is WEAKER evidence than it looks, and callers must not read it as death:
+    // a WHIP publish is created with `newSession(offer)` and never calls `pushTracks` (whip.ts), so the SFU
+    // registers NO tracks against the session and answers `{"tracks":[]}` for the whole life of a healthy
+    // publish. Verified live 2026-07-19 against a session that was actively bridging media (#233).
+    // So "idle" means only "this API cannot tell" for such sessions — it does NOT distinguish mid-negotiation,
+    // a dead publisher, and a perfectly healthy WHIP broadcast. whip-sweep.ts refuses to bill on it alone.
     if (!Array.isArray(tracks) || tracks.length === 0) return "idle";
     return "alive";
   }

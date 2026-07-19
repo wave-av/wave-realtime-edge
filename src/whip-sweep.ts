@@ -84,7 +84,15 @@ export interface WhipSweepPlan {
 	/** Still live → persist a refreshed lastSeenAt so a later orphan teardown bills to a VERIFIED instant. */
 	refresh: { resourceId: string; record: WhipResource }[];
 	/** Orphaned (publisher died without a DELETE) → bill, then drop. */
-	meter: { resourceId: string; org: string; line: MeterLine }[];
+	meter: {
+		resourceId: string;
+		org: string;
+		line: MeterLine;
+		/** WHY this was billed — carried so the sweep can LOG the reason, not just the count (#233). */
+		verdict: WhipSweepEntry["verdict"];
+		/** True when the session was never once observed alive, so the billed quantity is a floor, not a measure. */
+		neverSeenAlive: boolean;
+	}[];
 	/** Resource ids whose KV record should be deleted (always the billed ones). */
 	drop: string[];
 }
@@ -115,10 +123,27 @@ export function planWhipSweep(entries: WhipSweepEntry[], now: number): WhipSweep
 			continue;
 		}
 		if (verdict === "idle") {
-			// The SFU answers but reports no tracks. Below the grace window that is normal mid-negotiation, so
-			// leave it entirely alone; past it, the publisher is gone (CF never 404s these — see sessionLiveness).
-			// CRITICALLY, an idle session is NEVER refreshed: bumping lastSeenAt here would silently convert dead
-			// air into billable minutes, since the session can sit idle indefinitely.
+			// An "idle" verdict means the SFU answered but listed no tracks. That was read as "the publisher
+			// died without a teardown" — but for THIS surface it is not evidence of anything.
+			//
+			// GROUND TRUTH (2026-07-19, live probe): handlePublish takes the direct path `sfu.newSession(offer)`
+			// and never calls pushTracks (whip.ts:289), so the SFU never registers tracks against the session.
+			// `GET /sessions/{id}` therefore answers `{"tracks":[]}` for the ENTIRE life of a perfectly healthy
+			// publish — confirmed against a session that was actively bridging media at the time it was probed.
+			//
+			// The old rule billed that healthy session as an orphan the moment it aged past the grace window,
+			// and — far worse — DROPPED its KV record, which disarmed the real teardown meter: the later
+			// client DELETE found no record and returned 204 with no usage at all. Net effect was a flat
+			// 1 minute billed for a 14.5-minute broadcast, on every WHIP session, not just the bridge (#233).
+			//
+			// So an idle verdict may only age into a bill for a session we have ACTUALLY observed alive at
+			// least once. With no such sighting the tracks array tells us nothing, which is precisely the
+			// "unknown" case this module already refuses to act on: no refresh, no bill, record survives to
+			// the next tick (and the 24h KV TTL still bounds it).
+			if (record.lastSeenAt === undefined) continue;
+			// Below the grace window an empty track list is normal mid-negotiation, so leave it alone.
+			// CRITICALLY, an idle session is NEVER refreshed: bumping lastSeenAt here would silently convert
+			// dead air into billable minutes, since the session can sit idle indefinitely.
 			if ((observedAt ?? now) - record.startedAt <= WHIP_IDLE_GRACE_MS) continue;
 			// else: fall through and bill it exactly like a "gone" session.
 		}
@@ -129,6 +154,11 @@ export function planWhipSweep(entries: WhipSweepEntry[], now: number): WhipSweep
 			resourceId,
 			org: record.org,
 			line: buildWhipMeterLine(resourceId, record.startedAt, endedAt, resolveWhipMeter(record.meter)),
+			verdict,
+			// With no sighting the window collapses to startedAt+1ms — i.e. the documented 1-minute MINIMUM,
+			// not a measurement of how long the session actually ran. Surfaced so the log says so out loud
+			// rather than presenting a floor as if it were a duration (#233).
+			neverSeenAlive: record.lastSeenAt === undefined,
 		});
 		plan.drop.push(resourceId);
 	}
@@ -207,7 +237,21 @@ export async function sweepWhipResources(
 		// Bill the orphans FIRST (while org/startedAt/meter are still in hand), and DROP ONLY WHAT WAS ACCEPTED.
 		// An unconfirmed emit leaves the record in place so the next tick retries it; that retry is safe because
 		// the emit is idempotent on event_id = resourceId.
-		for (const { resourceId, org, line } of plan.meter) {
+		for (const { resourceId, org, line, verdict, neverSeenAlive } of plan.meter) {
+			// Say WHY, before acting. The sweep used to report only what it did ({"billed":1}), so a session
+			// billed a flat minute and destroyed looked identical in the logs to a correct orphan sweep —
+			// which is how #233 stayed invisible until the quantities were traced by hand. An irreversible
+			// billing decision must state its own reasoning.
+			console.log(
+				JSON.stringify({
+					msg: "whip-sweep-orphan",
+					resourceId,
+					verdict,
+					neverSeenAlive,
+					meter: line.meter,
+					minutes: line.meter_value,
+				}),
+			);
 			const delivered = await deliverWhipTeardownMeter(env, org, line, deps.fetch);
 			if (!delivered) {
 				stats.deferred++;

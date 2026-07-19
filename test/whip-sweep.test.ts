@@ -122,6 +122,72 @@ describe("planWhipSweep — billing rules", () => {
 	});
 });
 
+// #233 — the sweeper billed LIVE sessions a flat minute and destroyed their records.
+//
+// GROUND TRUTH (live probe, 2026-07-19): a WHIP publish is created with `newSession(offer)` and never
+// calls pushTracks, so the SFU registers no tracks and answers `{"tracks":[]}` for the ENTIRE life of a
+// healthy publish — confirmed against a session that was actively bridging media when probed. Every WHIP
+// session therefore looks "idle" forever, and the old rule billed each one as an orphan the moment it aged
+// past the grace window. The bill was `startedAt→startedAt+1ms` = 1 flat minute (lastSeenAt is only ever
+// written on an "alive" verdict, which this API can never produce here), and the record was then DROPPED —
+// so the real client DELETE found nothing and returned 204 with NO usage at all.
+//
+// Measured live: a 14.5-minute broadcast billed 1 minute. Not bridge-specific — it is the shared WHIP path.
+describe("planWhipSweep — an idle verdict alone must never bill a live session (#233)", () => {
+	it("does NOT bill a never-seen-alive idle session, however old it gets", () => {
+		// The exact production shape: no lastSeenAt (no "alive" verdict is reachable for a WHIP session),
+		// long past the grace window, media still flowing. The old code billed 1 minute and dropped it.
+		const observedAt = START + 45 * MIN;
+		const plan = planWhipSweep([entry({ verdict: "idle", observedAt })], observedAt);
+		expect(plan).toEqual({ refresh: [], meter: [], drop: [] });
+	});
+
+	it("above all does not DROP that record — dropping is what disarms the real teardown meter", () => {
+		// The irreversible half. Billing 1 minute is a wrong number; destroying the record means the
+		// correct number can never be billed by anyone, because handleDelete needs the record to exist.
+		const observedAt = START + 45 * MIN;
+		const plan = planWhipSweep([entry({ verdict: "idle", observedAt })], observedAt);
+		expect(plan.drop).toHaveLength(0);
+	});
+
+	it("still bills an idle session that WAS once observed alive (the real orphan case survives)", () => {
+		// The sweeper must not be neutered: a verified sighting makes the tracks array meaningful again,
+		// so a genuine orphan still bills — to its last verified instant, exactly as before.
+		const observedAt = START + 45 * MIN;
+		const plan = planWhipSweep(
+			[entry({ verdict: "idle", observedAt, record: { lastSeenAt: START + 6 * MIN } as never })],
+			observedAt,
+		);
+		expect(plan.meter).toHaveLength(1);
+		expect(plan.meter[0].line.meter_value).toBe(6);
+		expect(plan.drop).toEqual(["res00000abc"]);
+	});
+
+	it("still bills a GONE session with no sighting — 404/all-inactive is real evidence of death", () => {
+		// "gone" is a positive death signal (the SFU forgot the session, or every track went inactive),
+		// unlike "idle" which for this surface is no signal at all. That path is deliberately untouched.
+		const plan = planWhipSweep([entry({ verdict: "gone" })], START + 60 * MIN);
+		expect(plan.meter).toHaveLength(1);
+		expect(plan.meter[0].line.meter_value).toBe(1);
+	});
+
+	it("flags a bill computed with no sighting as neverSeenAlive, so the log states it is a floor", () => {
+		// 1 minute here is the documented MINIMUM for a started publish, not a measurement of duration.
+		// Reporting only `billed:1` is what let this hide: it read identically to a correct orphan sweep.
+		const plan = planWhipSweep([entry({ verdict: "gone" })], START + 60 * MIN);
+		expect(plan.meter[0].neverSeenAlive).toBe(true);
+		expect(plan.meter[0].verdict).toBe("gone");
+	});
+
+	it("does not flag a bill backed by a real sighting", () => {
+		const plan = planWhipSweep(
+			[entry({ verdict: "gone", record: { lastSeenAt: START + 3 * MIN } as never })],
+			START + 60 * MIN,
+		);
+		expect(plan.meter[0].neverSeenAlive).toBe(false);
+	});
+});
+
 /** In-memory KV implementing the full WhipKv surface, seeded with `whip:`-prefixed records. */
 function memKv(seed: Record<string, unknown> = {}): WhipKv & { store: Map<string, string> } {
 	const store = new Map<string, string>();
