@@ -10,13 +10,13 @@ import {
   parseWebhookSignature,
   timingSafeEqualHex,
   verifyStreamSignature,
-  parseStreamEvent,
   handleStreamBridge,
   reconcileStreamPending,
   STREAM_PENDING_PREFIX,
   MAX_STREAM_DISPATCH_ATTEMPTS,
   type StreamBridgeDeps,
 } from "../src/stream-bridge.js";
+import { parseStreamEvent } from "../src/stream-bridge-payload.js";
 
 const TEST_KEY = "rt-stream-bridge-test-key";
 
