@@ -35,9 +35,17 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { createSocket as nodeCreateSocket } from "node:dgram";
 
-/** localhost RTP egress ports ffmpeg writes to (one relay per container instance ⇒ fixed ports are safe). */
-export const VIDEO_RTP_PORT = 5004;
-export const AUDIO_RTP_PORT = 5006;
+// The localhost RTP egress ports ffmpeg writes to are ASSIGNED BY THE OS, per relay — never fixed (#230).
+//
+// They used to be constants (5004/5006) on the premise "one relay per container instance ⇒ fixed ports are safe".
+// That premise does not hold and cost us twice, live:
+//   1. NO CONCURRENCY. A second relay on the same instance collided — `bind EADDRINUSE 127.0.0.1:5004` — so two
+//      customers broadcasting at once meant the second one silently got a 502. A hard multi-tenant ceiling.
+//   2. NO SELF-RECOVERY. A crashed or half-torn-down relay left the port held, so every subsequent start failed
+//      until the instance was recycled — a wedge no retry could clear.
+// Binding port 0 and reading back the assignment removes both: each relay gets its own pair, and a leaked socket
+// can never block the next start. `ffmpegArgs` therefore REQUIRES the ports be passed in — there is deliberately
+// no default, so this cannot regress to a shared port by omission.
 /** RTP payload types stamped by ffmpeg. werift re-stamps to the negotiated outbound PT; these keep ffmpeg deterministic. */
 const VIDEO_PT = 96; // VP8
 const AUDIO_PT = 111; // Opus
@@ -51,15 +59,20 @@ const AUDIO_PT = 111; // Opus
  * @param {boolean} [hasAudio=true] - whether the source carries an audio stream (see `probeHasAudio`). When false the
  *   ENTIRE audio output leg is omitted: `-map 0:a:0?` alone is NOT enough, because a second `-f rtp` output that maps
  *   zero streams makes ffmpeg abort with "Output file #1 does not contain any stream" — the very 502 this fixes.
+ * @param {{video:number, audio?:number}} ports - the OS-assigned localhost RTP ports the relay's sockets are already
+ *   bound to (#230). REQUIRED, and validated: sending RTP to a port nothing is listening on is silent dead air, so a
+ *   missing/zero port must fail loudly here rather than produce a relay that looks up and carries no media.
  */
-export function ffmpegArgs(srcUrl, auth, hasAudio = true) {
+export function ffmpegArgs(srcUrl, auth, hasAudio = true, ports) {
+  if (!ports?.video) throw new Error("ffmpegArgs: ports.video is required (#230 — RTP ports are OS-assigned)");
+  if (hasAudio && !ports.audio) throw new Error("ffmpegArgs: ports.audio is required when hasAudio");
   const args = ["-hide_banner", "-loglevel", "warning", "-re"];
   if (auth) args.push("-headers", `Authorization: Bearer ${auth}\r\n`);
   args.push(
     "-i", srcUrl,
     "-map", "0:v:0", "-c:v", "libvpx", "-b:v", "2M", "-deadline", "realtime", "-cpu-used", "5",
     "-muxdelay", "0", "-muxpreload", "0", "-payload_type", String(VIDEO_PT), "-f", "rtp",
-    `rtp://127.0.0.1:${VIDEO_RTP_PORT}`,
+    `rtp://127.0.0.1:${ports.video}`,
   );
   if (hasAudio) {
     args.push(
@@ -67,7 +80,7 @@ export function ffmpegArgs(srcUrl, auth, hasAudio = true) {
       // above is what decides whether this leg exists at all.
       "-map", "0:a:0?", "-c:a", "libopus", "-b:a", "128k",
       "-muxdelay", "0", "-muxpreload", "0", "-payload_type", String(AUDIO_PT), "-f", "rtp",
-      `rtp://127.0.0.1:${AUDIO_RTP_PORT}`,
+      `rtp://127.0.0.1:${ports.audio}`,
     );
   }
   return args;
@@ -189,7 +202,8 @@ export async function hlsPull(o) {
   // Every socket the instant it exists — so teardown reaches it even if the OTHER leg's bind rejects mid-Promise.all.
   const openSockets = [];
 
-  const bindSocket = (port, track, kind) =>
+  // Port 0 = "OS, give me a free one". See the #230 note at the top of this file for why a fixed port was wrong.
+  const bindSocket = (track, kind) =>
     new Promise((resolve, reject) => {
       const sock = socketFactory();
       openSockets.push(sock);
@@ -219,16 +233,25 @@ export async function hlsPull(o) {
         if (!stopping) onState?.("failed");
         try { sock.close(); } catch { /* already closed */ }
       });
-      sock.bind(port, "127.0.0.1", () => { settled = true; resolve(sock); });
+      sock.bind(0, "127.0.0.1", () => { settled = true; resolve(sock); });
     });
 
+  let ports;
   try {
-    await Promise.all([
-      bindSocket(VIDEO_RTP_PORT, videoTrack, "video"),
+    const [videoSock, audioSock] = await Promise.all([
+      bindSocket(videoTrack, "video"),
       // No audio leg for a video-only source: nothing will ever be sent to this port, and binding it would leave a
       // socket whose silence is indistinguishable from a stalled audio feed.
-      ...(audioTrack ? [bindSocket(AUDIO_RTP_PORT, audioTrack, "audio")] : []),
+      ...(audioTrack ? [bindSocket(audioTrack, "audio")] : []),
     ]);
+    // Read the assignment back BEFORE spawning ffmpeg — the argv must point at the ports we actually hold. If the
+    // socket cannot report its address we must not guess: ffmpeg would send RTP into a void and the relay would
+    // come up looking healthy while carrying no media (exactly the silent-no-op class of #235/#241).
+    ports = { video: videoSock?.address?.().port, audio: audioSock?.address?.().port };
+    if (!ports.video || (audioTrack && !ports.audio)) {
+      throw new Error(`hls: RTP socket did not report a bound port (video=${ports.video} audio=${ports.audio})`);
+    }
+    log("hls-rtp-ports-bound", ports);
   } catch (e) {
     for (const s of openSockets) { try { s.close(); } catch { /* already closed */ } }
     throw e; // fail loud — a source that can't bind its RTP sockets can't relay
@@ -238,7 +261,7 @@ export async function hlsPull(o) {
   onTrack?.(videoTrack);
   if (audioTrack) onTrack?.(audioTrack);
 
-  const ff = spawnFn("ffmpeg", ffmpegArgs(srcUrl, auth, hasAudio), { stdio: ["ignore", "ignore", "pipe"] });
+  const ff = spawnFn("ffmpeg", ffmpegArgs(srcUrl, auth, hasAudio, ports), { stdio: ["ignore", "ignore", "pipe"] });
   ff.stderr?.on("data", (d) => log("ffmpeg-stderr", { line: String(d).slice(0, 200) }));
   ff.on("exit", (code) => {
     log("ffmpeg-exit", { code });

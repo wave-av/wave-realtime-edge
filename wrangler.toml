@@ -330,16 +330,17 @@ new_sqlite_classes = ["RecorderContainer"]
 # Dockerfile (no private dep) — wrangler supports a mixed build/reference set.
 [[containers]]
 class_name = "StreamBridgeContainer"
-# v7-b66cd86 (◆ 2026-07-19, Jake-named "you run it fully you have access so i approve") — carries #236:
-# /health now reports the RELAY's real state instead of a constant `{ok:true}`. The old image could not
-# fail its own health check, so a dead WHIP leg was invisible to the control plane — observed 2026-07-19
-# with the media path dead ~4 minutes and nothing reporting it. `bridging` is the field callers act on:
-# true only when a relay exists AND both legs are non-terminal. Also carries v6's #2 fix (video-only
-# sources no longer 502). Local amd64 image sha256:0b827ff9e5c0de6df7bb2e2786a2568cde26b574fde9365d4a5f3629335ea7cf.
+# v8-2d869f3 (◆ 2026-07-19) — carries #230: the relay's localhost RTP ports are now OS-assigned per
+# relay instead of a fixed 5004/5006. The fixed pair meant a SECOND concurrent relay on an instance died
+# with `bind EADDRINUSE 127.0.0.1:5004` (surfaced as a /start 502), so two customers broadcasting at once
+# could not both be bridged — a hard multi-tenant ceiling — and a half-torn-down relay held the port until
+# the instance was recycled. Local amd64 image sha256:2517839771eaa1bfd274834d2b61075ad7260dba55fbf205aac075f87b37693b.
+#
+# Also carries v7's #236 (truthful /health) and v6's #2 (video-only sources no longer 502).
 #
 # NOTE: a container image change triggers a ROLLOUT, which SIGKILLs in-flight bridges (#235 — no drain).
 # Deploy this when no customer broadcast is live until that lands.
-image = "registry.cloudflare.com/d674452f756fe46885a0d6ce7bc23f0a/wave-stream-bridge:v7-b66cd86"
+image = "registry.cloudflare.com/d674452f756fe46885a0d6ce7bc23f0a/wave-stream-bridge:v8-2d869f3"
 # 30, not 5 (#231). One bridge instance = one concurrent customer broadcast, so 5 was both a hard
 # multi-tenant ceiling AND a fragility: five leaked instances wedged bridging account-wide with no
 # self-healing. Account limits are nowhere near binding (total_vcpu 1500 vs 0.0625 per default
