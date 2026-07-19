@@ -84,6 +84,16 @@ export interface AlarmDeps {
 }
 
 export interface AlarmEnv {
+	/**
+	 * Preferred: a token scoped to Containers:Read on this account and NOTHING else (#234).
+	 *
+	 * Kept separate from CF_API_TOKEN deliberately. That token carries Calls/Realtime scope for the
+	 * customer-facing join path; widening it so a 15-minute observability read can work would grow the
+	 * blast radius of any worker-side leak for the sake of a read-only watchdog. Least privilege here is
+	 * cheap — the alarm needs exactly one GET.
+	 */
+	CONTAINERS_API_TOKEN?: string;
+	/** Fallback, so the alarm still works on an env where only the broader token is bound. */
 	CF_API_TOKEN?: string;
 	CF_ACCOUNT_ID?: string;
 	/** Off unless explicitly "1" — same INERT-by-default convention as the sweeper and the poll. */
@@ -108,13 +118,16 @@ export async function checkContainerHealth(env: AlarmEnv, deps: AlarmDeps): Prom
 	const out: Array<{ app: string; verdict: AlarmVerdict; alarmed: boolean }> = [];
 
 	if (env.CONTAINER_HEALTH_ALARM_ENABLED !== "1") return { verdicts: out };
-	if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) return { verdicts: out };
+	// Prefer the narrowly-scoped containers token; fall back to the broader one so this still works on an
+	// env where only that is bound.
+	const token = env.CONTAINERS_API_TOKEN || env.CF_API_TOKEN;
+	if (!token || !env.CF_ACCOUNT_ID) return { verdicts: out };
 
 	let apps: ContainerApp[];
 	try {
 		const res = await deps.fetch(
 			`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/containers/applications`,
-			{ headers: { authorization: `Bearer ${env.CF_API_TOKEN}` } },
+			{ headers: { authorization: `Bearer ${token}` } },
 		);
 		if (!res.ok) {
 			// A probe failure is itself worth a line — a SILENT probe failure would recreate the exact blindness
