@@ -135,6 +135,19 @@ export async function pollStreamLifecycles(deps: PollDeps): Promise<PollResult> 
         // No session recorded → the next tick retries. Loud, never silent.
         out.failed++;
         deps.log?.("stream-poll-start-failed", { uid, org, room, error: String(err) });
+
+        // RELEASE THE INSTANCE. A failed `/start` still leaves the container DO instance ACTIVE but never
+        // HEALTHY, and because no session was recorded nothing else will ever stop it — so the slot is held
+        // forever. Five such failures exhausted `max_instances` and wedged stream bridging account-wide
+        // (observed 2026-07-19: active:5, healthy:0; every real broadcast then 500'd with "Maximum number of
+        // running container instances exceeded"). Best-effort and non-throwing: a failed release must not
+        // mask the start error above, and must not abort the rest of the tick.
+        await deps
+          .dispatchStop(org, uid)
+          .then(() => deps.log?.("stream-poll-start-released", { uid, org }))
+          .catch((releaseErr) =>
+            deps.log?.("stream-poll-start-release-failed", { uid, org, error: String(releaseErr) }),
+          );
       }
       continue;
     }

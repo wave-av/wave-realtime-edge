@@ -281,3 +281,52 @@ describe("lifecycleUrl / livePollDeps", () => {
     });
   });
 });
+
+describe("a failed start must RELEASE its container instance — the wedge regression (#231)", () => {
+  it("releases the instance when /start fails", async () => {
+    const h = harness({ states: { u1: { live: true, videoUID: "v1" } }, failStart: true });
+    const r = await pollStreamLifecycles(h.deps);
+
+    // The critical assertion: the slot is handed back, not held forever.
+    expect(h.stops).toEqual([{ org: "org1", uid: "u1" }]);
+    expect(r).toMatchObject({ started: 0, failed: 1 });
+    expect(h.logs.map((l) => l.msg)).toContain("stream-poll-start-released");
+  });
+
+  it("still records NO session on a failed start (so the next tick retries)", async () => {
+    const h = harness({ states: { u1: { live: true, videoUID: "v1" } }, failStart: true });
+    await pollStreamLifecycles(h.deps);
+    expect(h.sessions.has("u1")).toBe(false);
+  });
+
+  it("a failing release is logged but never masks the start error or aborts the tick", async () => {
+    const h = harness({
+      inputs: [
+        { uid: "u1", org: "org1" },
+        { uid: "u2", org: "org2" },
+      ],
+      states: { u1: { live: true, videoUID: "v1" }, u2: { live: true, videoUID: "v2" } },
+      failStart: true,
+      failStop: true,
+    });
+    const r = await pollStreamLifecycles(h.deps);
+
+    const msgs = h.logs.map((l) => l.msg);
+    expect(msgs).toContain("stream-poll-start-failed"); // original error still surfaced
+    expect(msgs).toContain("stream-poll-start-release-failed");
+    // u2 was still scanned — one input's release failure does not abort the rest of the tick.
+    expect(r).toMatchObject({ scanned: 2, failed: 2 });
+  });
+
+  it("N consecutive failed starts release N instances — slots never accumulate", async () => {
+    const inputs = ["u1", "u2", "u3", "u4", "u5"].map((uid) => ({ uid, org: "org1" }));
+    const states = Object.fromEntries(inputs.map(({ uid }) => [uid, { live: true, videoUID: `vid-${uid}` }]));
+    const h = harness({ inputs, states, failStart: true });
+
+    await pollStreamLifecycles(h.deps);
+
+    // Exactly the scenario that wedged prod: 5 failing inputs against max_instances. Every one is
+    // released, so capacity returns to zero-held rather than five-held.
+    expect(h.stops).toHaveLength(5);
+  });
+});
