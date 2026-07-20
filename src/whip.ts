@@ -102,10 +102,12 @@ export interface WhipResource {
 	// `startedAt → lastSeenAt` (never → sweep-time), so a session whose publisher died without a DELETE is
 	// billed only for time it was demonstrably live. Absent ⇒ never probed; falls back to startedAt.
 	lastSeenAt?: number;
-	// #240: epoch-ms at which the sweeper first saw this session answer 410 Gone (PeerConnection disconnected).
-	// A single 410 is NOT proven terminal (a transient ICE drop can 410 then recover), so the sweeper stamps
-	// this on the first 410 and only bills+drops once it PERSISTS past WHIP_GONE_CONFIRM_MS. Cleared the moment
-	// the session answers 200 again (alive/idle) so a recovered blip never bills on a stale timestamp.
+	// #240/#257: epoch-ms at which the sweeper first saw a DEATH signal for this session — a 410 Gone
+	// (disconnected), a 404/all-inactive ("gone"), or an aged once-alive "idle". No single probe is proven
+	// terminal (a 410 can be a transient ICE drop, tracks can flap inactive→active, a 404 can be a mis-routed
+	// probe), so the sweeper stamps this on the first death of any kind and only bills+drops once it PERSISTS
+	// past WHIP_GONE_CONFIRM_MS. Cleared ONLY by an "alive" answer (200 + active tracks); an idle 200 no longer
+	// clears it (#240 Phase-2), so a recovered blip is rescued while an ambiguous flap can never reset the clock.
 	disconnectedSince?: number;
 }
 
