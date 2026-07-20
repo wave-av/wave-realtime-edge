@@ -11,12 +11,15 @@ on:
 
 permissions:
   contents: read
+  packages: read # @wave-av/spoke-chassis is a private GitHub Packages dep (added in #258)
 
 jobs:
   test:
     name: Worker contract tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -26,6 +29,12 @@ jobs:
         with:
           node-version: "24"
           cache: "npm"
+
+      # #258 added @wave-av/spoke-chassis (private scope). Without a .npmrc pointing the @wave-av scope at
+      # GitHub Packages with a read token, `npm ci` 401s and this whole test gate silently stopped running.
+      # Mirrors the proven pattern in governance-enforce.yml. NODE_AUTH_TOKEN is substituted by npm at read time.
+      - name: Authenticate to GitHub Packages for the @wave-av scope
+        run: printf '@wave-av:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}\n' > .npmrc
 
       - name: Install dependencies
         run: npm ci || npm install
