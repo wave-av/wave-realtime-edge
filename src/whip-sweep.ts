@@ -106,11 +106,12 @@ export interface WhipSweepPlan {
 	/** Resource ids whose KV record should be deleted (always the billed ones). */
 	drop: string[];
 	/**
-	 * #240 — record writebacks that are NOT alive-refreshes: stamping `disconnectedSince` on a first 410, or
-	 * clearing it when the session answers 200 again. Kept a separate bucket (not `refresh`) so the sweep log
-	 * counts them honestly and never reports a disconnect-stamp as a live sighting (#233 truthful-logging).
+	 * #240 — record writebacks that are NOT alive-refreshes: stamping `disconnectedSince` on a first 410. Kept a
+	 * separate bucket (not `refresh`) so the sweep log counts them honestly and never reports a disconnect-stamp
+	 * as a live sighting (#233 truthful-logging). The disconnect stamp is only ever CLEARED via an "alive"
+	 * refresh now (#240 Phase-2 flap fix); an idle 200 no longer clears it, so there is no "reconnected" mark.
 	 */
-	mark: { resourceId: string; record: WhipResource; reason: "disconnected-first-seen" | "reconnected" }[];
+	mark: { resourceId: string; record: WhipResource; reason: "disconnected-first-seen" }[];
 }
 
 /**
@@ -123,10 +124,12 @@ export interface WhipSweepPlan {
  *                unknown point since the last verified sighting, so billing to sweep-time would charge for
  *                dead air. Under-billing by at most one sweep interval is the correct error direction.
  *  - "disconnected" (410) → stamp `disconnectedSince` and WAIT. Only bill+drop (exactly like "gone") once the
- *                410 has persisted past WHIP_GONE_CONFIRM_MS; a 200 answer in between clears the stamp. This
- *                keeps a transient ICE blip from forfeiting a live session's whole bill (#240).
- *  - "idle"    → answered 200 with no tracks: bill only if previously seen alive AND past the grace window
- *                (else survives); clears any disconnect stamp, since a 200 answer proves it is not disconnected.
+ *                410 has persisted past WHIP_GONE_CONFIRM_MS; only an "alive" answer (200 + ACTIVE tracks) in
+ *                between clears the stamp. This keeps a transient ICE blip from forfeiting a live session's
+ *                whole bill (#240) WITHOUT letting an ambiguous 200/idle flap reset the clock forever (#240 P2).
+ *  - "idle"    → answered 200 with no ACTIVE tracks: bill only if previously seen alive AND past the grace
+ *                window (else survives). Does NOT clear a disconnect stamp — post branch-A a real reconnect
+ *                answers "alive", so an idle 200 no longer proves the session recovered (#240 Phase-2 flap fix).
  *  - "unknown" → do NOTHING (no refresh, no bill). Refreshing on an unverified probe would silently inflate
  *                a later orphan bill; billing on it could close a session that is actually live. The record
  *                simply survives to the next tick (and the 24h KV TTL bounds it).
@@ -159,37 +162,28 @@ export function planWhipSweep(entries: WhipSweepEntry[], now: number): WhipSweep
 			// else: confirmed persistently disconnected → fall through to the "gone" billing path.
 		}
 		if (verdict === "idle") {
-			// An "idle" verdict means the SFU answered but listed no tracks. That was read as "the publisher
-			// died without a teardown" — but for THIS surface it is not evidence of anything.
+			// An "idle" verdict means the SFU answered 200 but listed no ACTIVE tracks. For THIS surface it is
+			// not evidence of anything on its own — and, post branch-A, it must NEVER clear a pending 410 stamp.
 			//
-			// GROUND TRUTH (2026-07-19, live probe): handlePublish takes the direct path `sfu.newSession(offer)`
-			// and never calls pushTracks (whip.ts:289), so the SFU never registers tracks against the session.
-			// `GET /sessions/{id}` therefore answers `{"tracks":[]}` for the ENTIRE life of a perfectly healthy
-			// publish — confirmed against a session that was actively bridging media at the time it was probed.
+			// GROUND TRUTH (2026-07-19): the old direct path `sfu.newSession(offer)` never called pushTracks, so
+			// a perfectly healthy publish answered `{"tracks":[]}` for its ENTIRE life. The old rule billed that
+			// healthy session as an orphan past the grace window and — worse — DROPPED its KV record, disarming
+			// the real teardown meter (later DELETE → 204, no usage): a flat 1 minute for a 14.5-min broadcast (#233).
+			// So an idle verdict may only age into a bill for a session ACTUALLY observed alive at least once;
+			// with no sighting the tracks array tells us nothing (the "unknown" case: no refresh, no bill, survive).
 			//
-			// The old rule billed that healthy session as an orphan the moment it aged past the grace window,
-			// and — far worse — DROPPED its KV record, which disarmed the real teardown meter: the later
-			// client DELETE found no record and returned 204 with no usage at all. Net effect was a flat
-			// 1 minute billed for a 14.5-minute broadcast, on every WHIP session, not just the bridge (#233).
-			//
-			// So an idle verdict may only age into a bill for a session we have ACTUALLY observed alive at
-			// least once. With no such sighting the tracks array tells us nothing, which is precisely the
-			// "unknown" case this module already refuses to act on: no refresh, no bill, record survives to
-			// the next tick (and the 24h KV TTL still bounds it).
-			// Answering 200 (even trackless) means the session is NOT PC-disconnected → clear any pending 410
-			// stamp so a later 410 restarts the confirm clock from scratch (never bills on a stale timestamp
-			// that spanned a live moment). Done only on the non-billing exits below; a billed idle is dropped.
-			if (record.lastSeenAt === undefined) {
-				if (record.disconnectedSince !== undefined) plan.mark.push({ resourceId, record: { ...record, disconnectedSince: undefined }, reason: "reconnected" });
-				continue;
-			}
+			// #240 Phase-2 (2026-07-20, proven live): a CRASHED branch-A orphan's SFU flaps 410 ↔ 200-idle. The
+			// old code cleared `disconnectedSince` on every idle ("reconnected"), which RESET the 4-min confirm
+			// clock each sweep → the dead orphan never billed. That clear was reconnect-protection, but it is now
+			// REDUNDANT AND HARMFUL: branch-A registers local tracks (whip.ts pushTracks), so a genuinely
+			// recovered publisher answers "alive" (200 + active tracks) and clears the stamp above (line ~145).
+			// An "idle" answer no longer proves liveness, so it leaves any 410 stamp intact to ripen into a bill.
+			if (record.lastSeenAt === undefined) continue; // never seen alive → idle proves nothing; survive (stamp, if any, persists)
 			// Below the grace window an empty track list is normal mid-negotiation, so leave it alone.
 			// CRITICALLY, an idle session is NEVER refreshed: bumping lastSeenAt here would silently convert
-			// dead air into billable minutes, since the session can sit idle indefinitely.
-			if (at - record.startedAt <= WHIP_IDLE_GRACE_MS) {
-				if (record.disconnectedSince !== undefined) plan.mark.push({ resourceId, record: { ...record, disconnectedSince: undefined }, reason: "reconnected" });
-				continue;
-			}
+			// dead air into billable minutes, since the session can sit idle indefinitely. The disconnect stamp
+			// is intentionally NOT cleared here either — only "alive" clears it.
+			if (at - record.startedAt <= WHIP_IDLE_GRACE_MS) continue;
 			// else: fall through and bill it exactly like a "gone" session.
 		}
 		// "gone": bill to the last VERIFIED-alive instant, never to `now`. Floor at startedAt+1ms so an
