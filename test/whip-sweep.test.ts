@@ -28,12 +28,25 @@ function entry(over: Partial<WhipSweepEntry> & { verdict: WhipSweepEntry["verdic
 	};
 }
 
+// #257 — a death candidate whose confirm window has ALREADY elapsed: stamped at startedAt and observed
+// +30min later (≫ WHIP_GONE_CONFIRM_MS = 4min), so planWhipSweep BILLS it on this sweep instead of opening
+// the window. The bill-MATH assertions below (quantity, SKU, idempotency key, neverSeenAlive) are unchanged
+// by the confirm gate — it only changes WHEN a session bills, not for how much. planWhipSweep clocks the gate
+// off the per-entry observedAt (`at`), so observedAt drives it, not the `now` argument.
+function confirmed(over: Partial<WhipSweepEntry> & { verdict: WhipSweepEntry["verdict"] }): WhipSweepEntry {
+	return entry({
+		observedAt: START + 30 * MIN,
+		...over,
+		record: { disconnectedSince: START, ...over.record } as never,
+	});
+}
+
 describe("planWhipSweep — billing rules", () => {
 	it("bills a gone session to lastSeenAt, NOT to sweep-time (never charges for dead air)", () => {
 		// Session verified alive at +3min; swept at +60min. The publisher died somewhere after +3min, so the
 		// only defensible bill is 3 minutes — billing to `now` would invent 57 minutes of dead air.
 		const plan = planWhipSweep(
-			[entry({ verdict: "gone", record: { lastSeenAt: START + 3 * MIN } as never })],
+			[confirmed({ verdict: "gone", record: { lastSeenAt: START + 3 * MIN } as never })],
 			START + 60 * MIN,
 		);
 		expect(plan.meter).toHaveLength(1);
@@ -46,12 +59,12 @@ describe("planWhipSweep — billing rules", () => {
 	it("bills a gone session that was never probed the documented >=1 ceil-minute (not zero)", () => {
 		// No lastSeenAt: the publish died before its first sweep. The window is floored at 1ms so an
 		// established publish still bills the documented minimum rather than silently billing nothing.
-		const plan = planWhipSweep([entry({ verdict: "gone" })], START + 60 * MIN);
+		const plan = planWhipSweep([confirmed({ verdict: "gone" })], START + 60 * MIN);
 		expect(plan.meter[0].line.meter_value).toBe(1);
 	});
 
 	it("uses resourceId as the idempotency key so a sweep cannot double-bill a racing client DELETE", () => {
-		const plan = planWhipSweep([entry({ verdict: "gone", resourceId: "abc12345xyz" })], START + MIN);
+		const plan = planWhipSweep([confirmed({ verdict: "gone", resourceId: "abc12345xyz" })], START + MIN);
 		expect(plan.meter[0].line.event_id).toBe("abc12345xyz");
 	});
 
@@ -77,7 +90,7 @@ describe("planWhipSweep — billing rules", () => {
 	it("bills an idle (zero-track) session once past the grace window — CF never 404s these", () => {
 		const observedAt = START + 20 * MIN;
 		const plan = planWhipSweep(
-			[entry({ verdict: "idle", observedAt, record: { lastSeenAt: START + 4 * MIN } as never })],
+			[confirmed({ verdict: "idle", observedAt, record: { lastSeenAt: START + 4 * MIN } as never })],
 			observedAt,
 		);
 		expect(plan.meter).toHaveLength(1);
@@ -98,7 +111,7 @@ describe("planWhipSweep — billing rules", () => {
 		// idle minute into a billable one. This is the regression that made the first live proof overbill.
 		const observedAt = START + 50 * MIN;
 		const plan = planWhipSweep(
-			[entry({ verdict: "idle", observedAt, record: { lastSeenAt: START + 2 * MIN } as never })],
+			[confirmed({ verdict: "idle", observedAt, record: { lastSeenAt: START + 2 * MIN } as never })],
 			observedAt,
 		);
 		expect(plan.refresh).toHaveLength(0);
@@ -107,7 +120,7 @@ describe("planWhipSweep — billing rules", () => {
 
 	it("carries the sealed per-session meter SKU onto the orphan bill (bridge vs bare WHIP)", () => {
 		const plan = planWhipSweep(
-			[entry({ verdict: "gone", record: { meter: "wave_stream_bridge_minutes" } as never })],
+			[confirmed({ verdict: "gone", record: { meter: "wave_stream_bridge_minutes" } as never })],
 			START + 2 * MIN,
 		);
 		expect(plan.meter[0].line.meter).toBe("wave_stream_bridge_minutes");
@@ -115,7 +128,7 @@ describe("planWhipSweep — billing rules", () => {
 
 	it("rejects an unknown meter override, falling back to the default WHIP SKU (allowset holds)", () => {
 		const plan = planWhipSweep(
-			[entry({ verdict: "gone", record: { meter: "wave_free_money" } as never })],
+			[confirmed({ verdict: "gone", record: { meter: "wave_free_money" } as never })],
 			START + 2 * MIN,
 		);
 		expect(plan.meter[0].line.meter).toBe("wave_whip_ingest_minutes");
@@ -265,7 +278,7 @@ describe("planWhipSweep — an idle verdict alone must never bill a live session
 		// so a genuine orphan still bills — to its last verified instant, exactly as before.
 		const observedAt = START + 45 * MIN;
 		const plan = planWhipSweep(
-			[entry({ verdict: "idle", observedAt, record: { lastSeenAt: START + 6 * MIN } as never })],
+			[confirmed({ verdict: "idle", observedAt, record: { lastSeenAt: START + 6 * MIN } as never })],
 			observedAt,
 		);
 		expect(plan.meter).toHaveLength(1);
@@ -276,7 +289,7 @@ describe("planWhipSweep — an idle verdict alone must never bill a live session
 	it("still bills a GONE session with no sighting — 404/all-inactive is real evidence of death", () => {
 		// "gone" is a positive death signal (the SFU forgot the session, or every track went inactive),
 		// unlike "idle" which for this surface is no signal at all. That path is deliberately untouched.
-		const plan = planWhipSweep([entry({ verdict: "gone" })], START + 60 * MIN);
+		const plan = planWhipSweep([confirmed({ verdict: "gone" })], START + 60 * MIN);
 		expect(plan.meter).toHaveLength(1);
 		expect(plan.meter[0].line.meter_value).toBe(1);
 	});
@@ -284,14 +297,14 @@ describe("planWhipSweep — an idle verdict alone must never bill a live session
 	it("flags a bill computed with no sighting as neverSeenAlive, so the log states it is a floor", () => {
 		// 1 minute here is the documented MINIMUM for a started publish, not a measurement of duration.
 		// Reporting only `billed:1` is what let this hide: it read identically to a correct orphan sweep.
-		const plan = planWhipSweep([entry({ verdict: "gone" })], START + 60 * MIN);
+		const plan = planWhipSweep([confirmed({ verdict: "gone" })], START + 60 * MIN);
 		expect(plan.meter[0].neverSeenAlive).toBe(true);
 		expect(plan.meter[0].verdict).toBe("gone");
 	});
 
 	it("does not flag a bill backed by a real sighting", () => {
 		const plan = planWhipSweep(
-			[entry({ verdict: "gone", record: { lastSeenAt: START + 3 * MIN } as never })],
+			[confirmed({ verdict: "gone", record: { lastSeenAt: START + 3 * MIN } as never })],
 			START + 60 * MIN,
 		);
 		expect(plan.meter[0].neverSeenAlive).toBe(false);
@@ -338,7 +351,9 @@ const PROVISIONED = { GATEWAY_BASE_URL: "https://api.wave.online", WAVE_SERVICE_
 describe("sweepWhipResources — applying the plan", () => {
 	it("bills and drops an orphaned record, emitting the sealed bridge SKU to the gateway", async () => {
 		const kv = memKv({
-			"whip:res00000abc": { sessionId: "s".repeat(32), org: ORG, startedAt: START, lastSeenAt: START + 2 * MIN, meter: "wave_stream_bridge_minutes" },
+			// disconnectedSince seeded past the confirm window (#257): a first "gone" would only MARK; this record
+			// already ripened, so this single sweep bills+drops. The bill math is what this test pins.
+			"whip:res00000abc": { sessionId: "s".repeat(32), org: ORG, startedAt: START, lastSeenAt: START + 2 * MIN, disconnectedSince: START, meter: "wave_stream_bridge_minutes" },
 		});
 		const emits: unknown[] = [];
 		const stats = await sweepWhipResources({ ...PROVISIONED, RT_MEETING_ORG: kv } as never, depsFor("gone", START + 30 * MIN, emits) as never);
@@ -436,7 +451,8 @@ describe("sweepWhipResources — usage is never destroyed", () => {
 	it("KEEPS an orphan record when the usage emit is not confirmed, so the next tick retries", async () => {
 		// The regression that matters: emitting fail-open and deleting anyway would lose these minutes
 		// forever — reintroducing the exact revenue leak this sweeper exists to close.
-		const kv = memKv({ "whip:res00000abc": { sessionId: "s".repeat(32), org: ORG, startedAt: START } });
+		// disconnectedSince seeded past the confirm window (#257) so this sweep reaches the bill+emit path.
+		const kv = memKv({ "whip:res00000abc": { sessionId: "s".repeat(32), org: ORG, startedAt: START, disconnectedSince: START } });
 		const attempts: unknown[] = [];
 		const stats = await sweepWhipResources(
 			{ ...PROVISIONED, RT_MEETING_ORG: kv } as never,
@@ -497,6 +513,125 @@ describe("sweepWhipResources — usage is never destroyed", () => {
 		const emits: unknown[] = [];
 		const stats = await sweepWhipResources({ ...PROVISIONED, RT_MEETING_ORG: kv } as never, depsFor("gone", START + MIN, emits) as never);
 		expect(stats.scanned).toBe(1); // only the real record, never the cursor key
+	});
+});
+
+// #257 — the confirm window that #240 built for 410 now guards EVERY death signal (404/all-inactive "gone" and
+// aged once-alive "idle" too). The failure it closes is uniform: bill+drop deletes the KV record, so a session
+// billed on a transient death can never be billed correctly by its real teardown (DELETE → 204, no usage). No
+// single probe may bill; a death must persist across a sweep, and an "alive" answer in between rescues it.
+describe("planWhipSweep — uniform death confirm gate (#257)", () => {
+	it("a first 'gone' (404/all-inactive) MARKS and does NOT bill or drop", () => {
+		const observedAt = START + 10 * MIN;
+		const plan = planWhipSweep([entry({ verdict: "gone", observedAt })], observedAt);
+		expect(plan.meter).toHaveLength(0);
+		expect(plan.drop).toHaveLength(0);
+		expect(plan.mark).toHaveLength(1);
+		expect(plan.mark[0].reason).toBe("gone-first-seen");
+		expect(plan.mark[0].record.disconnectedSince).toBe(observedAt);
+	});
+
+	it("a first aged once-alive 'idle' MARKS (idle-first-seen) and does NOT bill", () => {
+		const observedAt = START + 20 * MIN; // past the 3-min negotiation grace
+		const plan = planWhipSweep([entry({ verdict: "idle", observedAt, record: { lastSeenAt: START + 5 * MIN } as never })], observedAt);
+		expect(plan.meter).toHaveLength(0);
+		expect(plan.mark).toHaveLength(1);
+		expect(plan.mark[0].reason).toBe("idle-first-seen");
+	});
+
+	it("a 'gone' still within the confirm window keeps waiting (no bill)", () => {
+		const firstSeen = START + 5 * MIN;
+		const observedAt = firstSeen + 3 * MIN; // < 4-min window
+		const plan = planWhipSweep([entry({ verdict: "gone", observedAt, record: { disconnectedSince: firstSeen } as never })], observedAt);
+		expect(plan).toEqual({ refresh: [], meter: [], drop: [], mark: [] });
+	});
+
+	it("a 'gone' persisted past the confirm window bills+drops", () => {
+		const firstSeen = START + 5 * MIN;
+		const observedAt = firstSeen + 5 * MIN; // >= 4-min window
+		const plan = planWhipSweep(
+			[entry({ verdict: "gone", observedAt, record: { disconnectedSince: firstSeen, lastSeenAt: START + 2 * MIN } as never })],
+			observedAt,
+		);
+		expect(plan.meter).toHaveLength(1);
+		expect(plan.meter[0].verdict).toBe("gone");
+		expect(plan.meter[0].line.meter_value).toBe(2); // to last verified sighting, never sweep-time
+		expect(plan.drop).toEqual(["res00000abc"]);
+	});
+
+	it("RESCUES a transient 'gone' that recovers to alive within the window — the whole point (no forfeit)", () => {
+		const firstSeen = START + 5 * MIN;
+		// 1) a first 'gone' stamps and waits
+		const p1 = planWhipSweep([entry({ verdict: "gone", observedAt: firstSeen })], firstSeen);
+		expect(p1.mark).toHaveLength(1);
+		const stamped = p1.mark[0].record; // disconnectedSince = firstSeen
+		// 2) an 'alive' sighting 2 min later (still inside the window) CLEARS the stamp and refreshes — never bills
+		const recovered = planWhipSweep([entry({ verdict: "alive", observedAt: firstSeen + 2 * MIN, record: stamped as never })], firstSeen + 2 * MIN);
+		expect(recovered.meter).toHaveLength(0);
+		expect(recovered.drop).toHaveLength(0);
+		expect(recovered.refresh).toHaveLength(1);
+		expect(recovered.refresh[0].record.disconnectedSince).toBeUndefined();
+		// 3) a later 'gone' therefore starts a FRESH clock (no immediate bill) — the session was proven live in between
+		const later = planWhipSweep([entry({ verdict: "gone", observedAt: firstSeen + 4 * MIN, record: recovered.refresh[0].record as never })], firstSeen + 4 * MIN);
+		expect(later.meter).toHaveLength(0);
+		expect(later.mark).toHaveLength(1);
+		expect(later.mark[0].record.disconnectedSince).toBe(firstSeen + 4 * MIN); // clock restarted, not carried
+	});
+
+	it("RESCUES an aged idle that flaps back to alive within the window", () => {
+		const firstSeen = START + 20 * MIN;
+		const p1 = planWhipSweep([entry({ verdict: "idle", observedAt: firstSeen, record: { lastSeenAt: START + 5 * MIN } as never })], firstSeen);
+		expect(p1.mark).toHaveLength(1);
+		expect(p1.mark[0].reason).toBe("idle-first-seen");
+		const alive = planWhipSweep([entry({ verdict: "alive", observedAt: firstSeen + 2 * MIN, record: p1.mark[0].record as never })], firstSeen + 2 * MIN);
+		expect(alive.meter).toHaveLength(0);
+		expect(alive.refresh[0].record.disconnectedSince).toBeUndefined();
+	});
+
+	it("does not stamp a fresh publish or a never-seen-alive session (idle preconditions unchanged, #233)", () => {
+		// within grace → survive; never-seen-alive → survive. Neither opens a confirm window.
+		expect(planWhipSweep([entry({ verdict: "idle", observedAt: START + 30_000 })], START + 30_000)).toEqual({ refresh: [], meter: [], drop: [], mark: [] });
+		expect(planWhipSweep([entry({ verdict: "idle", observedAt: START + 45 * MIN })], START + 45 * MIN)).toEqual({ refresh: [], meter: [], drop: [], mark: [] });
+	});
+});
+
+// #257 end-to-end through the real loader: a crashed publisher's 404 must bill on the SECOND sweep, not the first.
+describe("sweepWhipResources — a death bills only after it persists a sweep (#257)", () => {
+	it("a 'gone' orphan MARKS on sweep 1 (billed:0, record kept+stamped) then BILLS on sweep 2", async () => {
+		const kv = memKv({ "whip:res00000abc": { sessionId: "s".repeat(32), org: ORG, startedAt: START, lastSeenAt: START + 2 * MIN } });
+		const emits: unknown[] = [];
+
+		// Sweep 1: first 404 → stamp, do not bill, keep the record.
+		const s1 = await sweepWhipResources({ ...PROVISIONED, RT_MEETING_ORG: kv } as never, depsFor("gone", START + 10 * MIN, emits) as never);
+		expect(s1.billed).toBe(0);
+		expect(emits).toHaveLength(0);
+		expect(kv.store.has("whip:res00000abc")).toBe(true);
+		expect(JSON.parse(kv.store.get("whip:res00000abc")!).disconnectedSince).toBe(START + 10 * MIN);
+
+		// Sweep 2: still 404, now past the confirm window → bill+drop.
+		const s2 = await sweepWhipResources({ ...PROVISIONED, RT_MEETING_ORG: kv } as never, depsFor("gone", START + 20 * MIN, emits) as never);
+		expect(s2.billed).toBe(1);
+		expect(emits).toHaveLength(1);
+		expect(emits[0]).toMatchObject({ usage: { meter_value: 2, event_id: "res00000abc" } });
+		expect(kv.store.has("whip:res00000abc")).toBe(false);
+	});
+
+	it("a 404 that recovers to alive on sweep 2 is never billed — the live session's bill is preserved", async () => {
+		const kv = memKv({ "whip:res00000abc": { sessionId: "s".repeat(32), org: ORG, startedAt: START } });
+		const emits: unknown[] = [];
+
+		// Sweep 1: transient 404 → stamp only.
+		await sweepWhipResources({ ...PROVISIONED, RT_MEETING_ORG: kv } as never, depsFor("gone", START + 5 * MIN, emits) as never);
+		expect(JSON.parse(kv.store.get("whip:res00000abc")!).disconnectedSince).toBe(START + 5 * MIN);
+
+		// Sweep 2: alive again → stamp cleared, refreshed, nothing billed, record intact for its real teardown.
+		const s2 = await sweepWhipResources({ ...PROVISIONED, RT_MEETING_ORG: kv } as never, depsFor("alive", START + 8 * MIN, emits) as never);
+		expect(s2.billed).toBe(0);
+		expect(s2.refreshed).toBe(1);
+		expect(emits).toHaveLength(0);
+		const rec = JSON.parse(kv.store.get("whip:res00000abc")!);
+		expect(rec.disconnectedSince).toBeUndefined();
+		expect(rec.lastSeenAt).toBe(START + 8 * MIN);
 	});
 });
 
