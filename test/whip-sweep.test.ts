@@ -321,7 +321,7 @@ function memKv(seed: Record<string, unknown> = {}): WhipKv & { store: Map<string
 }
 
 /** Deps whose SFU returns a fixed verdict, recording every usage emit the sweeper makes. */
-function depsFor(verdict: "alive" | "gone" | "unknown", now: number, emits: unknown[]) {
+function depsFor(verdict: "alive" | "gone" | "unknown" | "disconnected" | "idle", now: number, emits: unknown[]) {
 	return {
 		sfu: () => ({ sessionLiveness: async () => verdict }) as never,
 		now: () => now,
@@ -347,6 +347,28 @@ describe("sweepWhipResources — applying the plan", () => {
 		expect(emits).toHaveLength(1);
 		expect(emits[0]).toMatchObject({ org: ORG, usage: { meter: "wave_stream_bridge_minutes", meter_value: 2, event_id: "res00000abc" } });
 		// Record dropped, so a later client DELETE is the idempotent 204 no-op rather than a second bill.
+		expect(kv.store.has("whip:res00000abc")).toBe(false);
+	});
+
+	it("#240: a persisted disconnectedSince past the confirm window BILLS+DROPS (loadResource must carry the stamp — regression)", async () => {
+		// The confirm-window stamp is written by an earlier sweep's mark and re-READ by the next. If loadResource
+		// strips disconnectedSince (the #240 bug, proven live 2026-07-20), every sweep re-loads the record with the
+		// stamp gone, re-stamps a fresh clock, and the 4-min window NEVER closes → a crashed orphan bills nothing.
+		// This drives the REAL loadResource (memKv seeds raw JSON): a stamp already past the window must ripen into
+		// a bill on THIS sweep, not reset. Fails on the pre-fix loader (billed:0, key still present, ds re-stamped).
+		const firstSeen = START + 2 * MIN;
+		const kv = memKv({
+			"whip:res00000abc": { sessionId: "s".repeat(32), org: ORG, startedAt: START, disconnectedSince: firstSeen },
+		});
+		const emits: unknown[] = [];
+		const stats = await sweepWhipResources(
+			{ ...PROVISIONED, RT_MEETING_ORG: kv } as never,
+			depsFor("disconnected", firstSeen + 10 * MIN, emits) as never, // 10 min past the stamp ≫ WHIP_GONE_CONFIRM_MS (4 min)
+		);
+
+		expect(stats.billed).toBe(1);
+		expect(emits).toHaveLength(1);
+		// Dropped, NOT re-stamped: the whole point is the window closed instead of resetting.
 		expect(kv.store.has("whip:res00000abc")).toBe(false);
 	});
 

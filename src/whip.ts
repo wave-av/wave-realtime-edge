@@ -228,6 +228,10 @@ export async function loadResource(kv: WhipKv | undefined, resourceId: string): 
 				room: typeof r.room === "string" ? r.room : undefined,
 				// #35: carry the sweeper's last observed-alive stamp so an orphan teardown bills to it.
 				lastSeenAt: typeof r.lastSeenAt === "number" ? r.lastSeenAt : undefined,
+				// #240: carry the sweeper's first-410 stamp forward. Without this the confirm-window stamp is
+				// write-only — every sweep re-loads the record with disconnectedSince stripped, re-stamps a fresh
+				// clock, and the window NEVER closes, so a crashed orphan is never billed (proven live 2026-07-20).
+				disconnectedSince: typeof r.disconnectedSince === "number" ? r.disconnectedSince : undefined,
 			};
 		}
 	} catch {
