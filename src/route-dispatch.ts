@@ -43,6 +43,10 @@ import { maybeHandleCanaryProof } from "./canary-proof";
 // file-size gate. INERT behind RECORDER_INGEST_ENABLED (default off → 501).
 import { maybeHandleRecordingIngest } from "./recording-ingest-route";
 import { maybeHandleRecorderDispatch } from "./recorder-dispatch-route";
+// WOW story pass (2026-07-20) — the branded front door at GET "/". Chassis-rendered (CSP-safe by
+// default: DEFAULT_CSP allows only same-origin script-src). Pure string render, no I/O, no auth.
+import { landingPage } from "./landing";
+import { DEFAULT_CSP } from "@wave-av/spoke-chassis";
 // Env shape, route-match constants, and the auth/deps/sink plumbing — extracted to a leaf module (task #56) so
 // neither file exceeds 800 lines. dispatch-helpers.ts imports nothing from here (no cycle).
 import {
@@ -93,6 +97,16 @@ export async function dispatch(
 			layer: "edge",
 			protocol: "webrtc-sfu",
 			version: "dev",
+		});
+	}
+
+	if (request.method === "GET" && url.pathname === "/") {
+		return new Response(landingPage(), {
+			headers: {
+				"content-type": "text/html; charset=utf-8",
+				"content-security-policy": DEFAULT_CSP,
+				"x-content-type-options": "nosniff",
+			},
 		});
 	}
 
