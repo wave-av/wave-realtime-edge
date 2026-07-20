@@ -182,17 +182,32 @@ describe("planWhipSweep — #240 disconnected (410) confirmation gate", () => {
 		expect(plan.meter).toHaveLength(0);
 	});
 
-	it("an idle (200) answer clears a pending disconnect stamp without billing", () => {
+	it("#240 Phase-2: an idle (200/no-active-tracks) answer does NOT clear a pending 410 stamp (flap fix)", () => {
+		// Proven live 2026-07-20: a crashed branch-A orphan's SFU flaps 410 ↔ 200-idle. The old code cleared
+		// disconnectedSince on every idle ("reconnected"), which RESET the 4-min confirm clock each sweep, so the
+		// dead orphan never billed. Post branch-A a genuine reconnect answers "alive" (200 + ACTIVE tracks) and
+		// clears the stamp; an ambiguous idle must leave it intact to ripen. Never seen alive → nothing is done.
 		const observedAt = START + 8 * MIN;
 		const plan = planWhipSweep(
 			[entry({ verdict: "idle", observedAt, record: { disconnectedSince: START + 5 * MIN } as never })],
 			observedAt,
 		);
-		expect(plan.meter).toHaveLength(0);
-		expect(plan.drop).toHaveLength(0);
-		expect(plan.mark).toHaveLength(1);
-		expect(plan.mark[0].reason).toBe("reconnected");
-		expect(plan.mark[0].record.disconnectedSince).toBeUndefined();
+		expect(plan).toEqual({ refresh: [], meter: [], drop: [], mark: [] }); // stamp preserved (untouched), no clear
+	});
+
+	it("#240 Phase-2: 410 → idle (flap) → persisted 410 still bills off the ORIGINAL stamp (clock not reset)", () => {
+		const firstSeen = START + 5 * MIN;
+		// The intervening idle sweep leaves disconnectedSince = firstSeen untouched (asserted above), so when the
+		// 410 next re-appears past the confirm window it bills off the original stamp rather than a reset clock.
+		const observedAt = firstSeen + 5 * MIN; // >= the 4-min confirm window, measured from the ORIGINAL 410
+		const plan = planWhipSweep(
+			[entry({ verdict: "disconnected", observedAt, record: { disconnectedSince: firstSeen } as never })],
+			observedAt,
+		);
+		expect(plan.meter).toHaveLength(1);
+		expect(plan.meter[0].verdict).toBe("disconnected");
+		expect(plan.meter[0].neverSeenAlive).toBe(true);
+		expect(plan.drop).toEqual(["res00000abc"]);
 	});
 
 	it("an unknown verdict leaves a pending disconnect stamp intact (never erased on a guess)", () => {
