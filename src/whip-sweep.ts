@@ -106,11 +106,12 @@ export interface WhipSweepPlan {
 	/** Resource ids whose KV record should be deleted (always the billed ones). */
 	drop: string[];
 	/**
-	 * #240 — record writebacks that are NOT alive-refreshes: stamping `disconnectedSince` on a first 410, or
-	 * clearing it when the session answers 200 again. Kept a separate bucket (not `refresh`) so the sweep log
-	 * counts them honestly and never reports a disconnect-stamp as a live sighting (#233 truthful-logging).
+	 * #240 — record writebacks that are NOT alive-refreshes: stamping `disconnectedSince` on a first 410. Kept a
+	 * separate bucket (not `refresh`) so the sweep log counts them honestly and never reports a disconnect-stamp
+	 * as a live sighting (#233 truthful-logging). The disconnect stamp is only ever CLEARED via an "alive"
+	 * refresh now (#240 Phase-2 flap fix); an idle 200 no longer clears it, so there is no "reconnected" mark.
 	 */
-	mark: { resourceId: string; record: WhipResource; reason: "disconnected-first-seen" | "reconnected" }[];
+	mark: { resourceId: string; record: WhipResource; reason: "disconnected-first-seen" }[];
 }
 
 /**

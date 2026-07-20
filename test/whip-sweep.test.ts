@@ -182,32 +182,34 @@ describe("planWhipSweep — #240 disconnected (410) confirmation gate", () => {
 		expect(plan.meter).toHaveLength(0);
 	});
 
-	it("#240 Phase-2: an idle (200/no-active-tracks) answer does NOT clear a pending 410 stamp (flap fix)", () => {
+	it("#240 Phase-2 flap: 410 → idle → persisted-410 threaded through the SAME record bills off the original stamp", () => {
 		// Proven live 2026-07-20: a crashed branch-A orphan's SFU flaps 410 ↔ 200-idle. The old code cleared
-		// disconnectedSince on every idle ("reconnected"), which RESET the 4-min confirm clock each sweep, so the
+		// disconnectedSince on every idle ("reconnected"), RESETTING the 4-min confirm clock each sweep, so the
 		// dead orphan never billed. Post branch-A a genuine reconnect answers "alive" (200 + ACTIVE tracks) and
-		// clears the stamp; an ambiguous idle must leave it intact to ripen. Never seen alive → nothing is done.
-		const observedAt = START + 8 * MIN;
-		const plan = planWhipSweep(
-			[entry({ verdict: "idle", observedAt, record: { disconnectedSince: START + 5 * MIN } as never })],
-			observedAt,
-		);
-		expect(plan).toEqual({ refresh: [], meter: [], drop: [], mark: [] }); // stamp preserved (untouched), no clear
-	});
-
-	it("#240 Phase-2: 410 → idle (flap) → persisted 410 still bills off the ORIGINAL stamp (clock not reset)", () => {
+		// clears the stamp; an idle no longer does. This threads ONE record through the real flap sequence.
 		const firstSeen = START + 5 * MIN;
-		// The intervening idle sweep leaves disconnectedSince = firstSeen untouched (asserted above), so when the
-		// 410 next re-appears past the confirm window it bills off the original stamp rather than a reset clock.
-		const observedAt = firstSeen + 5 * MIN; // >= the 4-min confirm window, measured from the ORIGINAL 410
-		const plan = planWhipSweep(
-			[entry({ verdict: "disconnected", observedAt, record: { disconnectedSince: firstSeen } as never })],
-			observedAt,
+
+		// 1) first 410 stamps disconnectedSince = firstSeen (no bill yet)
+		const p1 = planWhipSweep([entry({ verdict: "disconnected", observedAt: firstSeen })], firstSeen);
+		expect(p1.meter).toHaveLength(0);
+		expect(p1.mark).toHaveLength(1);
+		const stamped = p1.mark[0].record; // carries disconnectedSince = firstSeen
+		expect(stamped.disconnectedSince).toBe(firstSeen);
+
+		// 2) an idle sweep 2 min later must leave the stamp UNTOUCHED (the flap that used to reset the clock)
+		const p2 = planWhipSweep(
+			[entry({ verdict: "idle", observedAt: firstSeen + 2 * MIN, record: stamped as never })],
+			firstSeen + 2 * MIN,
 		);
-		expect(plan.meter).toHaveLength(1);
-		expect(plan.meter[0].verdict).toBe("disconnected");
-		expect(plan.meter[0].neverSeenAlive).toBe(true);
-		expect(plan.drop).toEqual(["res00000abc"]);
+		expect(p2).toEqual({ refresh: [], meter: [], drop: [], mark: [] });
+
+		// 3) a 410 past the confirm window — measured from the ORIGINAL firstSeen, NOT reset by the idle — bills+drops
+		const observedAt = firstSeen + 5 * MIN;
+		const p3 = planWhipSweep([entry({ verdict: "disconnected", observedAt, record: stamped as never })], observedAt);
+		expect(p3.meter).toHaveLength(1);
+		expect(p3.meter[0].verdict).toBe("disconnected");
+		expect(p3.meter[0].neverSeenAlive).toBe(true);
+		expect(p3.drop).toEqual(["res00000abc"]);
 	});
 
 	it("an unknown verdict leaves a pending disconnect stamp intact (never erased on a guess)", () => {
