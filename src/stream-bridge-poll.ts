@@ -76,6 +76,18 @@ export function mediaIsFlowing(state: LifecycleState): boolean {
   return state.live && typeof state.videoUID === "string" && state.videoUID !== VIDEO_UID_UNKNOWN;
 }
 
+/**
+ * One authenticated `GET live_inputs/{uid}` read (#241): the RTMP connection state AND the input's
+ * recording mode, from the SAME API call (no extra request). `recordingMode` gates bridge-eligibility —
+ * see the dispatch gate: only `automatic` inputs can serve the LL-HLS the container pulls.
+ */
+export interface InputProbe {
+  /** `status.current.state`: `"connected"` | `"disconnected"` | … | null when unreadable. */
+  state: string | null;
+  /** `recording.mode`: `"automatic"` | `"off"` | … | null when unreadable. */
+  recordingMode: string | null;
+}
+
 /** Injected seam so every path unit-tests with no network and no KV. */
 export interface PollDeps {
   /** All known input uids with their org (live: KV list on the stream-input-org: prefix). */
@@ -96,13 +108,13 @@ export interface PollDeps {
    */
   probeHealth?(org: string, uid: string): Promise<{ bridging: boolean; tracks: number } | null>;
   /**
-   * The INPUT's RTMP connection state from the live_inputs API (#241) — `"connected"`, `"disconnected"`,
-   * or null when unreadable. Distinct from `probeLifecycle`, which reads the unauthenticated lifecycle
-   * endpoint and CANNOT tell an idle input apart from one that is receiving media without a videoUID.
-   * Optional; absent → the connected-input dispatch path (#241) is skipped entirely and behaviour is
-   * byte-identical to before: only `mediaIsFlowing` can trigger a start.
+   * The INPUT's authenticated live_inputs read (#241): RTMP connection state + recording mode, or null
+   * when unreadable. Distinct from `probeLifecycle`, which reads the unauthenticated lifecycle endpoint
+   * and CANNOT tell an idle input apart from one receiving media without a videoUID. Optional; absent →
+   * the connected-input dispatch path (#241) is skipped entirely and behaviour is byte-identical to
+   * before: only `mediaIsFlowing` can trigger a start.
    */
-  probeInputState?(uid: string): Promise<string | null>;
+  probeInputState?(uid: string): Promise<InputProbe | null>;
   log?(msg: string, fields: Record<string, unknown>): void;
 }
 
@@ -120,6 +132,14 @@ export interface PollResult {
    * already active — see the dispatch gate.
    */
   connectedNoVideo: number;
+  /**
+   * Inputs RTMP-connected but NOT bridge-capable (recording.mode ≠ "automatic") → deliberately NOT
+   * dispatched (#241 follow-up). recording:off inputs cannot serve the LL-HLS the container pulls, so a
+   * dispatch 502s every tick. Critically, the WHEP-A egress plane (armed, INGRESS_ROUTER_ENABLED) writes
+   * the SAME `stream-input-org:` prefix with recording:off inputs that are played via CF WHEP directly and
+   * must never be SFU-bridged. This counter makes that correct exclusion observable (was silent churn).
+   */
+  connectedNotBridgeable: number;
   /**
    * Bridges the container CONFIRMED alive this tick (an explicit `bridging:true`).
    *
@@ -146,7 +166,7 @@ export interface PollResult {
  * inventing `live:false` would tear down a healthy broadcast.
  */
 export async function pollStreamLifecycles(deps: PollDeps): Promise<PollResult> {
-  const out: PollResult = { scanned: 0, started: 0, stopped: 0, failed: 0, skipped: 0, revived: 0, connectedNoVideo: 0, healthy: 0, healthUnknown: 0 };
+  const out: PollResult = { scanned: 0, started: 0, stopped: 0, failed: 0, skipped: 0, revived: 0, connectedNoVideo: 0, connectedNotBridgeable: 0, healthy: 0, healthUnknown: 0 };
   // Bound the authenticated status probes per tick. The probe now DRIVES dispatch (#241), but the cap
   // still must not turn a 200-input account into 200 extra API calls every five minutes.
   let stateProbeBudget = MAX_STATE_PROBES_PER_TICK;
@@ -172,22 +192,36 @@ export async function pollStreamLifecycles(deps: PollDeps): Promise<PollResult> 
     // `{live:false,videoUID:null,status:"disconnected"}` on the lifecycle endpoint for the ENTIRE window
     // while the authenticated API correctly reported `state:"connected"` immediately. `inputState` is now
     // LOAD-BEARING — it drives dispatch below, not just the diagnostic log it used to feed exclusively.
-    let inputState: string | null = null;
+    let probe: InputProbe | null = null;
     if (!flowing && !active && deps.probeInputState && stateProbeBudget > 0) {
       stateProbeBudget--;
-      inputState = await deps.probeInputState(uid).catch(() => null);
-      if (inputState === "connected") {
+      probe = await deps.probeInputState(uid).catch(() => null);
+      if (probe?.state === "connected") {
         out.connectedNoVideo++;
         deps.log?.("stream-poll-connected-no-video", {
           uid,
           org,
-          inputState,
+          inputState: probe.state,
+          recordingMode: probe.recordingMode,
           videoUID: state.videoUID,
           status: state.status ?? null,
         });
       }
     }
-    const connectedNoLifecycle = inputState === "connected";
+    // #241 follow-up — a connected input may dispatch on the inputState signal ONLY when it is
+    // BRIDGE-CAPABLE: recording.mode === "automatic", so CF serves the LL-HLS the container pulls. A
+    // recording:off input can NEVER be LL-HLS-bridged (proven live: container /start → 502 "no live
+    // media"), and the ARMED WHEP-A egress plane (INGRESS_ROUTER_ENABLED) fills the SHARED
+    // stream-input-org: prefix with recording:off inputs that are played via CF WHEP directly and must
+    // NOT be SFU-bridged — dispatching them 502s + churns a container instance every tick. Fail-closed:
+    // unknown/absent mode → not bridge-capable → no dispatch (retry next tick). (`flowing` already
+    // implies automatic — a concrete videoUID exists only once CF spun up the recording pipeline — so
+    // only this inputState path needs the gate.)
+    const connectedNoLifecycle = probe?.state === "connected" && probe.recordingMode === "automatic";
+    if (probe?.state === "connected" && !connectedNoLifecycle) {
+      out.connectedNotBridgeable++;
+      deps.log?.("stream-poll-connected-not-bridgeable", { uid, org, recordingMode: probe.recordingMode });
+    }
 
     if ((flowing || connectedNoLifecycle) && !active) {
       const room = bridgeRoomFor(uid); // deterministic → a duplicate start joins the same room
@@ -290,28 +324,36 @@ interface PollRuntimeEnv extends StreamBridgeRuntimeEnv {
 }
 
 /**
- * Read one input's RTMP connection state (#241).
+ * Read one input's RTMP connection state AND recording mode (#241) from a single authenticated
+ * live_inputs GET — no extra API call for the mode.
  *
- * Shape verified against the live API 2026-07-19, not assumed:
- *   {"result":{"status":{"current":{"state":"disconnected","reason":"client_disconnect",...}}}}
+ * Shape verified against the live API 2026-07-19/2026-07-20, not assumed:
+ *   {"result":{"status":{"current":{"state":"connected",...}}, "recording":{"mode":"off"}}}
  *
  * Returns null on ANY failure — the caller treats null as "cannot tell" and does nothing, so a flaky
- * status API can never manufacture a false #241 report.
+ * status API can never manufacture a false #241 report. Fields absent from a 200 body resolve to null
+ * individually (the caller fails CLOSED on `recordingMode !== "automatic"` for the dispatch gate).
  */
 export async function liveProbeInputState(
   env: PollRuntimeEnv,
   uid: string,
   fetchFn: typeof fetch = fetch,
-): Promise<string | null> {
+): Promise<InputProbe | null> {
   try {
     const res = await fetchFn(
       `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/stream/live_inputs/${uid}`,
       { headers: { authorization: `Bearer ${env.CLOUDFLARE_STREAM_API_TOKEN}` } },
     );
     if (!res.ok) return null;
-    const body = (await res.json()) as { result?: { status?: { current?: { state?: unknown } } } };
+    const body = (await res.json()) as {
+      result?: { status?: { current?: { state?: unknown } }; recording?: { mode?: unknown } };
+    };
     const state = body.result?.status?.current?.state;
-    return typeof state === "string" ? state : null;
+    const mode = body.result?.recording?.mode;
+    return {
+      state: typeof state === "string" ? state : null,
+      recordingMode: typeof mode === "string" ? mode : null,
+    };
   } catch {
     return null;
   }

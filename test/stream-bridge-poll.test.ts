@@ -37,6 +37,9 @@ function harness(o: {
   omitProbeHealth?: boolean;
   /** #241 — the input's RTMP state from the live_inputs API. undefined → dep omitted. */
   inputState?: string | null;
+  /** #241 follow-up — the input's recording.mode. Defaults to "automatic" (bridge-capable) so existing
+   *  connected-dispatch cases keep dispatching; set "off"/null to exercise the not-bridgeable gate. */
+  recordingMode?: string | null;
 }): Harness {
   const starts: Harness["starts"] = [];
   const stops: Harness["stops"] = [];
@@ -62,7 +65,9 @@ function harness(o: {
         stops.push({ org, uid });
       },
       ...(o.omitProbeHealth ? {} : { probeHealth: async () => o.health ?? null }),
-      ...(o.inputState === undefined ? {} : { probeInputState: async () => o.inputState ?? null }),
+      ...(o.inputState === undefined
+        ? {}
+        : { probeInputState: async () => ({ state: o.inputState ?? null, recordingMode: o.recordingMode === undefined ? "automatic" : o.recordingMode }) }),
       log: (msg, fields) => logs.push({ msg, fields }),
     },
   };
@@ -465,7 +470,7 @@ describe("pollStreamLifecycles — RTMP-connected but no videoUID (#241)", () =>
   it("does not probe an input that is already bridging", async () => {
     let probed = false;
     const h = harness({ states: { u1: { live: true, videoUID: "v1" } }, sessions: ["u1"], health: { bridging: true, tracks: 2 } });
-    h.deps.probeInputState = async () => { probed = true; return "connected"; };
+    h.deps.probeInputState = async () => { probed = true; return { state: "connected", recordingMode: "automatic" }; };
     await pollStreamLifecycles(h.deps);
     expect(probed).toBe(false);
   });
@@ -475,7 +480,7 @@ describe("pollStreamLifecycles — RTMP-connected but no videoUID (#241)", () =>
     const inputs = Array.from({ length: 40 }, (_, i) => ({ uid: `u${i}`, org: "org1" }));
     const states = Object.fromEntries(inputs.map((i) => [i.uid, NO_VIDEO]));
     const h = harness({ inputs, states });
-    h.deps.probeInputState = async () => { probes++; return "disconnected"; };
+    h.deps.probeInputState = async () => { probes++; return { state: "disconnected", recordingMode: null }; };
     await pollStreamLifecycles(h.deps);
     expect(probes).toBe(MAX_STATE_PROBES_PER_TICK);
   });
@@ -541,7 +546,7 @@ describe("pollStreamLifecycles — #241 FIX: dispatch on authenticated inputStat
     const h = harness({ states: { u1: DISCONNECTED_LOOKING }, sessions: ["u1"] });
     h.deps.probeInputState = async () => {
       probed = true;
-      return "connected";
+      return { state: "connected", recordingMode: "automatic" };
     };
     const r = await pollStreamLifecycles(h.deps);
     expect(probed).toBe(false); // guarded by !active before the probe even runs
@@ -556,5 +561,53 @@ describe("pollStreamLifecycles — #241 FIX: dispatch on authenticated inputStat
     expect(h.sessions.has("u1")).toBe(false); // retried next tick
     expect(h.stops).toEqual([{ org: "org1", uid: "u1" }]); // the slot was handed back
     expect(h.logs.map((l) => l.msg)).toContain("stream-poll-start-released");
+  });
+});
+
+describe("pollStreamLifecycles — #241 follow-up: only bridge-capable (recording:automatic) inputs dispatch", () => {
+  // Proven live 2026-07-20: a recording:off input reaches inputState:"connected" but CF never spins up
+  // the video/LL-HLS pipeline, so the container's LL-HLS source leg 502s ("no live media"). The ARMED
+  // WHEP-A egress plane (INGRESS_ROUTER_ENABLED) fills the SAME stream-input-org: prefix with recording:off
+  // inputs that are played via CF WHEP directly — those must NEVER be SFU-bridged. The gate excludes them.
+  const DISCONNECTED_LOOKING = { live: false, videoUID: null, status: "disconnected" };
+
+  it("connected but recording:off → NO dispatch, counted as connectedNotBridgeable (the WHEP-A collision case)", async () => {
+    const h = harness({ states: { u1: DISCONNECTED_LOOKING }, inputState: "connected", recordingMode: "off" });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(h.starts).toHaveLength(0);
+    expect(r).toMatchObject({ started: 0, failed: 0, connectedNoVideo: 1, connectedNotBridgeable: 1 });
+    const line = h.logs.find((l) => l.msg === "stream-poll-connected-not-bridgeable");
+    expect(line?.fields).toMatchObject({ uid: "u1", recordingMode: "off" });
+  });
+
+  it("connected but recording mode unreadable (null) → fail-closed, NO dispatch", async () => {
+    const h = harness({ states: { u1: DISCONNECTED_LOOKING }, inputState: "connected", recordingMode: null });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(h.starts).toHaveLength(0);
+    expect(r).toMatchObject({ started: 0, connectedNotBridgeable: 1 });
+  });
+
+  it("connected AND recording:automatic → DISPATCHES via inputState (the real bridge source)", async () => {
+    const h = harness({ states: { u1: DISCONNECTED_LOOKING }, inputState: "connected", recordingMode: "automatic" });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(h.starts).toHaveLength(1);
+    expect(r).toMatchObject({ started: 1, connectedNotBridgeable: 0 });
+    const line = h.logs.find((l) => l.msg === "stream-poll-started");
+    expect(line?.fields).toMatchObject({ via: "inputState" });
+  });
+
+  it("connected-not-bridgeable does NOT churn: no start attempt means no instance to release", async () => {
+    const h = harness({ states: { u1: DISCONNECTED_LOOKING }, inputState: "connected", recordingMode: "off" });
+    await pollStreamLifecycles(h.deps);
+    expect(h.stops).toHaveLength(0); // nothing dispatched → nothing to release → zero churn
+    expect(h.logs.map((l) => l.msg)).not.toContain("stream-poll-start-failed");
+  });
+
+  it("recording mode is read WITHOUT a second API call (same InputProbe carries state + mode)", async () => {
+    let calls = 0;
+    const h = harness({ states: { u1: DISCONNECTED_LOOKING } });
+    h.deps.probeInputState = async () => { calls++; return { state: "connected", recordingMode: "automatic" }; };
+    await pollStreamLifecycles(h.deps);
+    expect(calls).toBe(1); // one authenticated read yields both fields
   });
 });
