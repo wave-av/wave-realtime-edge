@@ -282,6 +282,37 @@ export async function sweepWhipResources(
 		const plan = planWhipSweep(entries, deps.now());
 		stats.skipped += entries.length - plan.refresh.length - plan.meter.length - plan.mark.length;
 
+		// #261 — one structured verdict line PER scanned resource, not only the billed/marked ones. The sweep
+		// previously logged an orphan-bill (whip-sweep-orphan) and a disconnect-stamp (whip-sweep-mark) but was
+		// SILENT for the refresh/skip majority, so a session that was refreshed, held idle, or judged "unknown"
+		// left no trace at all — which is precisely how #240's mis-billing hid through two misdiagnoses (the
+		// only visible signal was an aggregate {billed:N}). This makes every verdict directly observable. It is
+		// bounded by the per-tick `examined` limit (entries never exceeds it) and carries the two fields the
+		// billing decision actually turns on — lastSeenAt and the #240 disconnectedSince stamp. `action` mirrors
+		// which plan bucket the resource landed in; keep it in sync with the buckets planWhipSweep returns.
+		const meterIds = new Set(plan.meter.map((m) => m.resourceId));
+		const markIds = new Set(plan.mark.map((m) => m.resourceId));
+		const refreshIds = new Set(plan.refresh.map((r) => r.resourceId));
+		for (const { resourceId, record, verdict } of entries) {
+			const action = meterIds.has(resourceId)
+				? "bill"
+				: markIds.has(resourceId)
+					? "mark"
+					: refreshIds.has(resourceId)
+						? "refresh"
+						: "skip";
+			console.log(
+				JSON.stringify({
+					msg: "whip-sweep-verdict",
+					resourceId,
+					verdict,
+					lastSeenAt: record.lastSeenAt,
+					disconnectedSince: record.disconnectedSince,
+					action,
+				}),
+			);
+		}
+
 		// Bill the orphans FIRST (while org/startedAt/meter are still in hand), and DROP ONLY WHAT WAS ACCEPTED.
 		// An unconfirmed emit leaves the record in place so the next tick retries it; that retry is safe because
 		// the emit is idempotent on event_id = resourceId.

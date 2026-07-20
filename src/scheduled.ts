@@ -54,9 +54,14 @@ export async function scheduledHandler(
 		});
 	}
 
-	// #35 — WHIP orphan sweeper: bills publish sessions whose container died without sending a teardown
-	// DELETE (revenue integrity). Runs on EVERY tick. INERT unless WHIP_SWEEP_ENABLED + KV bound. Best-effort.
-	scheduledWhipSweep(env, ctx);
+	// #35/#260 — WHIP orphan sweeper: bills publish sessions whose container died without sending a teardown
+	// DELETE (revenue integrity). GATED to the sweep's own */5 event (isSweepOnlyTick). Both crons
+	// (*/15 + */5) fire at :00/:15/:30/:45, so scheduled() is invoked TWICE at those instants; running the
+	// sweep unconditionally raced two concurrent sweeps there (#260) — benign post-#240 (emit is idempotent on
+	// event_id) but it doubled SFU liveness probes. */5 alone already covers every 5-minute sweep instant, so
+	// gating to it keeps the exact cadence with exactly one sweep per tick. INERT unless WHIP_SWEEP_ENABLED +
+	// KV bound. Best-effort.
+	if (isSweepOnlyTick) scheduledWhipSweep(env, ctx);
 
 	// #234 — container-app WEDGE alarm (`active > 0 && healthy == 0`). Gated to the FIFTEEN-minute tick, not
 	// every tick: the signature must be SUSTAINED to mean anything, and two 15-min samples is the ~2-poll-
