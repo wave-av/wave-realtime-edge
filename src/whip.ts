@@ -21,12 +21,7 @@
 // default) → the worker's 501 catch-all is unchanged. This module is never entered.
 
 import { SfuClient, SfuError, type SessionDescription, type LocalTrack } from "./sfu.js";
-import {
-	type MeterEmitEnv,
-	isEmitProvisioned,
-	type UsageEnvelope,
-	type MeterLine,
-} from "./metering.js";
+import { type MeterEmitEnv } from "./metering.js";
 import {
 	whipRoomRecordingEnabled,
 	publishViaRoom,
@@ -34,46 +29,34 @@ import {
 	WHIP_ROOM_HEADER,
 	type WhipRoomEnv,
 } from "./whip-room.js";
+import {
+	METER_WHIP_INGEST_MINUTES,
+	resolveWhipMeter,
+	buildWhipMeterLine,
+	emitWhipTeardownMeter,
+	WHIP_METER_OVERRIDE_HEADER,
+} from "./whip-meter.js";
+import {
+	RESOURCE_ID,
+	WHIP_KV_PREFIX,
+	WHIP_KV_TTL_SECONDS,
+	type WhipKv,
+	type WhipResource,
+	loadResource,
+} from "./whip-resource.js";
 
-/** WHIP ingest meter — dedicated SKU per the frozen contract §4 (priced to STRIPE_PRICE_WHIP_INGEST_MIN). */
-export const METER_WHIP_INGEST_MINUTES = "wave_whip_ingest_minutes";
-
-/**
- * #91 B2 stream-bridge SKU — a CF-Stream→SFU bridge publish bills a DISTINCT meter (4-layer COGS; frozen
- * contract §4 / orphan-COGS-blocks-GA), NOT the bare WHIP-ingest SKU. The gateway directs it via the SEALED
- * `x-wave-meter-override` header (stamped server-side ONLY for a `stream-bridge:write` key; forward() strips
- * any client copy). The edge honors that override but ONLY against this allowset (validate-before-sink) — an
- * unknown/malformed value can NEVER be billed; it falls back to the default WHIP-ingest meter.
- */
-export const METER_STREAM_BRIDGE_MINUTES = "wave_stream_bridge_minutes";
-const WHIP_METER_OVERRIDE_ALLOW: ReadonlySet<string> = new Set([METER_STREAM_BRIDGE_MINUTES]);
-export const WHIP_METER_OVERRIDE_HEADER = "x-wave-meter-override";
-
-/** Resolve the session's billing meter from the gateway-sealed override: the named bridge SKU when present
- *  AND allowed, else the default wave_whip_ingest_minutes. Pure — the security boundary (the override is
- *  gateway-sealed, never client-supplied) is upstream; this is the defense-in-depth allowset check. */
-export function resolveWhipMeter(override: string | null | undefined): string {
-	return override && WHIP_METER_OVERRIDE_ALLOW.has(override) ? override : METER_WHIP_INGEST_MINUTES;
-}
-
-/** WHIP resource ids are opaque url-safe tokens we mint; guard before path interpolation / KV keys. */
-export const RESOURCE_ID = /^[0-9a-zA-Z_-]{8,128}$/;
-/** KV key prefix for the resourceId → session record (reuses the RT_MEETING_ORG namespace). */
-export const WHIP_KV_PREFIX = "whip:";
-/** Resource records outlive a publish session comfortably; TTL bounds the teardown window. */
-export const WHIP_KV_TTL_SECONDS = 60 * 60 * 24; // 24h
-
-/** The minimal KV surface this module needs (read/write/delete/list the resource record). Matches CF KV. */
-export interface WhipKv {
-	get(key: string): Promise<string | null>;
-	put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<void>;
-	delete(key: string): Promise<void>;
-	// #35: paginated enumeration for the orphan sweeper (same shape the other cron reconciles use).
-	list(opts: {
-		prefix?: string;
-		cursor?: string;
-	}): Promise<{ keys: { name: string }[]; list_complete: boolean; cursor?: string }>;
-}
+// Re-export the two split-out clusters' public surface so every currently-importable symbol stays importable
+// from src/whip.ts (whip-sweep.ts and tests import several of these directly).
+export {
+	METER_WHIP_INGEST_MINUTES,
+	METER_STREAM_BRIDGE_MINUTES,
+	WHIP_METER_OVERRIDE_HEADER,
+	resolveWhipMeter,
+	buildWhipMeterLine,
+	emitWhipTeardownMeter,
+	deliverWhipTeardownMeter,
+} from "./whip-meter.js";
+export { RESOURCE_ID, WHIP_KV_PREFIX, WHIP_KV_TTL_SECONDS, type WhipKv, type WhipResource, loadResource } from "./whip-resource.js";
 
 /** The subset of worker Env this module reads. SFU creds gate liveness; meter/KV are optional → INERT. */
 export interface WhipEnv extends MeterEmitEnv, WhipRoomEnv {
@@ -85,30 +68,6 @@ export interface WhipEnv extends MeterEmitEnv, WhipRoomEnv {
 	// #144 (#91-B): WHIP_ROOM_RECORDING (WhipRoomEnv) routes publish through a RoomDO room so the recorder +
 	// negotiation apply. Default-off → the direct SFU path below is byte-identical. ROOM (WhipRoomEnv) is the
 	// RoomDO binding used only on that flagged path.
-}
-
-/** A persisted WHIP resource record (resourceId → SFU session), used by PATCH/DELETE/sweep. */
-export interface WhipResource {
-	sessionId: string;
-	org: string;
-	startedAt: number; // epoch ms — start of the publish session, for the teardown meter
-	// #145 (#91-C): the RoomDO room this publish routed through (WHIP_ROOM_RECORDING path). Persisted so DELETE
-	// can address the SAME DO (`{org}:{room}`) to finalize the recorder. Absent ⇒ direct path (no recorder tap).
-	room?: string;
-	// #91 B2: the resolved billing meter, captured (gateway-sealed, allowset-validated) at publish so the
-	// teardown bills the right SKU regardless of how it fires (client DELETE or cron). Absent ⇒ default WHIP.
-	meter?: string;
-	// #35: last epoch-ms at which the sweeper OBSERVED this session alive at the SFU. The orphan sweep bills
-	// `startedAt → lastSeenAt` (never → sweep-time), so a session whose publisher died without a DELETE is
-	// billed only for time it was demonstrably live. Absent ⇒ never probed; falls back to startedAt.
-	lastSeenAt?: number;
-	// #240/#257: epoch-ms at which the sweeper first saw a DEATH signal for this session — a 410 Gone
-	// (disconnected), a 404/all-inactive ("gone"), or an aged once-alive "idle". No single probe is proven
-	// terminal (a 410 can be a transient ICE drop, tracks can flap inactive→active, a 404 can be a mis-routed
-	// probe), so the sweeper stamps this on the first death of any kind and only bills+drops once it PERSISTS
-	// past WHIP_GONE_CONFIRM_MS. Cleared ONLY by an "alive" answer (200 + active tracks); an idle 200 no longer
-	// clears it (#240 Phase-2), so a recovered blip is rescued while an ambiguous flap can never reset the clock.
-	disconnectedSince?: number;
 }
 
 /** Injectable seams so every path unit-tests with NO live network (mirrors the repo's __egressDeps pattern). */
@@ -142,104 +101,6 @@ export function whipIngestEnabled(env: WhipEnv): boolean {
 /** Typed JSON error envelope (the 201 body is SDP; every error body is JSON, mirroring the spoke contract). */
 function jsonError(code: string, message: string, status: number): Response {
 	return Response.json({ error: code, message }, { status });
-}
-
-/**
- * Build the one teardown meter line for a WHIP publish session. PURE (no I/O) so the accounting is
- * unit-testable. Duration is ceil-minutes (a started publish bills ≥1 min); idempotency = resourceId (§4).
- */
-export function buildWhipMeterLine(
-	resourceId: string,
-	startedAt: number,
-	endedAt: number,
-	meter: string = METER_WHIP_INGEST_MINUTES,
-): MeterLine {
-	const ms = endedAt - startedAt;
-	const minutes = ms > 0 ? Math.ceil(ms / 60_000) : 0;
-	return { meter, meter_value: minutes, event_id: resourceId };
-}
-
-/**
- * Emit the WHIP ingest teardown meter to the gateway `/v1/internal/usage` (same ingest the realtime tap
- * uses). FAIL-OPEN (§4): a meter failure must never affect the teardown response. Idempotent on resourceId.
- * No-op (no network) when the emit is not provisioned (GATEWAY_BASE_URL + WAVE_SERVICE_TOKEN) or value is 0.
- */
-export async function emitWhipTeardownMeter(
-	env: WhipEnv,
-	org: string,
-	line: MeterLine,
-	fetchFn: typeof fetch,
-): Promise<void> {
-	// Fail-open by contract: the client-DELETE path must never be affected by a metering failure.
-	await deliverWhipTeardownMeter(env, org, line, fetchFn);
-}
-
-/**
- * The same emit, but REPORTING whether the usage was actually accepted. The cron sweeper needs this: unlike
- * handleDelete (where the client is tearing down regardless and fail-open is correct), the sweeper OWNS the
- * only remaining record of that session's usage. If it dropped the record on an emit that silently failed,
- * the minutes would be lost forever — reintroducing the exact revenue leak this sweeper exists to close.
- * So the sweeper retries on the next tick instead, which is safe because the emit is idempotent on
- * event_id = resourceId.
- *
- * @returns true when the usage is durably accounted for (delivered, or nothing billable to deliver).
- */
-export async function deliverWhipTeardownMeter(
-	env: WhipEnv,
-	org: string,
-	line: MeterLine,
-	fetchFn: typeof fetch,
-): Promise<boolean> {
-	if (!isEmitProvisioned(env)) return false; // INERT — nothing was recorded, so nothing may be dropped
-	if (!(line.meter_value > 0)) return true; // nothing billable (zero/negative duration) → safe to drop
-	const base = (env.GATEWAY_BASE_URL as string).replace(/\/+$/, "");
-	const token = env.WAVE_SERVICE_TOKEN as string;
-	const body: UsageEnvelope = { org, usage: line };
-	try {
-		const res = await fetchFn(`${base}/v1/internal/usage`, {
-			method: "POST",
-			headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-			body: JSON.stringify(body),
-		});
-		if (!res.ok) {
-			console.warn(`whip-meter emit failed status=${res.status} org=${org}`); // loud, non-blocking
-			return false;
-		}
-		return true;
-	} catch (e) {
-		console.warn(`whip-meter emit error org=${org}: ${(e as Error)?.message ?? e}`);
-		return false;
-	}
-}
-
-/** Parse a `whip:`-prefixed KV record back into a typed WhipResource, or null on absent/corrupt. Shared by
- *  handlePatch/handleDelete here and by the orphan sweeper (src/whip-sweep.ts). */
-export async function loadResource(kv: WhipKv | undefined, resourceId: string): Promise<WhipResource | null> {
-	if (!kv) return null;
-	const raw = await kv.get(`${WHIP_KV_PREFIX}${resourceId}`);
-	if (!raw) return null;
-	try {
-		const r = JSON.parse(raw) as Partial<WhipResource>;
-		if (typeof r.sessionId === "string" && typeof r.org === "string" && typeof r.startedAt === "number") {
-			return {
-				sessionId: r.sessionId,
-				org: r.org,
-				startedAt: r.startedAt,
-				meter: typeof r.meter === "string" ? r.meter : undefined,
-				// #145: carry the room forward so DELETE can address the recorder-holding DO to finalize.
-				room: typeof r.room === "string" ? r.room : undefined,
-				// #35: carry the sweeper's last observed-alive stamp so an orphan teardown bills to it.
-				lastSeenAt: typeof r.lastSeenAt === "number" ? r.lastSeenAt : undefined,
-				// #240: carry the sweeper's first-410 stamp forward. Without this the confirm-window stamp is
-				// write-only — every sweep re-loads the record with disconnectedSince stripped, re-stamps a fresh
-				// clock, and the window NEVER closes, so a crashed orphan is never billed (proven live 2026-07-20).
-				disconnectedSince: typeof r.disconnectedSince === "number" ? r.disconnectedSince : undefined,
-			};
-		}
-	} catch {
-		/* corrupt record → treat as absent */
-	}
-	return null;
 }
 
 /**
