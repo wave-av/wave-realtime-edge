@@ -434,11 +434,17 @@ describe("pollStreamLifecycles — RTMP-connected but no videoUID (#241)", () =>
     expect(line?.fields).toMatchObject({ uid: "u1", inputState: "connected", videoUID: "unknown" });
   });
 
-  it("does NOT dispatch on it — widening mediaIsFlowing would bridge idle inputs and bill dead air", async () => {
+  it("DOES dispatch on it (#241 fix) — the authenticated probe is now load-bearing, not diagnostic-only", async () => {
+    // Superseded expectation: this used to assert NO dispatch, on the theory that widening
+    // `mediaIsFlowing` to accept the "unknown" videoUID sentinel would bridge idle inputs. That
+    // theory was correct — but the FIX taken is not to widen `mediaIsFlowing`; it's to let the
+    // independently-verified authenticated `inputState==="connected"` signal drive dispatch on its
+    // own path, alongside (not instead of) `flowing`. An idle-ready input reads `inputState:
+    // "disconnected"` and still never dispatches — see the sibling test below.
     const h = harness({ states: { u1: NO_VIDEO }, inputState: "connected" });
     const r = await pollStreamLifecycles(h.deps);
-    expect(h.starts).toHaveLength(0);
-    expect(r.started).toBe(0);
+    expect(h.starts).toHaveLength(1);
+    expect(r.started).toBe(1);
   });
 
   it("stays quiet for a genuinely idle input (disconnected) — no false positives", async () => {
@@ -478,5 +484,77 @@ describe("pollStreamLifecycles — RTMP-connected but no videoUID (#241)", () =>
     const h = harness({ states: { u1: NO_VIDEO } });
     const r = await pollStreamLifecycles(h.deps);
     expect(r).toMatchObject({ connectedNoVideo: 0, started: 0, failed: 0 });
+  });
+});
+
+describe("pollStreamLifecycles — #241 FIX: dispatch on authenticated inputState==='connected'", () => {
+  // The PROVEN root cause: WAVE inputs are all created with recording:{mode:"off"}
+  // (cf-stream-live-client.ts:128), so CF never mints a videoUID for them and the unauthenticated
+  // lifecycle endpoint reads {live:false, videoUID:null, status:"disconnected"} for the ENTIRE
+  // duration of a real RTMP push — mediaIsFlowing is structurally always false. The authenticated
+  // live_inputs API is the only reliable signal.
+  const DISCONNECTED_LOOKING = { live: false, videoUID: null, status: "disconnected" };
+
+  it("THE FIX: not flowing, inputState connected, no session → dispatchStart + openSession fire", async () => {
+    const h = harness({ states: { u1: DISCONNECTED_LOOKING }, inputState: "connected" });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(h.starts).toHaveLength(1);
+    expect(h.starts[0]).toMatchObject({ org: "org1", uid: "u1" });
+    expect(r).toMatchObject({ started: 1, failed: 0 });
+    expect(h.sessions.has("u1")).toBe(true);
+    const line = h.logs.find((l) => l.msg === "stream-poll-started");
+    expect(line?.fields).toMatchObject({ uid: "u1", via: "inputState" });
+  });
+
+  it("legacy path unchanged: flowing true, not active → still dispatches (via lifecycle)", async () => {
+    const h = harness({ states: { u1: { live: true, videoUID: "v1" } } });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(h.starts).toHaveLength(1);
+    expect(r.started).toBe(1);
+    const line = h.logs.find((l) => l.msg === "stream-poll-started");
+    expect(line?.fields).toMatchObject({ via: "lifecycle" });
+  });
+
+  it("graceful degrade: probeInputState dep omitted, not flowing → NO dispatch (today's behaviour)", async () => {
+    const h = harness({ states: { u1: DISCONNECTED_LOOKING } }); // inputState undefined → dep omitted
+    const r = await pollStreamLifecycles(h.deps);
+    expect(h.starts).toHaveLength(0);
+    expect(r).toMatchObject({ started: 0, connectedNoVideo: 0 });
+  });
+
+  it("inputState 'disconnected', not flowing → NO dispatch", async () => {
+    const h = harness({ states: { u1: DISCONNECTED_LOOKING }, inputState: "disconnected" });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(h.starts).toHaveLength(0);
+    expect(r.started).toBe(0);
+  });
+
+  it("inputState null (unreadable probe), not flowing → NO dispatch", async () => {
+    const h = harness({ states: { u1: DISCONNECTED_LOOKING }, inputState: null });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(h.starts).toHaveLength(0);
+    expect(r.started).toBe(0);
+  });
+
+  it("already active session + connected → NO duplicate dispatch (probe not even called)", async () => {
+    let probed = false;
+    const h = harness({ states: { u1: DISCONNECTED_LOOKING }, sessions: ["u1"] });
+    h.deps.probeInputState = async () => {
+      probed = true;
+      return "connected";
+    };
+    const r = await pollStreamLifecycles(h.deps);
+    expect(probed).toBe(false); // guarded by !active before the probe even runs
+    expect(h.starts).toHaveLength(0);
+    expect(r.started).toBe(0);
+  });
+
+  it("failed dispatchStart on the connected path still RELEASES the instance (#231 wedge guard)", async () => {
+    const h = harness({ states: { u1: DISCONNECTED_LOOKING }, inputState: "connected", failStart: true });
+    const r = await pollStreamLifecycles(h.deps);
+    expect(r).toMatchObject({ started: 0, failed: 1 });
+    expect(h.sessions.has("u1")).toBe(false); // retried next tick
+    expect(h.stops).toEqual([{ org: "org1", uid: "u1" }]); // the slot was handed back
+    expect(h.logs.map((l) => l.msg)).toContain("stream-poll-start-released");
   });
 });

@@ -39,7 +39,7 @@ export const MAX_INPUTS_PER_TICK = 200;
 /** Explicit timeout on every lifecycle probe — an unbounded hang would stall the whole tick. */
 export const LIFECYCLE_TIMEOUT_MS = 5_000;
 
-/** Cap on authenticated live_inputs status probes per tick (#241 detector is diagnostic, not load-bearing). */
+/** Cap on authenticated live_inputs status probes per tick (#241 detector now drives dispatch — see below). */
 export const MAX_STATE_PROBES_PER_TICK = 20;
 
 /**
@@ -99,7 +99,8 @@ export interface PollDeps {
    * The INPUT's RTMP connection state from the live_inputs API (#241) — `"connected"`, `"disconnected"`,
    * or null when unreadable. Distinct from `probeLifecycle`, which reads the unauthenticated lifecycle
    * endpoint and CANNOT tell an idle input apart from one that is receiving media without a videoUID.
-   * Optional; absent → the mismatch detector below is skipped.
+   * Optional; absent → the connected-input dispatch path (#241) is skipped entirely and behaviour is
+   * byte-identical to before: only `mediaIsFlowing` can trigger a start.
    */
   probeInputState?(uid: string): Promise<string | null>;
   log?(msg: string, fields: Record<string, unknown>): void;
@@ -113,7 +114,11 @@ export interface PollResult {
   skipped: number;
   /** Sessions the CONTAINER reported dead while the input was still live → record cleared for re-dispatch (#247). */
   revived: number;
-  /** Inputs RTMP-connected but with no concrete videoUID — a customer pushing media we are NOT bridging (#241). */
+  /**
+   * Inputs RTMP-connected with no concrete videoUID (#241). Now LOAD-BEARING, not just diagnostic:
+   * these are counted as such, but the same inputs also drive a dispatch below (`started`) unless
+   * already active — see the dispatch gate.
+   */
   connectedNoVideo: number;
   /**
    * Bridges the container CONFIRMED alive this tick (an explicit `bridging:true`).
@@ -142,8 +147,8 @@ export interface PollResult {
  */
 export async function pollStreamLifecycles(deps: PollDeps): Promise<PollResult> {
   const out: PollResult = { scanned: 0, started: 0, stopped: 0, failed: 0, skipped: 0, revived: 0, connectedNoVideo: 0, healthy: 0, healthUnknown: 0 };
-  // Bound the authenticated status probes per tick. The detector below is diagnostic, not load-bearing, and
-  // must not turn a 200-input account into 200 extra API calls every five minutes.
+  // Bound the authenticated status probes per tick. The probe now DRIVES dispatch (#241), but the cap
+  // still must not turn a 200-input account into 200 extra API calls every five minutes.
   let stateProbeBudget = MAX_STATE_PROBES_PER_TICK;
   const inputs = (await deps.listInputs()).slice(0, MAX_INPUTS_PER_TICK);
 
@@ -159,13 +164,44 @@ export async function pollStreamLifecycles(deps: PollDeps): Promise<PollResult> 
     const active = await deps.hasSession(uid).catch(() => false);
     const flowing = mediaIsFlowing(state);
 
-    if (flowing && !active) {
+    // #241 — when the unauthenticated lifecycle endpoint doesn't show flowing media, ask the
+    // AUTHENTICATED live_inputs API whether RTMP is actually connected. This is structurally required
+    // for every WAVE input: they are all created with `recording:{mode:"off"}` (cf-stream-live-client.ts),
+    // and CF NEVER mints a videoUID for a no-recording input — so `flowing` is permanently false even
+    // while a customer is live-pushing. Proven live 2026-07-19/2026-07-20: a 13-minute ffmpeg push read
+    // `{live:false,videoUID:null,status:"disconnected"}` on the lifecycle endpoint for the ENTIRE window
+    // while the authenticated API correctly reported `state:"connected"` immediately. `inputState` is now
+    // LOAD-BEARING — it drives dispatch below, not just the diagnostic log it used to feed exclusively.
+    let inputState: string | null = null;
+    if (!flowing && !active && deps.probeInputState && stateProbeBudget > 0) {
+      stateProbeBudget--;
+      inputState = await deps.probeInputState(uid).catch(() => null);
+      if (inputState === "connected") {
+        out.connectedNoVideo++;
+        deps.log?.("stream-poll-connected-no-video", {
+          uid,
+          org,
+          inputState,
+          videoUID: state.videoUID,
+          status: state.status ?? null,
+        });
+      }
+    }
+    const connectedNoLifecycle = inputState === "connected";
+
+    if ((flowing || connectedNoLifecycle) && !active) {
       const room = bridgeRoomFor(uid); // deterministic → a duplicate start joins the same room
       try {
         await deps.dispatchStart(org, uid, room);
         await deps.openSession(uid, org, room);
         out.started++;
-        deps.log?.("stream-poll-started", { uid, org, room, videoUID: state.videoUID });
+        deps.log?.("stream-poll-started", {
+          uid,
+          org,
+          room,
+          videoUID: state.videoUID,
+          via: flowing ? "lifecycle" : "inputState",
+        });
       } catch (err) {
         // No session recorded → the next tick retries. Loud, never silent.
         out.failed++;
@@ -220,37 +256,6 @@ export async function pollStreamLifecycles(deps: PollDeps): Promise<PollResult> 
         deps.log?.("stream-poll-bridge-dead", { uid, org, tracks: health.tracks, videoUID: state.videoUID });
       }
       continue;
-    }
-
-    // #241 — RTMP-CONNECTED BUT NO videoUID: a customer is pushing real media and we are not bridging it.
-    //
-    // Observed 2026-07-19: a 13-minute push, ffmpeg exit 0, CF reporting {"state":"connected"} the whole
-    // window — and ZERO dispatches, because CF never minted a videoUID. Every tick logged
-    // {"scanned":7,"started":0,"failed":0,"skipped":0}, which is byte-identical to a quiet night. The
-    // customer's stream was up; from our telemetry nothing was wrong.
-    //
-    // The lifecycle endpoint alone CANNOT distinguish this: an idle-ready input and a receiving-but-unminted
-    // input can both read {live:true, videoUID:"unknown"}. Only the authenticated live_inputs API carries the
-    // RTMP connection state (`.result.status.current.state`, verified against the live API), so the detector
-    // needs that second probe — which is exactly why this state was invisible for so long.
-    //
-    // DIAGNOSTIC ONLY. It deliberately does NOT dispatch. Widening mediaIsFlowing to accept the "unknown"
-    // sentinel would bridge idle inputs, burning container instances and billing customers for dead air —
-    // the fail-safe direction is the one already coded, and the real fix belongs upstream of the check.
-    // What this does is turn an ABSENCE into a named, queryable condition.
-    if (!flowing && !active && deps.probeInputState && stateProbeBudget > 0) {
-      stateProbeBudget--;
-      const inputState = await deps.probeInputState(uid).catch(() => null);
-      if (inputState === "connected") {
-        out.connectedNoVideo++;
-        deps.log?.("stream-poll-connected-no-video", {
-          uid,
-          org,
-          inputState,
-          videoUID: state.videoUID,
-          status: state.status ?? null,
-        });
-      }
     }
 
     if (!flowing && active) {
