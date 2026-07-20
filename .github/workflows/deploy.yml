@@ -6,7 +6,8 @@ name: deploy
 # established sibling pattern (wave-acuity-edge/.github/workflows/deploy.yml).
 #
 # What this does:
-#   1. npm ci || npm install   (standalone worker — NO @wave-av/* deps, so no GitHub Packages auth)
+#   1. .npmrc + npm ci || npm install   (#258 added the private @wave-av/spoke-chassis dep, so this
+#      needs GitHub Packages auth — packages:read + NODE_AUTH_TOKEN + .npmrc, mirroring contract-tests.yml)
 #   2. typecheck + test (re-run the gate before a real deploy)
 #   3. wrangler deploy
 #      wrangler reads wrangler.toml: name, main, routes (rt.wave.online custom_domain), the Durable Object
@@ -41,6 +42,7 @@ on:
 
 permissions:
   contents: read
+  packages: read # @wave-av/spoke-chassis is a private GitHub Packages dep (added in #258)
 
 concurrency:
   group: deploy-wave-realtime-edge
@@ -50,6 +52,8 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -58,6 +62,12 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
+
+      # #258 added @wave-av/spoke-chassis (private scope). Without a .npmrc pointing the @wave-av scope at
+      # GitHub Packages with a read token, `npm ci` 401s and the deploy never runs. Mirrors the proven
+      # pattern in contract-tests.yml / governance-enforce.yml. NODE_AUTH_TOKEN is substituted by npm at read time.
+      - name: Authenticate to GitHub Packages for the @wave-av scope
+        run: printf '@wave-av:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}\n' > .npmrc
 
       - name: install
         run: npm ci || npm install
