@@ -20,7 +20,7 @@
 // INERT (§3 tail, §6-B3): the whole surface is reached ONLY when `WHIP_INGEST_ENABLED` is truthy. Off (the
 // default) → the worker's 501 catch-all is unchanged. This module is never entered.
 
-import { SfuClient, SfuError, type SessionDescription } from "./sfu.js";
+import { SfuClient, SfuError, type SessionDescription, type LocalTrack } from "./sfu.js";
 import {
 	type MeterEmitEnv,
 	isEmitProvisioned,
@@ -244,6 +244,39 @@ export async function loadResource(kv: WhipKv | undefined, resourceId: string): 
  *
  * AUTH is enforced by the worker (gatewayGate) BEFORE this runs — org arrives via x-wave-org.
  */
+/**
+ * #240 branch-A: parse a WHIP offer's `m=` media sections into CF Realtime `LocalTrack` push requests.
+ * Walks the SDP line-by-line; for each `audio`/`video` `m=` section, captures the FIRST `a=mid:<value>`
+ * line that follows (stopping at the next `m=` line or end of SDP) and mints `{location:"local", mid,
+ * trackName: "<resourceId>-<mid>"}`. `m=application` (datachannel) sections are ignored — they carry no
+ * media track. An offer with no media sections (or none with a mid) returns `[]`; the caller must treat
+ * that as a hard failure (nothing to push).
+ */
+export function parseOfferMids(offer: SessionDescription, resourceId: string): LocalTrack[] {
+	const lines = offer.sdp.split(/\r?\n/);
+	const tracks: LocalTrack[] = [];
+	let inMediaSection = false;
+	let sectionIsTrackable = false;
+	let sectionHasMid = false;
+	for (const line of lines) {
+		if (line.startsWith("m=")) {
+			inMediaSection = true;
+			sectionHasMid = false;
+			// m=<media> <port> <proto> ... — only "audio"/"video" kinds carry a pushable track.
+			const kind = line.slice(2).split(" ")[0];
+			sectionIsTrackable = kind === "audio" || kind === "video";
+			continue;
+		}
+		if (!inMediaSection || !sectionIsTrackable || sectionHasMid) continue;
+		const midMatch = /^a=mid:(\S+)/.exec(line);
+		if (midMatch) {
+			sectionHasMid = true;
+			tracks.push({ location: "local", mid: midMatch[1], trackName: `${resourceId}-${midMatch[1]}` });
+		}
+	}
+	return tracks;
+}
+
 async function handlePublish(request: Request, env: WhipEnv, deps: WhipDeps, org: string): Promise<Response> {
 	const ct = (request.headers.get("content-type") ?? "").toLowerCase();
 	if (!ct.includes("application/sdp")) {
@@ -288,11 +321,56 @@ async function handlePublish(request: Request, env: WhipEnv, deps: WhipDeps, org
 			sessionId = routed.sessionId;
 			answerSdp = routed.answerSdp;
 		} else {
-			// Direct path (UNCHANGED): newSession(offer) creates the SFU session FROM the publisher's offer and
-			// returns the SFU's answer (verbatim SDP passthrough). The publisher's offered tracks are pushed in
-			// the same negotiation (a second pushTracks is a no-op here). Media terminates at the SFU.
-			const session = await sfu.newSession(offer);
-			const answer = session.sessionDescription;
+			// Direct path (#240 branch-A): newSession() with NO offer creates an EMPTY SFU session (no SDP
+			// exchange yet) -- the prior "newSession(offer) pushes tracks in the same negotiation" comment was
+			// WRONG (disproved live: GET /sessions/{id} came back {"tracks":[]} for the session's whole life,
+			// which is why the orphan sweeper could never see an "alive" verdict). The publisher's offer is
+			// instead relayed via pushTracks, which registers LOCAL tracks against the session AND carries the
+			// SDP exchange -- so this is STILL exactly one offer/answer round-trip from the WHIP client's view
+			// (no server-initiated renegotiation is introduced).
+			//
+			// Validate the offer BEFORE minting a CF session (#254 review): parseOfferMids used to run AFTER
+			// newSession(), so a medialess offer left a real CF Realtime session behind with NO KV record —
+			// unreachable to the sweeper (kv.list({prefix}) is its only discovery mechanism) and therefore
+			// leaked forever.
+			const localTracks = parseOfferMids(offer, resourceId);
+			if (localTracks.length === 0) {
+				return jsonError("REALTIME_UPSTREAM", "offer carried no media sections", 502);
+			}
+			const session = await sfu.newSession();
+			// #254 review (finding 1): persist a sweeper-reachable KV record IMMEDIATELY after the CF session
+			// exists, BEFORE pushTracks — not only after a successful push. A track-less session is NOT GC'd by
+			// CF on idle (see sfu.ts sessionLiveness: CF keeps answering 200/tracks:[] indefinitely); the ONLY
+			// cleanup path is the whip-sweep 410/disconnected flow (#240/#253), and that sweep discovers
+			// candidates solely via kv.list({prefix}) — so a session with no KV row is invisible to it forever.
+			// Deliberately conservative: lastSeenAt/disconnectedSince are left unset (never "verified alive"),
+			// so if pushTracks below throws, the sweeper will find this record, confirm the SFU's 410, and
+			// bill+drop it for at most the minimal `startedAt+1` window (whip-sweep.ts:197) rather than treating
+			// it as ever having been live.
+			const preMeter = resolveWhipMeter(request.headers.get(WHIP_METER_OVERRIDE_HEADER));
+			const preRecord: WhipResource = { sessionId: session.sessionId, org, startedAt: deps.now(), meter: preMeter };
+			try {
+				await env.RT_MEETING_ORG?.put(`${WHIP_KV_PREFIX}${resourceId}`, JSON.stringify(preRecord), {
+					expirationTtl: WHIP_KV_TTL_SECONDS,
+				});
+			} catch (e) {
+				console.warn(`whip-resource pre-push persist failed resourceId=${resourceId}: ${(e as Error)?.message ?? e}`);
+			}
+			let pushed;
+			try {
+				pushed = await sfu.pushTracks(session.sessionId, localTracks, offer);
+			} catch (e) {
+				// newSession succeeded but pushTracks failed -> an orphaned empty session at the SFU. SfuClient
+				// has no closeSession, so we can't close it inline; the KV record written above (pre-pushTracks)
+				// is what makes this orphan sweeper-reachable — the sweeper will see the SFU 410, confirm it
+				// persists past WHIP_GONE_CONFIRM_MS, and bill+drop it. Log loudly so this is visible, then
+				// re-throw so the caller gets the real upstream error.
+				console.warn(
+					`whip-publish pushTracks failed after newSession sessionId=${session.sessionId} resourceId=${resourceId}: ${(e as Error)?.message ?? e}`,
+				);
+				throw e;
+			}
+			const answer = pushed.sessionDescription;
 			if (!answer || answer.type !== "answer" || !answer.sdp) {
 				return jsonError("REALTIME_UPSTREAM", "SFU did not return an SDP answer", 503);
 			}
