@@ -180,7 +180,10 @@ export class SfuClient {
    * FOUR-STATE by design (this is a BILLING decision, so ambiguity must never close a live session):
    *   "gone"    — the SFU 404s the session, or every track is inactive. Unambiguously over.
    *   "alive"   — the session answers and still has a non-inactive track.
-   *   "idle"    — the session answers but reports ZERO tracks.
+   *   "idle"    — the session answers (200) but reports ZERO tracks.
+   *   "disconnected" — the SFU answers 410 Gone (the session's PeerConnection is disconnected). NOT proven
+   *               terminal (a transient ICE drop can 410 then recover), so the sweeper confirms it persists
+   *               across a window before closing — see whip-sweep.ts.
    *   "unknown" — any transport/parse/non-5xx-classifiable failure. The sweeper treats this as ALIVE.
    *
    * "idle" exists because of a LIVE-OBSERVED CF behaviour (#35, 2026-07-18): when a publisher dies without
@@ -191,10 +194,20 @@ export class SfuClient {
    * publish can legitimately have no tracks yet — only the caller knows the session's age, so only the
    * caller can safely age it out.
    *
+   * A DISTINCT signal exists that "idle" cannot see (#240, live-verified 2026-07-19): when the WHIP session's
+   * PeerConnection is disconnected, CF Realtime answers 410 Gone with `{"errorCode":"session_error", ...}`,
+   * whereas a LIVE trackless publish answers 200 `{"tracks":[],"dataChannels":[]}`. So for a session that
+   * never registers tracks, the HTTP status is the discriminator: 200 ⇒ "idle", 410 ⇒ "disconnected". 410 is
+   * kept SEPARATE from "gone" (404/all-inactive, unambiguously terminal) because a transient ICE disconnect
+   * can also answer 410 yet self-recover — the sweeper must confirm the 410 persists before it bills+drops
+   * (whip-sweep.ts), or it would forfeit a live session's whole bill. (This still does NOT resolve the #35
+   * case — a publisher that dies WITHOUT its PC tearing down, where CF lingers at 200/`tracks:[]`; that reads
+   * "idle" and needs a separate liveness mechanism.)
+   *
    * Deliberately does NOT reuse `call()`: that helper throws one uniform SfuError on every non-2xx, which
    * cannot distinguish "404 → the session is legitimately over" from "502 → we simply could not tell".
    */
-  async sessionLiveness(sessionId: string): Promise<"alive" | "gone" | "idle" | "unknown"> {
+  async sessionLiveness(sessionId: string): Promise<"alive" | "gone" | "idle" | "disconnected" | "unknown"> {
     if (!SESSIONID.test(sessionId)) return "unknown"; // never bill/close on a malformed id
     const doFetch = this.fetchImpl; // detach from `this` (see call() — global fetch rejects a bound receiver)
     let res: Response;
@@ -206,7 +219,11 @@ export class SfuClient {
     } catch {
       return "unknown"; // transport failure — cannot tell, so the sweeper must assume the session is live
     }
-    if (res.status === 404) return "gone"; // the SFU no longer knows this session → the publish is over
+    if (res.status === 404) return "gone"; // the SFU no longer knows this id → unambiguously over
+    // 410 Gone = the session's PeerConnection is disconnected (#240, live-verified 2026-07-19). NOT proven
+    // terminal — a transient ICE drop can 410 then recover — so it is reported SEPARATELY; whip-sweep.ts
+    // confirms it persists before billing+dropping. Other non-ok (401/403/429/5xx) stay "unknown".
+    if (res.status === 410) return "disconnected";
     if (!res.ok) return "unknown";
     let json: unknown = null;
     try {
