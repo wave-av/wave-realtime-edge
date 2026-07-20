@@ -248,9 +248,9 @@ describe("SfuClient.sessionLiveness", () => {
 	});
 
 	// #240 — live-verified 2026-07-19: a disconnected WHIP session (PeerConnection gone) answers 410 Gone,
-	// while a live trackless publish answers 200. Before this fix, 410 fell into `!res.ok → "unknown"` and
-	// the sweeper treated a dead orphan as ALIVE until the 24h TTL. 410 must map to "gone" like 404.
-	it("410 Gone (disconnected PeerConnection) → gone", async () => {
+	// while a live trackless publish answers 200. 410 maps to a SEPARATE "disconnected" verdict (NOT "gone"),
+	// because a transient ICE drop can also 410 then recover — whip-sweep.ts confirms it persists before billing.
+	it("410 Gone (disconnected PeerConnection) → disconnected", async () => {
 		const c = new SfuClient(
 			CFG,
 			stub(() =>
@@ -260,7 +260,7 @@ describe("SfuClient.sessionLiveness", () => {
 				),
 			),
 		);
-		expect(await c.sessionLiveness(SESSION)).toBe("gone");
+		expect(await c.sessionLiveness(SESSION)).toBe("disconnected");
 	});
 
 	it("other non-ok (500) → unknown (must NOT close a session on a server error)", async () => {

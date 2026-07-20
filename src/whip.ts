@@ -102,6 +102,11 @@ export interface WhipResource {
 	// `startedAt → lastSeenAt` (never → sweep-time), so a session whose publisher died without a DELETE is
 	// billed only for time it was demonstrably live. Absent ⇒ never probed; falls back to startedAt.
 	lastSeenAt?: number;
+	// #240: epoch-ms at which the sweeper first saw this session answer 410 Gone (PeerConnection disconnected).
+	// A single 410 is NOT proven terminal (a transient ICE drop can 410 then recover), so the sweeper stamps
+	// this on the first 410 and only bills+drops once it PERSISTS past WHIP_GONE_CONFIRM_MS. Cleared the moment
+	// the session answers 200 again (alive/idle) so a recovered blip never bills on a stale timestamp.
+	disconnectedSince?: number;
 }
 
 /** Injectable seams so every path unit-tests with NO live network (mirrors the repo's __egressDeps pattern). */

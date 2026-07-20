@@ -68,7 +68,7 @@ describe("planWhipSweep — billing rules", () => {
 	it("does NOTHING on an unknown verdict — no bill, no drop, and no unverified lastSeenAt refresh", () => {
 		// Refreshing here would silently inflate a LATER orphan bill with time we never actually verified.
 		const plan = planWhipSweep([entry({ verdict: "unknown" })], START + 9 * MIN);
-		expect(plan).toEqual({ refresh: [], meter: [], drop: [] });
+		expect(plan).toEqual({ refresh: [], meter: [], drop: [], mark: [] });
 	});
 
 	// LIVE-OBSERVED (#35, 2026-07-18): when a publisher dies without a teardown, CF Realtime does NOT 404 the
@@ -90,7 +90,7 @@ describe("planWhipSweep — billing rules", () => {
 		// and must NOT be refreshed either, or dead air would later be billed as real.
 		const observedAt = START + 30_000; // 30s old
 		const plan = planWhipSweep([entry({ verdict: "idle", observedAt })], observedAt);
-		expect(plan).toEqual({ refresh: [], meter: [], drop: [] });
+		expect(plan).toEqual({ refresh: [], meter: [], drop: [], mark: [] });
 	});
 
 	it("NEVER refreshes lastSeenAt on an idle session (that pollution would bill dead air)", () => {
@@ -122,6 +122,99 @@ describe("planWhipSweep — billing rules", () => {
 	});
 });
 
+describe("planWhipSweep — #240 disconnected (410) confirmation gate", () => {
+	it("a first 410 stamps disconnectedSince and does NOT bill or drop", () => {
+		const observedAt = START + 5 * MIN;
+		const plan = planWhipSweep([entry({ verdict: "disconnected", observedAt })], observedAt);
+		expect(plan.meter).toHaveLength(0);
+		expect(plan.drop).toHaveLength(0);
+		expect(plan.refresh).toHaveLength(0);
+		expect(plan.mark).toHaveLength(1);
+		expect(plan.mark[0].reason).toBe("disconnected-first-seen");
+		expect(plan.mark[0].record.disconnectedSince).toBe(observedAt);
+	});
+
+	it("a 410 still within the confirm window does nothing (waits for it to persist)", () => {
+		const firstSeen = START + 5 * MIN;
+		const observedAt = firstSeen + 3 * MIN; // < the 4-min confirm window
+		const plan = planWhipSweep(
+			[entry({ verdict: "disconnected", observedAt, record: { disconnectedSince: firstSeen } as never })],
+			observedAt,
+		);
+		expect(plan).toEqual({ refresh: [], meter: [], drop: [], mark: [] });
+	});
+
+	it("a 410 persisted past the confirm window bills+drops exactly like gone", () => {
+		const firstSeen = START + 5 * MIN;
+		const observedAt = firstSeen + 5 * MIN; // >= the 4-min confirm window
+		const plan = planWhipSweep(
+			[entry({ verdict: "disconnected", observedAt, record: { disconnectedSince: firstSeen, lastSeenAt: START + 2 * MIN } as never })],
+			observedAt,
+		);
+		expect(plan.meter).toHaveLength(1);
+		expect(plan.meter[0].verdict).toBe("disconnected");
+		expect(plan.meter[0].line.meter_value).toBe(2); // to the last VERIFIED sighting, never sweep-time
+		expect(plan.drop).toEqual(["res00000abc"]);
+		expect(plan.mark).toHaveLength(0);
+	});
+
+	it("a persisted 410 never seen alive bills the 1-min floor with neverSeenAlive", () => {
+		const firstSeen = START + 5 * MIN;
+		const observedAt = firstSeen + 10 * MIN;
+		const plan = planWhipSweep(
+			[entry({ verdict: "disconnected", observedAt, record: { disconnectedSince: firstSeen } as never })],
+			observedAt,
+		);
+		expect(plan.meter[0].line.meter_value).toBe(1);
+		expect(plan.meter[0].neverSeenAlive).toBe(true);
+		expect(plan.drop).toEqual(["res00000abc"]);
+	});
+
+	it("an alive verdict clears a pending disconnect stamp (recovered)", () => {
+		const observedAt = START + 8 * MIN;
+		const plan = planWhipSweep(
+			[entry({ verdict: "alive", observedAt, record: { disconnectedSince: START + 5 * MIN } as never })],
+			observedAt,
+		);
+		expect(plan.refresh).toHaveLength(1);
+		expect(plan.refresh[0].record.disconnectedSince).toBeUndefined();
+		expect(plan.refresh[0].record.lastSeenAt).toBe(observedAt);
+		expect(plan.meter).toHaveLength(0);
+	});
+
+	it("an idle (200) answer clears a pending disconnect stamp without billing", () => {
+		const observedAt = START + 8 * MIN;
+		const plan = planWhipSweep(
+			[entry({ verdict: "idle", observedAt, record: { disconnectedSince: START + 5 * MIN } as never })],
+			observedAt,
+		);
+		expect(plan.meter).toHaveLength(0);
+		expect(plan.drop).toHaveLength(0);
+		expect(plan.mark).toHaveLength(1);
+		expect(plan.mark[0].reason).toBe("reconnected");
+		expect(plan.mark[0].record.disconnectedSince).toBeUndefined();
+	});
+
+	it("an unknown verdict leaves a pending disconnect stamp intact (never erased on a guess)", () => {
+		const plan = planWhipSweep(
+			[entry({ verdict: "unknown", record: { disconnectedSince: START + 5 * MIN } as never })],
+			START + 9 * MIN,
+		);
+		expect(plan).toEqual({ refresh: [], meter: [], drop: [], mark: [] });
+	});
+
+	it("an aged-out idle with a stale disconnect stamp bills+drops and does NOT also mark (no put/delete race)", () => {
+		const observedAt = START + 30 * MIN;
+		const plan = planWhipSweep(
+			[entry({ verdict: "idle", observedAt, record: { lastSeenAt: START + 6 * MIN, disconnectedSince: START + 5 * MIN } as never })],
+			observedAt,
+		);
+		expect(plan.meter).toHaveLength(1);
+		expect(plan.drop).toEqual(["res00000abc"]);
+		expect(plan.mark).toHaveLength(0);
+	});
+});
+
 // #233 — the sweeper billed LIVE sessions a flat minute and destroyed their records.
 //
 // GROUND TRUTH (live probe, 2026-07-19): a WHIP publish is created with `newSession(offer)` and never
@@ -139,7 +232,7 @@ describe("planWhipSweep — an idle verdict alone must never bill a live session
 		// long past the grace window, media still flowing. The old code billed 1 minute and dropped it.
 		const observedAt = START + 45 * MIN;
 		const plan = planWhipSweep([entry({ verdict: "idle", observedAt })], observedAt);
-		expect(plan).toEqual({ refresh: [], meter: [], drop: [] });
+		expect(plan).toEqual({ refresh: [], meter: [], drop: [], mark: [] });
 	});
 
 	it("above all does not DROP that record — dropping is what disarms the real teardown meter", () => {

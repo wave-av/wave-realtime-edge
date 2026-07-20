@@ -38,6 +38,16 @@ const WHIP_SWEEP_CURSOR_KEY = "whipsweep:cursor";
 const WHIP_IDLE_GRACE_MS = 3 * 60_000; // 3 min
 
 /**
+ * #240 — how long a session must CONTINUOUSLY answer 410 Gone (PeerConnection disconnected) before the sweeper
+ * treats it as a dead orphan and bills+drops it. Deliberately just UNDER the 5-min sweep interval so a 410 seen
+ * on two consecutive sweeps confirms, while a transient ICE disconnect that recovers by the next sweep (answers
+ * 200 in between → stamp cleared) never bills. A single 410 is NOT proof of death: unlike a 404, CF also emits
+ * 410 for a recoverable ICE `disconnected` blip. Under-confirming (waiting a sweep) only delays revenue; over-
+ * eager billing forfeits a live session's WHOLE bill (its later teardown DELETE finds no record → 204, no usage).
+ */
+const WHIP_GONE_CONFIRM_MS = 4 * 60_000; // 4 min (< the */5 sweep interval → requires two consecutive 410 sweeps)
+
+/**
  * #35 — the dedicated cron expression for the orphan sweep. MUST stay byte-identical to the second entry in
  * wrangler.toml `crons`, since scheduledHandler compares `event.cron` against it to keep the pre-existing
  * fifteen-minute reconciles on their original cadence.
@@ -69,7 +79,7 @@ export interface WhipSweepEntry {
 	resourceId: string;
 	record: WhipResource;
 	/** SFU liveness verdict (see SfuClient.sessionLiveness). "unknown" ⇒ we could not tell. */
-	verdict: "alive" | "gone" | "idle" | "unknown";
+	verdict: "alive" | "gone" | "idle" | "disconnected" | "unknown";
 	/**
 	 * Epoch ms captured immediately BEFORE this session's own probe. Stamped per-entry rather than once per
 	 * page because a page of probes takes real time: a single post-loop timestamp would credit the first
@@ -95,17 +105,28 @@ export interface WhipSweepPlan {
 	}[];
 	/** Resource ids whose KV record should be deleted (always the billed ones). */
 	drop: string[];
+	/**
+	 * #240 — record writebacks that are NOT alive-refreshes: stamping `disconnectedSince` on a first 410, or
+	 * clearing it when the session answers 200 again. Kept a separate bucket (not `refresh`) so the sweep log
+	 * counts them honestly and never reports a disconnect-stamp as a live sighting (#233 truthful-logging).
+	 */
+	mark: { resourceId: string; record: WhipResource; reason: "disconnected-first-seen" | "reconnected" }[];
 }
 
 /**
  * #35 — decide, PURELY, what to do with each probed WHIP resource. No I/O, so the billing rules are
  * unit-testable in isolation (mirrors buildWhipMeterLine's pure-accounting stance).
  *
- * The three verdicts map to deliberately asymmetric actions, because this is a BILLING boundary:
+ * The verdicts map to deliberately asymmetric actions, because this is a BILLING boundary:
  *  - "alive"   → refresh lastSeenAt to `now`. We just verified it, so it is safe to bill up to here later.
  *  - "gone"    → bill `startedAt → lastSeenAt` and drop. NEVER bill to `now`: the publisher died at some
  *                unknown point since the last verified sighting, so billing to sweep-time would charge for
  *                dead air. Under-billing by at most one sweep interval is the correct error direction.
+ *  - "disconnected" (410) → stamp `disconnectedSince` and WAIT. Only bill+drop (exactly like "gone") once the
+ *                410 has persisted past WHIP_GONE_CONFIRM_MS; a 200 answer in between clears the stamp. This
+ *                keeps a transient ICE blip from forfeiting a live session's whole bill (#240).
+ *  - "idle"    → answered 200 with no tracks: bill only if previously seen alive AND past the grace window
+ *                (else survives); clears any disconnect stamp, since a 200 answer proves it is not disconnected.
  *  - "unknown" → do NOTHING (no refresh, no bill). Refreshing on an unverified probe would silently inflate
  *                a later orphan bill; billing on it could close a session that is actually live. The record
  *                simply survives to the next tick (and the 24h KV TTL bounds it).
@@ -114,13 +135,28 @@ export interface WhipSweepPlan {
  * the documented ≥1 ceil-minute for a started publish, rather than silently billing zero.
  */
 export function planWhipSweep(entries: WhipSweepEntry[], now: number): WhipSweepPlan {
-	const plan: WhipSweepPlan = { refresh: [], meter: [], drop: [] };
+	const plan: WhipSweepPlan = { refresh: [], meter: [], drop: [], mark: [] };
 	for (const { resourceId, record, verdict, observedAt } of entries) {
-		if (verdict === "unknown") continue; // cannot tell → never act on a guess
+		const at = observedAt ?? now;
+		if (verdict === "unknown") continue; // cannot tell → never act on a guess (any disconnect stamp survives)
 		if (verdict === "alive") {
 			// Stamp the instant THIS session was probed, never the page-wide `now` (see WhipSweepEntry.observedAt).
-			plan.refresh.push({ resourceId, record: { ...record, lastSeenAt: observedAt ?? now } });
+			// Verified live ⇒ clear any pending disconnect stamp (the session recovered; JSON.stringify drops it).
+			plan.refresh.push({ resourceId, record: { ...record, lastSeenAt: at, disconnectedSince: undefined } });
 			continue;
+		}
+		if (verdict === "disconnected") {
+			// #240 — 410 Gone: the PeerConnection is disconnected. Unlike 404 this is NOT proven terminal (a
+			// transient ICE drop can 410 then recover), so a single 410 may NOT bill+drop — that would forfeit a
+			// live session's whole bill (its later teardown DELETE would find no record → 204, no usage). Stamp
+			// the first 410 and wait; only once it PERSISTS past the confirm window (a recovered blip would have
+			// answered 200 in between and cleared the stamp) does it bill exactly like a "gone" session.
+			if (record.disconnectedSince === undefined) {
+				plan.mark.push({ resourceId, record: { ...record, disconnectedSince: at }, reason: "disconnected-first-seen" });
+				continue;
+			}
+			if (at - record.disconnectedSince < WHIP_GONE_CONFIRM_MS) continue; // still within the confirm window
+			// else: confirmed persistently disconnected → fall through to the "gone" billing path.
 		}
 		if (verdict === "idle") {
 			// An "idle" verdict means the SFU answered but listed no tracks. That was read as "the publisher
@@ -140,11 +176,20 @@ export function planWhipSweep(entries: WhipSweepEntry[], now: number): WhipSweep
 			// least once. With no such sighting the tracks array tells us nothing, which is precisely the
 			// "unknown" case this module already refuses to act on: no refresh, no bill, record survives to
 			// the next tick (and the 24h KV TTL still bounds it).
-			if (record.lastSeenAt === undefined) continue;
+			// Answering 200 (even trackless) means the session is NOT PC-disconnected → clear any pending 410
+			// stamp so a later 410 restarts the confirm clock from scratch (never bills on a stale timestamp
+			// that spanned a live moment). Done only on the non-billing exits below; a billed idle is dropped.
+			if (record.lastSeenAt === undefined) {
+				if (record.disconnectedSince !== undefined) plan.mark.push({ resourceId, record: { ...record, disconnectedSince: undefined }, reason: "reconnected" });
+				continue;
+			}
 			// Below the grace window an empty track list is normal mid-negotiation, so leave it alone.
 			// CRITICALLY, an idle session is NEVER refreshed: bumping lastSeenAt here would silently convert
 			// dead air into billable minutes, since the session can sit idle indefinitely.
-			if ((observedAt ?? now) - record.startedAt <= WHIP_IDLE_GRACE_MS) continue;
+			if (at - record.startedAt <= WHIP_IDLE_GRACE_MS) {
+				if (record.disconnectedSince !== undefined) plan.mark.push({ resourceId, record: { ...record, disconnectedSince: undefined }, reason: "reconnected" });
+				continue;
+			}
 			// else: fall through and bill it exactly like a "gone" session.
 		}
 		// "gone": bill to the last VERIFIED-alive instant, never to `now`. Floor at startedAt+1ms so an
@@ -232,7 +277,7 @@ export async function sweepWhipResources(
 		}
 
 		const plan = planWhipSweep(entries, deps.now());
-		stats.skipped += entries.length - plan.refresh.length - plan.meter.length;
+		stats.skipped += entries.length - plan.refresh.length - plan.meter.length - plan.mark.length;
 
 		// Bill the orphans FIRST (while org/startedAt/meter are still in hand), and DROP ONLY WHAT WAS ACCEPTED.
 		// An unconfirmed emit leaves the record in place so the next tick retries it; that retry is safe because
@@ -262,6 +307,19 @@ export async function sweepWhipResources(
 				await kv.delete(`${WHIP_KV_PREFIX}${resourceId}`);
 			} catch (e) {
 				console.warn(`whip-sweep drop failed resourceId=${resourceId}: ${(e as Error)?.message ?? e}`);
+			}
+		}
+		// #240 — persist disconnect-stamp writes (first-410 stamp / 200-recovery clear) on a DISJOINT set of
+		// resources from refresh/drop. NOT counted as refreshed (not live sightings); each logs its reason so
+		// the sweep never presents a pending-close or a recovery as an alive session (#233 truthful-logging).
+		for (const { resourceId, record, reason } of plan.mark) {
+			try {
+				await kv.put(`${WHIP_KV_PREFIX}${resourceId}`, JSON.stringify(record), {
+					expirationTtl: WHIP_KV_TTL_SECONDS,
+				});
+				console.log(JSON.stringify({ msg: "whip-sweep-mark", resourceId, reason }));
+			} catch (e) {
+				console.warn(`whip-sweep mark failed resourceId=${resourceId}: ${(e as Error)?.message ?? e}`);
 			}
 		}
 		// Persist refreshed sightings (preserving the original TTL window).
