@@ -257,9 +257,9 @@ function whipDeps(): { deps: WhipDeps; newSessionCalls: number } {
       ({
         newSession: async () => {
           newSessionCalls++;
-          return { sessionId: "sessDirect1", sessionDescription: { type: "answer", sdp: DIRECT_ANSWER } };
+          return { sessionId: "sessDirect1" };
         },
-        pushTracks: async () => ({ tracks: [] }),
+        pushTracks: async () => ({ tracks: [], sessionDescription: { type: "answer", sdp: DIRECT_ANSWER } }),
       }) as never,
     now: () => 1_000_000,
     mintResourceId: () => "res00000001",

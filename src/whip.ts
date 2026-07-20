@@ -20,7 +20,7 @@
 // INERT (§3 tail, §6-B3): the whole surface is reached ONLY when `WHIP_INGEST_ENABLED` is truthy. Off (the
 // default) → the worker's 501 catch-all is unchanged. This module is never entered.
 
-import { SfuClient, SfuError, type SessionDescription } from "./sfu.js";
+import { SfuClient, SfuError, type SessionDescription, type LocalTrack } from "./sfu.js";
 import {
 	type MeterEmitEnv,
 	isEmitProvisioned,
@@ -244,6 +244,39 @@ export async function loadResource(kv: WhipKv | undefined, resourceId: string): 
  *
  * AUTH is enforced by the worker (gatewayGate) BEFORE this runs — org arrives via x-wave-org.
  */
+/**
+ * #240 branch-A: parse a WHIP offer's `m=` media sections into CF Realtime `LocalTrack` push requests.
+ * Walks the SDP line-by-line; for each `audio`/`video` `m=` section, captures the FIRST `a=mid:<value>`
+ * line that follows (stopping at the next `m=` line or end of SDP) and mints `{location:"local", mid,
+ * trackName: "<resourceId>-<mid>"}`. `m=application` (datachannel) sections are ignored — they carry no
+ * media track. An offer with no media sections (or none with a mid) returns `[]`; the caller must treat
+ * that as a hard failure (nothing to push).
+ */
+export function parseOfferMids(offer: SessionDescription, resourceId: string): LocalTrack[] {
+	const lines = offer.sdp.split(/\r?\n/);
+	const tracks: LocalTrack[] = [];
+	let inMediaSection = false;
+	let sectionIsTrackable = false;
+	let sectionHasMid = false;
+	for (const line of lines) {
+		if (line.startsWith("m=")) {
+			inMediaSection = true;
+			sectionHasMid = false;
+			// m=<media> <port> <proto> ... — only "audio"/"video" kinds carry a pushable track.
+			const kind = line.slice(2).split(" ")[0];
+			sectionIsTrackable = kind === "audio" || kind === "video";
+			continue;
+		}
+		if (!inMediaSection || !sectionIsTrackable || sectionHasMid) continue;
+		const midMatch = /^a=mid:(\S+)/.exec(line);
+		if (midMatch) {
+			sectionHasMid = true;
+			tracks.push({ location: "local", mid: midMatch[1], trackName: `${resourceId}-${midMatch[1]}` });
+		}
+	}
+	return tracks;
+}
+
 async function handlePublish(request: Request, env: WhipEnv, deps: WhipDeps, org: string): Promise<Response> {
 	const ct = (request.headers.get("content-type") ?? "").toLowerCase();
 	if (!ct.includes("application/sdp")) {
@@ -288,11 +321,31 @@ async function handlePublish(request: Request, env: WhipEnv, deps: WhipDeps, org
 			sessionId = routed.sessionId;
 			answerSdp = routed.answerSdp;
 		} else {
-			// Direct path (UNCHANGED): newSession(offer) creates the SFU session FROM the publisher's offer and
-			// returns the SFU's answer (verbatim SDP passthrough). The publisher's offered tracks are pushed in
-			// the same negotiation (a second pushTracks is a no-op here). Media terminates at the SFU.
-			const session = await sfu.newSession(offer);
-			const answer = session.sessionDescription;
+			// Direct path (#240 branch-A): newSession() with NO offer creates an EMPTY SFU session (no SDP
+			// exchange yet) -- the prior "newSession(offer) pushes tracks in the same negotiation" comment was
+			// WRONG (disproved live: GET /sessions/{id} came back {"tracks":[]} for the session's whole life,
+			// which is why the orphan sweeper could never see an "alive" verdict). The publisher's offer is
+			// instead relayed via pushTracks, which registers LOCAL tracks against the session AND carries the
+			// SDP exchange -- so this is STILL exactly one offer/answer round-trip from the WHIP client's view
+			// (no server-initiated renegotiation is introduced).
+			const session = await sfu.newSession();
+			const localTracks = parseOfferMids(offer, resourceId);
+			if (localTracks.length === 0) {
+				return jsonError("REALTIME_UPSTREAM", "offer carried no media sections", 502);
+			}
+			let pushed;
+			try {
+				pushed = await sfu.pushTracks(session.sessionId, localTracks, offer);
+			} catch (e) {
+				// newSession succeeded but pushTracks failed -> an orphaned empty session at the SFU. SfuClient
+				// has no closeSession; a track-less session is GC'd by CF on idle, but log loudly so this is
+				// visible, then re-throw so the caller gets the real upstream error.
+				console.warn(
+					`whip-publish pushTracks failed after newSession sessionId=${session.sessionId} resourceId=${resourceId}: ${(e as Error)?.message ?? e}`,
+				);
+				throw e;
+			}
+			const answer = pushed.sessionDescription;
 			if (!answer || answer.type !== "answer" || !answer.sdp) {
 				return jsonError("REALTIME_UPSTREAM", "SFU did not return an SDP answer", 503);
 			}

@@ -11,6 +11,7 @@ import {
 	buildWhipMeterLine,
 	whipIngestEnabled,
 	resolveWhipMeter,
+	parseOfferMids,
 	METER_WHIP_INGEST_MINUTES,
 	METER_STREAM_BRIDGE_MINUTES,
 	WHIP_METER_OVERRIDE_HEADER,
@@ -21,7 +22,7 @@ import {
 import { SfuError, type SessionDescription } from "../src/sfu.js";
 
 const ctx = { waitUntil: () => {} } as unknown as ExecutionContext;
-const OFFER_SDP = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n";
+const OFFER_SDP = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\n";
 const ANSWER_SDP = "v=0\r\no=- 2 2 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n";
 
 /** In-memory KV stub implementing the minimal WhipKv surface. */
@@ -52,8 +53,8 @@ function mockDeps(over: Partial<WhipDeps> = {}): { deps: WhipDeps; meterCalls: {
 	const deps: WhipDeps = {
 		sfu: () =>
 			({
-				newSession: async () => ({ sessionId: "sess0001abcd", sessionDescription: { type: "answer", sdp: ANSWER_SDP } }),
-				pushTracks: async () => ({ tracks: [] }),
+				newSession: async () => ({ sessionId: "sess0001abcd" }),
+				pushTracks: async () => ({ tracks: [], sessionDescription: { type: "answer", sdp: ANSWER_SDP } }),
 			}) as never,
 		now: () => 1_000_000,
 		mintResourceId: () => "res00000001",
@@ -106,11 +107,11 @@ describe("handleWhip — POST /v1/whip/publish (happy path)", () => {
 		const { deps } = mockDeps({
 			sfu: () =>
 				({
-					newSession: async (offer?: SessionDescription) => {
+					newSession: async () => ({ sessionId: "sess0001abcd" }),
+					pushTracks: async (_sessionId: string, _tracks: unknown, offer?: SessionDescription) => {
 						seen = offer;
-						return { sessionId: "sess0001abcd", sessionDescription: { type: "answer", sdp: ANSWER_SDP } };
+						return { tracks: [], sessionDescription: { type: "answer", sdp: ANSWER_SDP } };
 					},
-					pushTracks: async () => ({ tracks: [] }),
 				}) as never,
 		});
 		await handleWhip(
@@ -150,6 +151,37 @@ describe("handleWhip — POST /v1/whip/publish (happy path)", () => {
 	it("503 when the SFU is unavailable (newSession throws SfuError 503)", async () => {
 		const { deps } = mockDeps({
 			sfu: () => ({ newSession: async () => { throw new SfuError("REALTIME_NOT_CONFIGURED", "no app", 503); } }) as never,
+		});
+		const res = await handleWhip(
+			whipReq("POST", "/v1/whip/publish", { "content-type": "application/sdp" }, OFFER_SDP),
+			whipEnv(),
+			"org_A",
+			deps,
+		);
+		expect(res!.status).toBe(503);
+	});
+
+	it("502 when the offer carries no media sections (nothing to push)", async () => {
+		const { deps } = mockDeps();
+		const noMediaSdp = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n";
+		const res = await handleWhip(
+			whipReq("POST", "/v1/whip/publish", { "content-type": "application/sdp" }, noMediaSdp),
+			whipEnv(),
+			"org_A",
+			deps,
+		);
+		expect(res!.status).toBe(502);
+	});
+
+	it("propagates a pushTracks failure after a successful newSession (close-on-failure, #240 branch-A)", async () => {
+		const { deps } = mockDeps({
+			sfu: () =>
+				({
+					newSession: async () => ({ sessionId: "sess0001abcd" }),
+					pushTracks: async () => {
+						throw new SfuError("REALTIME_UPSTREAM", "tracks/new failed", 502);
+					},
+				}) as never,
 		});
 		const res = await handleWhip(
 			whipReq("POST", "/v1/whip/publish", { "content-type": "application/sdp" }, OFFER_SDP),
@@ -317,6 +349,49 @@ describe("worker /v1/whip/* gating", () => {
 			ctx,
 		);
 		expect(res.status).toBe(400);
+	});
+});
+
+// #240 branch-A: parseOfferMids drives the pushTracks LocalTrack registration for the direct path.
+describe("parseOfferMids", () => {
+	it("audio-only offer → one local track", () => {
+		const sdp = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=sendonly\r\n";
+		expect(parseOfferMids({ type: "offer", sdp }, "res00000001")).toEqual([
+			{ location: "local", mid: "0", trackName: "res00000001-0" },
+		]);
+	});
+
+	it("video-only offer → one local track", () => {
+		const sdp = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\na=sendonly\r\n";
+		expect(parseOfferMids({ type: "offer", sdp }, "res00000001")).toEqual([
+			{ location: "local", mid: "0", trackName: "res00000001-0" },
+		]);
+	});
+
+	it("audio+video offer → two local tracks with correct mids", () => {
+		const sdp =
+			"v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n" +
+			"m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=sendonly\r\n" +
+			"m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\na=sendonly\r\n";
+		expect(parseOfferMids({ type: "offer", sdp }, "res00000001")).toEqual([
+			{ location: "local", mid: "0", trackName: "res00000001-0" },
+			{ location: "local", mid: "1", trackName: "res00000001-1" },
+		]);
+	});
+
+	it("ignores an m=application (datachannel) section", () => {
+		const sdp =
+			"v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n" +
+			"m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:0\r\na=sendonly\r\n" +
+			"m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:1\r\n";
+		expect(parseOfferMids({ type: "offer", sdp }, "res00000001")).toEqual([
+			{ location: "local", mid: "0", trackName: "res00000001-0" },
+		]);
+	});
+
+	it("no media sections → []", () => {
+		const sdp = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n";
+		expect(parseOfferMids({ type: "offer", sdp }, "res00000001")).toEqual([]);
 	});
 });
 
