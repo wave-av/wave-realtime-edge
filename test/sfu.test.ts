@@ -225,3 +225,68 @@ describe("SfuClient.renegotiate", () => {
 		await expect(c.renegotiate("bad/id", { type: "answer", sdp: "v=x" })).rejects.toMatchObject({ code: "BAD_REQUEST", status: 400 });
 	});
 });
+
+describe("SfuClient.sessionLiveness", () => {
+	it("200 with a non-inactive track → alive", async () => {
+		const c = new SfuClient(CFG, stub(() => jsonResp({ tracks: [{ status: "active" }] })));
+		expect(await c.sessionLiveness(SESSION)).toBe("alive");
+	});
+
+	it("200 with every track inactive → gone", async () => {
+		const c = new SfuClient(CFG, stub(() => jsonResp({ tracks: [{ status: "inactive" }, { status: "inactive" }] })));
+		expect(await c.sessionLiveness(SESSION)).toBe("gone");
+	});
+
+	it("200 with tracks:[] → idle (a healthy no-pushTracks WHIP publish looks like this, #233)", async () => {
+		const c = new SfuClient(CFG, stub(() => jsonResp({ tracks: [], dataChannels: [] })));
+		expect(await c.sessionLiveness(SESSION)).toBe("idle");
+	});
+
+	it("404 → gone (the SFU no longer knows this session)", async () => {
+		const c = new SfuClient(CFG, stub(() => jsonResp({ errorCode: "not_found" }, 404)));
+		expect(await c.sessionLiveness(SESSION)).toBe("gone");
+	});
+
+	// #240 — live-verified 2026-07-19: a disconnected WHIP session (PeerConnection gone) answers 410 Gone,
+	// while a live trackless publish answers 200. Before this fix, 410 fell into `!res.ok → "unknown"` and
+	// the sweeper treated a dead orphan as ALIVE until the 24h TTL. 410 must map to "gone" like 404.
+	it("410 Gone (disconnected PeerConnection) → gone", async () => {
+		const c = new SfuClient(
+			CFG,
+			stub(() =>
+				jsonResp(
+					{ errorCode: "session_error", errorDescription: "Session appears to be disconnected. Please check if the PeerConnection is connected." },
+					410,
+				),
+			),
+		);
+		expect(await c.sessionLiveness(SESSION)).toBe("gone");
+	});
+
+	it("other non-ok (500) → unknown (must NOT close a session on a server error)", async () => {
+		const c = new SfuClient(CFG, stub(() => jsonResp({ errorCode: "internal" }, 500)));
+		expect(await c.sessionLiveness(SESSION)).toBe("unknown");
+	});
+
+	it("401 Unauthorized → unknown (auth failure is not proof the session is gone)", async () => {
+		const c = new SfuClient(CFG, stub(() => jsonResp({ errorCode: "unauthorized" }, 401)));
+		expect(await c.sessionLiveness(SESSION)).toBe("unknown");
+	});
+
+	it("transport throw → unknown (cannot tell, so the sweeper assumes live)", async () => {
+		const c = new SfuClient(CFG, vi.fn(async () => { throw new Error("boom"); }) as never);
+		expect(await c.sessionLiveness(SESSION)).toBe("unknown");
+	});
+
+	it("non-JSON 200 body → unknown", async () => {
+		const c = new SfuClient(CFG, stub(() => new Response("<html>not json</html>", { status: 200 })));
+		expect(await c.sessionLiveness(SESSION)).toBe("unknown");
+	});
+
+	it("malformed session id → unknown (no upstream call)", async () => {
+		const f = stub(() => jsonResp({ tracks: [] }));
+		const c = new SfuClient(CFG, f as never);
+		expect(await c.sessionLiveness("bad/id/slashes")).toBe("unknown");
+		expect(f).not.toHaveBeenCalled();
+	});
+});

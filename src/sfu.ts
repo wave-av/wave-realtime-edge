@@ -178,7 +178,8 @@ export class SfuClient {
    * decide whether a publish session whose client never sent a teardown DELETE is actually over.
    *
    * FOUR-STATE by design (this is a BILLING decision, so ambiguity must never close a live session):
-   *   "gone"    — the SFU 404s the session, or every track is inactive. Unambiguously over.
+   *   "gone"    — the SFU 404s the session, returns 410 Gone (its PeerConnection is disconnected), or every
+   *               track is inactive. Unambiguously over.
    *   "alive"   — the session answers and still has a non-inactive track.
    *   "idle"    — the session answers but reports ZERO tracks.
    *   "unknown" — any transport/parse/non-5xx-classifiable failure. The sweeper treats this as ALIVE.
@@ -190,6 +191,14 @@ export class SfuClient {
    * entirely. It is reported separately rather than as "gone" because a session probed moments after
    * publish can legitimately have no tracks yet — only the caller knows the session's age, so only the
    * caller can safely age it out.
+   *
+   * A DISTINCT death signal exists that "idle" cannot see (#240, live-verified 2026-07-19): when the WHIP
+   * session's PeerConnection is actually disconnected, CF Realtime answers 410 Gone with
+   * `{"errorCode":"session_error", ...}`, whereas a LIVE trackless publish answers 200
+   * `{"tracks":[],"dataChannels":[]}`. So for a session that never registers tracks, the HTTP status IS the
+   * discriminator: 200 ⇒ alive-but-trackless ("idle"), 410 ⇒ gone. A 410 is therefore treated exactly like a
+   * 404. (This does NOT resolve the #35 case — a publisher that dies WITHOUT its PC tearing down, where CF
+   * lingers at 200/`tracks:[]`; that still reads "idle" and needs a separate liveness mechanism.)
    *
    * Deliberately does NOT reuse `call()`: that helper throws one uniform SfuError on every non-2xx, which
    * cannot distinguish "404 → the session is legitimately over" from "502 → we simply could not tell".
@@ -206,7 +215,11 @@ export class SfuClient {
     } catch {
       return "unknown"; // transport failure — cannot tell, so the sweeper must assume the session is live
     }
-    if (res.status === 404) return "gone"; // the SFU no longer knows this session → the publish is over
+    // 404 (the SFU no longer knows this id) or 410 Gone (the session's PeerConnection is disconnected) both
+    // mean the publish is definitively over. 410 is the one unambiguous death signal for a WHIP session that
+    // never registers tracks — see the header note (#240, live-verified 2026-07-19). Other non-ok statuses
+    // (401/403/429/5xx) are NOT "session gone" and must stay "unknown".
+    if (res.status === 404 || res.status === 410) return "gone";
     if (!res.ok) return "unknown";
     let json: unknown = null;
     try {
