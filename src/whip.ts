@@ -328,18 +328,43 @@ async function handlePublish(request: Request, env: WhipEnv, deps: WhipDeps, org
 			// instead relayed via pushTracks, which registers LOCAL tracks against the session AND carries the
 			// SDP exchange -- so this is STILL exactly one offer/answer round-trip from the WHIP client's view
 			// (no server-initiated renegotiation is introduced).
-			const session = await sfu.newSession();
+			//
+			// Validate the offer BEFORE minting a CF session (#254 review): parseOfferMids used to run AFTER
+			// newSession(), so a medialess offer left a real CF Realtime session behind with NO KV record —
+			// unreachable to the sweeper (kv.list({prefix}) is its only discovery mechanism) and therefore
+			// leaked forever.
 			const localTracks = parseOfferMids(offer, resourceId);
 			if (localTracks.length === 0) {
 				return jsonError("REALTIME_UPSTREAM", "offer carried no media sections", 502);
+			}
+			const session = await sfu.newSession();
+			// #254 review (finding 1): persist a sweeper-reachable KV record IMMEDIATELY after the CF session
+			// exists, BEFORE pushTracks — not only after a successful push. A track-less session is NOT GC'd by
+			// CF on idle (see sfu.ts sessionLiveness: CF keeps answering 200/tracks:[] indefinitely); the ONLY
+			// cleanup path is the whip-sweep 410/disconnected flow (#240/#253), and that sweep discovers
+			// candidates solely via kv.list({prefix}) — so a session with no KV row is invisible to it forever.
+			// Deliberately conservative: lastSeenAt/disconnectedSince are left unset (never "verified alive"),
+			// so if pushTracks below throws, the sweeper will find this record, confirm the SFU's 410, and
+			// bill+drop it for at most the minimal `startedAt+1` window (whip-sweep.ts:197) rather than treating
+			// it as ever having been live.
+			const preMeter = resolveWhipMeter(request.headers.get(WHIP_METER_OVERRIDE_HEADER));
+			const preRecord: WhipResource = { sessionId: session.sessionId, org, startedAt: deps.now(), meter: preMeter };
+			try {
+				await env.RT_MEETING_ORG?.put(`${WHIP_KV_PREFIX}${resourceId}`, JSON.stringify(preRecord), {
+					expirationTtl: WHIP_KV_TTL_SECONDS,
+				});
+			} catch (e) {
+				console.warn(`whip-resource pre-push persist failed resourceId=${resourceId}: ${(e as Error)?.message ?? e}`);
 			}
 			let pushed;
 			try {
 				pushed = await sfu.pushTracks(session.sessionId, localTracks, offer);
 			} catch (e) {
 				// newSession succeeded but pushTracks failed -> an orphaned empty session at the SFU. SfuClient
-				// has no closeSession; a track-less session is GC'd by CF on idle, but log loudly so this is
-				// visible, then re-throw so the caller gets the real upstream error.
+				// has no closeSession, so we can't close it inline; the KV record written above (pre-pushTracks)
+				// is what makes this orphan sweeper-reachable — the sweeper will see the SFU 410, confirm it
+				// persists past WHIP_GONE_CONFIRM_MS, and bill+drop it. Log loudly so this is visible, then
+				// re-throw so the caller gets the real upstream error.
 				console.warn(
 					`whip-publish pushTracks failed after newSession sessionId=${session.sessionId} resourceId=${resourceId}: ${(e as Error)?.message ?? e}`,
 				);

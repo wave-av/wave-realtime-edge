@@ -173,7 +173,7 @@ describe("handleWhip — POST /v1/whip/publish (happy path)", () => {
 		expect(res!.status).toBe(502);
 	});
 
-	it("propagates a pushTracks failure after a successful newSession (close-on-failure, #240 branch-A)", async () => {
+	it("propagates a pushTracks failure after a successful newSession as a 503 (no close is implemented, #240 branch-A)", async () => {
 		const { deps } = mockDeps({
 			sfu: () =>
 				({
@@ -190,6 +190,43 @@ describe("handleWhip — POST /v1/whip/publish (happy path)", () => {
 			deps,
 		);
 		expect(res!.status).toBe(503);
+	});
+
+	it("a pushTracks failure still leaves a sweeper-reachable KV record for the orphaned CF session (#254 finding 1)", async () => {
+		const putCalls: { key: string; value: string }[] = [];
+		const kv = memKv();
+		const trackingKv: WhipKv = {
+			...kv,
+			async put(k, v, opts) {
+				putCalls.push({ key: k, value: v as string });
+				await kv.put(k, v, opts);
+			},
+		};
+		const { deps } = mockDeps({
+			sfu: () =>
+				({
+					newSession: async () => ({ sessionId: "sess0001abcd" }),
+					pushTracks: async () => {
+						throw new SfuError("REALTIME_UPSTREAM", "tracks/new failed", 502);
+					},
+				}) as never,
+		});
+		const env = whipEnv({ RT_MEETING_ORG: trackingKv });
+		const res = await handleWhip(
+			whipReq("POST", "/v1/whip/publish", { "content-type": "application/sdp" }, OFFER_SDP),
+			env,
+			"org_A",
+			deps,
+		);
+		expect(res!.status).toBe(503);
+		// the KV put (pre-pushTracks) happened BEFORE the throw propagated out of handleWhip
+		expect(putCalls.length).toBeGreaterThanOrEqual(1);
+		expect(putCalls[0].key).toBe("whip:res00000001");
+		const record = JSON.parse(putCalls[0].value) as { sessionId: string; org: string; startedAt: number };
+		expect(record.sessionId).toBe("sess0001abcd");
+		expect(record.org).toBe("org_A");
+		// still reachable by the sweeper's kv.list({prefix})
+		expect(kv.store.has("whip:res00000001")).toBe(true);
 	});
 });
 
