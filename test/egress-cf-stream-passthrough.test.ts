@@ -16,6 +16,7 @@ import {
   type CfStreamEgressTarget,
 } from "../src/egress-cf-stream-passthrough.js";
 import type { EgressJob } from "../src/egress-router.js";
+import { CfStreamEgressLiveOutputClient } from "../src/egress-cf-stream-live-output-client.js";
 
 /** A fake origin: records the create-output requests it received and returns a canned output id (or a canned non-2xx). */
 function fakeClient(
@@ -86,6 +87,37 @@ describe("CfStreamPassthroughEgressBackend — owns the cfStream tier, defers th
     const outcome = await be.provision(job, { ...TARGET, rtmpDestination: "http://evil.example/steal" });
     expect(outcome.status).toBe("unroutable");
     expect(client.calls).toHaveLength(0);
+  });
+
+  // wre#320 sec-review MEDIUM fix: the passthrough backend gated only on `isValidRtmpDestination` (scheme-only)
+  // and called `client.provisionOutput` directly with NO SSRF-at-connect re-check of its own. Prove the gap is
+  // now closed at the SHARED chokepoint (`CfStreamEgressLiveOutputClient.provisionOutput`) — wiring the backend
+  // to the REAL concrete client (not a bare fake) shows this provision path ALSO refuses a destination whose
+  // resolved IP is private/metadata, exactly like the O1 arm path already did.
+  it("refuses a simulcast whose rtmpDestination resolves to a private/metadata IP — SSRF-at-connect chokepoint", async () => {
+    const rebindResolver = async (h: string) => (h === "internal.example" ? ["169.254.169.254"] : []);
+    const realClient = new CfStreamEgressLiveOutputClient({
+      accountId: "acct123",
+      apiToken: "tok",
+      fetchFn: (async () => new Response(JSON.stringify({ success: true, result: { uid: "should-not-be-called" } }))) as typeof fetch,
+      resolveHost: rebindResolver,
+    });
+    const be = new CfStreamPassthroughEgressBackend(realClient);
+    const job = buildPassthroughJob({ ...DEFAULT_CF_STREAM_EGRESS_CONFIG, output: "simulcast" }, 1);
+    const outcome = await be.provision(job, {
+      sessionId: "cfstream:28064cd43cee30dd62c728da2152c61d",
+      trackName: "cam-1",
+      participantId: "p1",
+      rtmpDestination: "rtmp://internal.example:1935/app/key",
+    });
+    expect(outcome.status).toBe("provisioned");
+    if (outcome.status === "provisioned") {
+      expect(outcome.result.ok).toBe(false);
+      if (!outcome.result.ok) {
+        expect(outcome.result.status).toBe(403);
+        expect(outcome.result.reason).toMatch(/SSRF-at-connect/);
+      }
+    }
   });
 
   it("DEFERS a within-envelope compositing job to waveRender — never provisions a passthrough for it", async () => {

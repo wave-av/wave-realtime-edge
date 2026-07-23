@@ -29,12 +29,22 @@
  * INJECTED FETCH. `fetchFn` is injectable (defaults to global `fetch`), so this adapter is fully unit-testable
  * with a fake — no real network in test, mirroring `cf-stream-live-client.ts`'s auth pattern exactly (account id
  * + bearer API token in the header, same `CF_API_BASE`).
+ *
+ * SSRF-AT-CONNECT CHOKEPOINT (wre#320 sec-review MEDIUM fix). `provisionOutput` is the ONE seam both
+ * `CfStreamPassthroughEgressBackend.provision` (egress-cf-stream-passthrough.ts) and `armExternalRtmpRestream`
+ * (egress-arm.ts) funnel into for a real CF output create — so the DNS-rebind-safe re-check
+ * (`validateDestinationUrl`, ssrf-guard.ts) lives HERE, not only on the arm's call path. Before any outbound CF
+ * API call, `req.rtmpDestination`'s resolved IP is re-validated; a reject (or any thrown error from the guard
+ * itself) is a typed `{ok:false, status:403}` refusal, never a throw and never a provision. This makes SSRF-at-
+ * connect unbypassable by construction: no consumer of this concrete client — passthrough backend or O1 arm —
+ * can reach CF without passing this gate, even if a future third caller forgets its own re-check.
  */
 import type {
   CfStreamEgressClient,
   CfStreamEgressRequest,
   CfStreamEgressResult,
 } from "./egress-cf-stream-passthrough.js";
+import { validateDestinationUrl, type SsrfGuardOptions } from "./ssrf-guard.js";
 
 const CF_API_BASE = "https://api.cloudflare.com/client/v4";
 
@@ -48,6 +58,9 @@ export interface CfStreamEgressLiveOutputConfig {
   readonly accountId: string;
   readonly apiToken: string;
   readonly fetchFn?: typeof fetch;
+  /** SSRF-at-connect resolver override (tests only; production defaults to ssrf-guard.ts's DoH resolver).
+   *  Threaded through so this chokepoint's re-validation uses the same injectable resolver the arm path does. */
+  readonly resolveHost?: SsrfGuardOptions["resolveHost"];
 }
 
 /** Recover the CF Stream live-input uid from a bridged-Zoom `sessionId` (the deterministic `cfstream:{uid}` room
@@ -123,6 +136,27 @@ export class CfStreamEgressLiveOutputClient implements CfStreamEgressClient {
     const split = splitRtmpUrl(req.rtmpDestination);
     if (!split) {
       return { ok: false, status: 400, reason: `rtmpDestination has no stream-key path segment (${req.rtmpDestination})` };
+    }
+
+    // SSRF-AT-CONNECT CHOKEPOINT — see module docstring. Re-validates the RESOLVED destination immediately
+    // before any outbound CF provision, regardless of which caller (passthrough backend or O1 arm) reached this
+    // adapter. Fail CLOSED on a reject AND on any thrown error from the guard itself (deny-by-default, never a
+    // silent provision).
+    let ssrf: Awaited<ReturnType<typeof validateDestinationUrl>>;
+    try {
+      ssrf = await validateDestinationUrl("rtmp", req.rtmpDestination, {
+        resolveHost: this.cfg.resolveHost,
+        fetchFn: this.fetchFn,
+      });
+    } catch (e) {
+      return {
+        ok: false,
+        status: 403,
+        reason: `ssrf-at-connect check threw, denying by default: ${(e as Error)?.message ?? String(e)}`,
+      };
+    }
+    if (!ssrf.ok) {
+      return { ok: false, status: 403, reason: `destination failed SSRF-at-connect check: ${ssrf.reason}` };
     }
 
     try {

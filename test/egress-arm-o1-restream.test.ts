@@ -221,6 +221,60 @@ describe("armExternalRtmpRestream", () => {
     expect(client.calls).toHaveLength(0);
   });
 
+  // wre#320 sec-review LOW fixes.
+  it("refuses (400) a destination whose kind is not rtmp — NO provision call", async () => {
+    const kv = fakeKv();
+    const encKey = base64Key();
+    const env: EgressDestinationsEnv = { EGRESS_DEST_MGMT_ENABLED: "1", DEST_KEY_ENCRYPTION_KEY: encKey, RT_MEETING_ORG: kv };
+    const res = await handleEgressDestinations(
+      new Request("https://edge/v1/egress/destinations", {
+        method: "POST",
+        body: JSON.stringify({ kind: "srt", url: "srt://live.example.com:9000", passphrase: "p" }),
+      }),
+      env,
+      "acme",
+      { resolveHost: publicResolver },
+    );
+    expect(res?.status).toBe(201);
+    const j = (await res!.json()) as { destination: { id: string } };
+    const destId = j.destination.id;
+
+    const client = fakeClient();
+    const outcome = await armExternalRtmpRestream(
+      armEnv({ DEST_KEY_ENCRYPTION_KEY: encKey, RT_MEETING_ORG: kv }),
+      "acme",
+      destId,
+      TARGET,
+      client,
+      { resolveHost: publicResolver },
+    );
+    expect(outcome.status).toBe("refused");
+    if (outcome.status === "refused") {
+      expect(outcome.httpStatus).toBe(400);
+      expect(outcome.reason).toMatch(/kind/);
+    }
+    expect(client.calls).toHaveLength(0);
+  });
+
+  it("refuses (fail-closed, NO provision call) when resolveDestinationForArm throws", async () => {
+    const kv = fakeKv();
+    const encKey = base64Key();
+    const destId = await createDestination(kv, encKey, "acme", publicResolver);
+    const client = fakeClient();
+    const outcome = await armExternalRtmpRestream(
+      // Missing DEST_KEY_ENCRYPTION_KEY → `getAesKey` throws inside `resolveDestinationForArm`.
+      armEnv({ RT_MEETING_ORG: kv }),
+      "acme",
+      destId,
+      TARGET,
+      client,
+      { resolveHost: publicResolver },
+    );
+    expect(outcome.status).toBe("refused");
+    if (outcome.status === "refused") expect(outcome.httpStatus).toBe(500);
+    expect(client.calls).toHaveLength(0);
+  });
+
   it("stays INERT when EGRESS_DEST_MGMT_ENABLED is off", async () => {
     const kv = fakeKv();
     const encKey = base64Key();

@@ -55,7 +55,8 @@ describe("splitRtmpUrl", () => {
 describe("CfStreamEgressLiveOutputClient.provisionOutput", () => {
   it("builds the correct CF request: URL (accountId + derived liveInputId), POST, bearer auth, {url,streamKey} body", async () => {
     const fetchFn = fakeFetch();
-    const client = new CfStreamEgressLiveOutputClient({ accountId: "acct123", apiToken: "tok-abc", fetchFn });
+    const resolveHost = async (h: string) => (h === "a.rtmp.youtube.com" ? ["93.184.216.34"] : []);
+    const client = new CfStreamEgressLiveOutputClient({ accountId: "acct123", apiToken: "tok-abc", fetchFn, resolveHost });
     const result = await client.provisionOutput({
       sessionId: SESSION_ID,
       trackName: "cam-1",
@@ -73,7 +74,8 @@ describe("CfStreamEgressLiveOutputClient.provisionOutput", () => {
 
   it("maps a non-2xx CF reply to a typed error, never a throw", async () => {
     const fetchFn = fakeFetch({ status: 401, body: { success: false, errors: [{ code: 10000, message: "unauthorized" }] } });
-    const client = new CfStreamEgressLiveOutputClient({ accountId: "acct123", apiToken: "bad-tok", fetchFn });
+    const resolveHost = async (h: string) => (h === "live.example" ? ["93.184.216.34"] : []);
+    const client = new CfStreamEgressLiveOutputClient({ accountId: "acct123", apiToken: "bad-tok", fetchFn, resolveHost });
     const result = await client.provisionOutput({
       sessionId: SESSION_ID,
       trackName: "cam-1",
@@ -106,5 +108,51 @@ describe("CfStreamEgressLiveOutputClient.provisionOutput", () => {
     const result = await client.provisionOutput({ sessionId: SESSION_ID, trackName: "cam-1", output: "record" });
     expect(result.ok).toBe(false);
     expect(fetchFn.calls).toHaveLength(0);
+  });
+
+  // wre#320 sec-review MEDIUM fix: `provisionOutput` is the SHARED chokepoint both the passthrough backend and
+  // the O1 arm funnel into — prove the SSRF-at-connect re-check lives HERE, not only on the arm's own call path.
+  describe("SSRF-at-connect chokepoint (wre#320 sec-review)", () => {
+    it("refuses (403, no CF fetch) when rtmpDestination resolves to a private/metadata IP", async () => {
+      const fetchFn = fakeFetch();
+      const rebindResolver = async (h: string) => (h === "internal.example" ? ["169.254.169.254"] : []);
+      const client = new CfStreamEgressLiveOutputClient({
+        accountId: "acct123",
+        apiToken: "tok",
+        fetchFn,
+        resolveHost: rebindResolver,
+      });
+      const result = await client.provisionOutput({
+        sessionId: SESSION_ID,
+        trackName: "cam-1",
+        output: "simulcast",
+        rtmpDestination: "rtmp://internal.example:1935/app/key",
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.status).toBe(403);
+        expect(result.reason).toMatch(/SSRF-at-connect/);
+      }
+      expect(fetchFn.calls).toHaveLength(0);
+    });
+
+    it("provisions (calls CF) when rtmpDestination resolves to a public IP", async () => {
+      const fetchFn = fakeFetch();
+      const publicResolver = async (h: string) => (h === "live.example.com" ? ["93.184.216.34"] : []);
+      const client = new CfStreamEgressLiveOutputClient({
+        accountId: "acct123",
+        apiToken: "tok",
+        fetchFn,
+        resolveHost: publicResolver,
+      });
+      const result = await client.provisionOutput({
+        sessionId: SESSION_ID,
+        trackName: "cam-1",
+        output: "simulcast",
+        rtmpDestination: "rtmp://live.example.com:1935/app/key",
+      });
+      expect(result).toEqual({ ok: true, outputId: "lo-out-1" });
+      expect(fetchFn.calls).toHaveLength(1);
+    });
   });
 });

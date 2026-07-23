@@ -277,9 +277,28 @@ export async function armExternalRtmpRestream(
     return { status: "refused", httpStatus: 404, reason: "external rtmp restream is not armed" };
   }
 
-  const dest = await resolveDestinationForArm(env, org, destId);
+  // FAIL-CLOSED ON RESOLVE THROW (wre#320 sec-review LOW fix): `resolveDestinationForArm` throws when the
+  // encryption key is unconfigured (`getAesKey`, egress-destinations.ts) — its own doc contract says the ARM
+  // path decides its own error handling, but callers elsewhere assume it "never throws". Catch here so a
+  // misconfigured key surfaces as a typed refusal, never an unhandled throw into the media path.
+  let dest: Awaited<ReturnType<typeof resolveDestinationForArm>>;
+  try {
+    dest = await resolveDestinationForArm(env, org, destId);
+  } catch (e) {
+    return {
+      status: "refused",
+      httpStatus: 500,
+      reason: `destination resolve failed, denying by default: ${(e as Error)?.message ?? String(e)}`,
+    };
+  }
   if (!dest) {
     return { status: "refused", httpStatus: 404, reason: "destination not found" };
+  }
+
+  // KIND GUARD (wre#320 sec-review LOW fix): this arm builds an RTMP simulcast request — a destination stored
+  // as a different kind (e.g. `srt`) must never be silently treated as RTMP.
+  if (dest.kind !== "rtmp") {
+    return { status: "refused", httpStatus: 400, reason: `destination kind '${dest.kind}' is not rtmp` };
   }
 
   // SSRF-AT-CONNECT — re-runs BEFORE any outbound provision/dial (see assertDestinationSafeAtConnect docstring
