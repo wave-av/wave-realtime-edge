@@ -34,6 +34,7 @@ import type {
 export interface StreamInputKv {
   get(key: string): Promise<string | null>;
   put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<void>;
+  delete(key: string): Promise<void>;
 }
 
 /** Reverse-index KV key prefix: `org → [its live-input uids]`, powering org-scoped source discovery. Distinct

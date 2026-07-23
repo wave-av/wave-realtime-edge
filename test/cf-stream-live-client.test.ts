@@ -30,6 +30,9 @@ function fakeKv(opts: { seed?: Record<string, string>; failPutPrefix?: string } 
       if (opts.failPutPrefix && k.startsWith(opts.failPutPrefix)) throw new Error(`KV put boom for ${k}`);
       store.set(k, v);
     },
+    async delete(k) {
+      store.delete(k);
+    },
   };
 }
 

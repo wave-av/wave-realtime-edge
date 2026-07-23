@@ -1,15 +1,19 @@
-// WHEP-A — the /v1/whep/sources provision + discovery handler. Proves: GET lists the org's sources (org-scoped),
-// POST provisions ONLY the cfStreamLive plane (whip → deferred → WRONG_PLANE; bad job → 400), misconfig fails LOUD
-// (503), a wrong method 405s, an unrecognized path falls through (null). Injected fake CF fetch + fake KV.
+// WHEP-A — the /v1/whep/sources provision + discovery + teardown handler. Proves: GET lists the org's sources
+// (org-scoped), POST provisions ONLY the cfStreamLive plane (whip → deferred → WRONG_PLANE; bad job → 400),
+// DELETE tears down (best-effort CF delete + both KV keys cleaned, idempotent when unknown, 403 on foreign org),
+// misconfig fails LOUD (503), a wrong method 405s, an unrecognized path falls through (null). Injected fake CF
+// fetch + fake KV.
 import { describe, it, expect } from "vitest";
-import { handleWhepSources, type WhepSourcesEnv } from "../src/whep-sources.js";
+import { handleWhepSources, maybeHandleWhepSources, type WhepSourcesEnv } from "../src/whep-sources.js";
 import {
   ORG_STREAM_INPUTS_PREFIX,
   type StreamInputKv,
 } from "../src/cf-stream-live-client.js";
 import { STREAM_INPUT_ORG_PREFIX } from "../src/stream-bridge.js";
+import { gatewayGate } from "../src/dispatch-helpers.js";
 
 const UID = "28064cd43cee30dd62c728da2152c61d";
+const SAFE_ORG = /^[a-z0-9_-]+$/i;
 
 function fakeKv(seed: Record<string, string> = {}): StreamInputKv & { store: Map<string, string> } {
   const store = new Map<string, string>(Object.entries(seed));
@@ -20,6 +24,9 @@ function fakeKv(seed: Record<string, string> = {}): StreamInputKv & { store: Map
     },
     async put(k, v) {
       store.set(k, v);
+    },
+    async delete(k) {
+      store.delete(k);
     },
   };
 }
@@ -138,5 +145,75 @@ describe("handleWhepSources", () => {
     expect(res?.status).toBe(403);
     const j = (await res!.json()) as { error: string };
     expect(j.error).toBe("WHEP_SOURCE_PROVISION_FAILED");
+  });
+
+  describe("DELETE /v1/whep/sources/{uid} — teardown", () => {
+    const del = (uid: string) => new Request(`https://edge/v1/whep/sources/${uid}`, { method: "DELETE" });
+
+    it("calls bestEffortDeleteInput + cleans both KV keys, returns 200", async () => {
+      const kv = fakeKv({
+        [`${STREAM_INPUT_ORG_PREFIX}${UID}`]: "acme",
+        [`${ORG_STREAM_INPUTS_PREFIX}acme`]: JSON.stringify([{ uid: UID, room: "r1", createdAt: 5 }]),
+      });
+      const calls: { url: string; method: string }[] = [];
+      const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({ url: String(input), method: (init?.method ?? "GET").toUpperCase() });
+        return new Response("{}", { status: 200 });
+      }) as typeof fetch;
+
+      const res = await handleWhepSources(del(UID), env({ RT_MEETING_ORG: kv }), "acme", { fetchFn });
+      expect(res?.status).toBe(200);
+      const j = (await res!.json()) as { ok: boolean; uid: string };
+      expect(j).toEqual({ ok: true, uid: UID });
+
+      expect(calls).toEqual([{ url: expect.stringContaining(`/stream/live_inputs/${UID}`), method: "DELETE" }]);
+      expect(kv.store.has(`${STREAM_INPUT_ORG_PREFIX}${UID}`)).toBe(false);
+      expect(kv.store.has(`${ORG_STREAM_INPUTS_PREFIX}acme`) && kv.store.get(`${ORG_STREAM_INPUTS_PREFIX}acme`)).not.toContain(UID);
+    });
+
+    it("is idempotent when uid is unknown — 200, no throw, no CF call", async () => {
+      const kv = fakeKv();
+      let cfCalled = false;
+      const fetchFn = (async () => {
+        cfCalled = true;
+        return new Response("{}", { status: 200 });
+      }) as typeof fetch;
+
+      const res = await handleWhepSources(del(UID), env({ RT_MEETING_ORG: kv }), "acme", { fetchFn });
+      expect(res?.status).toBe(200);
+      const j = (await res!.json()) as { ok: boolean; uid: string };
+      expect(j).toEqual({ ok: true, uid: UID });
+      expect(cfCalled).toBe(false); // already-gone: never reaches the CF delete
+    });
+
+    it("403 when x-wave-org does not own the uid", async () => {
+      const kv = fakeKv({ [`${STREAM_INPUT_ORG_PREFIX}${UID}`]: "other-org" });
+      const res = await handleWhepSources(del(UID), env({ RT_MEETING_ORG: kv }), "acme", { fetchFn: okFetch() });
+      expect(res?.status).toBe(403);
+      // ownership untouched — no KV mutation on a rejected teardown.
+      expect(kv.store.get(`${STREAM_INPUT_ORG_PREFIX}${UID}`)).toBe("other-org");
+    });
+
+    it("fails open on the CF call — bestEffortDeleteInput never throws, KV cleanup still happens", async () => {
+      const kv = fakeKv({ [`${STREAM_INPUT_ORG_PREFIX}${UID}`]: "acme" });
+      const throwingFetch = (async () => {
+        throw new Error("network boom");
+      }) as typeof fetch;
+      const res = await handleWhepSources(del(UID), env({ RT_MEETING_ORG: kv }), "acme", { fetchFn: throwingFetch });
+      expect(res?.status).toBe(200);
+      expect(kv.store.has(`${STREAM_INPUT_ORG_PREFIX}${UID}`)).toBe(false);
+    });
+
+    it("401/gateway-reject without x-wave-internal (dispatch wrapper)", async () => {
+      const e = { ...env(), WAVE_INTERNAL_SECRET: "s3cret" };
+      const res = await maybeHandleWhepSources(del(UID), e, gatewayGate, SAFE_ORG);
+      expect(res?.status).toBe(401);
+    });
+
+    it("501 (null fall-through) when INGRESS_ROUTER_ENABLED is off (dispatch wrapper)", async () => {
+      const e = { ...env({ INGRESS_ROUTER_ENABLED: undefined }) };
+      const res = await maybeHandleWhepSources(del(UID), e, gatewayGate, SAFE_ORG);
+      expect(res).toBeNull(); // route-dispatch falls through to the 501 catch-all when INERT
+    });
   });
 });

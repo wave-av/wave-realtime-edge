@@ -22,6 +22,9 @@ function fakeKv(): StreamInputKv {
     async put(k, v) {
       store.set(k, v);
     },
+    async delete(k) {
+      store.delete(k);
+    },
   };
 }
 
