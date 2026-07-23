@@ -81,10 +81,89 @@ export interface RtmsBridgeDeps {
    *  live DO does not yet wire a real video-ingest-sink socket (◆ follow-up slice), so this stays
    *  undefined in production today and pumpVideo drops every frame — inert, never a fabricated push. */
   videoIngestSocket?(): IngestSocket | null;
+  /** #RTMS-fanout WAVE_RTMS_PER_PARTICIPANT — resolve the fan-out sinks for one participant (a sanitized
+   *  userId, or null for the mixed/unknown-speaker bucket). Only consulted when config.perParticipantEnabled
+   *  is true AND a valid userId was parsed off the frame; called lazily, once per newly-seen participant
+   *  (the result is cached — see the per-participant map in pumpAudio/pumpVideo). The live DO's
+   *  implementation is responsible for minting/caching the per-participant CF-SFU track (named
+   *  `zoom-${meetingUuid}-${userId}`) and wrapping it as a ParticipantSink; that wiring is a ◆ follow-up
+   *  slice and is NOT provided by this spike — optional/absent so existing call sites stay byte-identical. */
+  sinks?(userId: string | null): ParticipantSink[];
   /** Wall clock (ms) — injectable so any timing instrumentation is deterministic in tests. */
   now(): number;
   /** Structured log sink (JSON line) — injectable so tests can assert emitted instrumentation. */
   log(msg: string, fields: Record<string, unknown>): void;
+}
+
+/**
+ * #RTMS-fanout — one fan-out destination for a single participant's demuxed media. The existing CF-SFU
+ * ingest-socket path becomes ONE implementation of this interface (see the DO's `sinks()` wiring); NDI
+ * and MoQ are additional (currently INERT-stub) implementations. `video` is optional — an audio-only sink
+ * (e.g. a future transcription tee) never needs it. Fail-safe by contract: RtmsBridgeCore swallows/logs
+ * any throw from a sink call so one bad sink never drops frames for the others.
+ */
+export interface ParticipantSink {
+  audio(frame: Uint8Array): void;
+  video?(frame: Uint8Array): void;
+  close(): void;
+}
+
+/**
+ * ◆ follow-up slice: real impl crosses into wave-moq-edge (a separate container/service) — publishing a
+ * MoQ track is out of scope for this Worker. This is an INERT forwarder stub: logs one structured line
+ * per call and does nothing else — no socket, no buffering, no network. Never constructed by default;
+ * a caller opts in by wiring it into their own `RtmsBridgeDeps.sinks()` implementation.
+ */
+export class MoqTrackSink implements ParticipantSink {
+  constructor(
+    private readonly log: (msg: string, fields: Record<string, unknown>) => void,
+    private readonly userId: string,
+  ) {}
+  audio(frame: Uint8Array): void {
+    this.log("rtms-bridge-moq-sink-stub", { userId: this.userId, kind: "audio", bytes: frame.byteLength });
+  }
+  video(frame: Uint8Array): void {
+    this.log("rtms-bridge-moq-sink-stub", { userId: this.userId, kind: "video", bytes: frame.byteLength });
+  }
+  close(): void {
+    /* inert — no socket to close */
+  }
+}
+
+/**
+ * ◆ follow-up slice: real impl crosses into wave-bridge-edge (a separate container running Zoom's native
+ * NDI-HX SDK) — NDI is NEVER emitted from this Worker (no such SDK/runtime here). This is an INERT
+ * forwarder stub only: logs one structured line per call, no-ops otherwise. Never constructed by default.
+ */
+export class NdiHxForwardSink implements ParticipantSink {
+  constructor(
+    private readonly log: (msg: string, fields: Record<string, unknown>) => void,
+    private readonly userId: string,
+  ) {}
+  audio(frame: Uint8Array): void {
+    this.log("rtms-bridge-ndi-sink-stub", { userId: this.userId, kind: "audio", bytes: frame.byteLength });
+  }
+  close(): void {
+    /* inert — no socket to close */
+  }
+}
+
+/** #RTMS-fanout — allowlist for a Zoom RTMS userId before it's used as a track-name/map-key segment
+ *  (Corridor guardrail: never let an untrusted upstream value drive a resource name unsanitized). */
+const SAFE_RTMS_USER_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** #RTMS-fanout — cap on distinct per-participant tracks/maps per meeting, so a spoofed/rotating stream
+ *  of userIds can't grow this Worker's per-DO memory unbounded (a cheap DoS otherwise). Overflow participants
+ *  are routed to the mixed track (never dropped silently, never an unbounded map). */
+export const MAX_RTMS_PARTICIPANTS = 50;
+
+/** Sanitize a raw RTMS `content.user_id` for use as a track-name/map-key segment. Anything not matching
+ *  the allowlist (including absent) → null, so the caller falls back to the mixed track — never throws,
+ *  never lets an unsanitized value reach a track name. */
+function sanitizeRtmsUserId(userId: number | string | undefined): string | null {
+  if (userId === undefined || userId === null) return null;
+  const s = String(userId);
+  return SAFE_RTMS_USER_ID.test(s) ? s : null;
 }
 
 /** Where the tapped Zoom audio is published: a session in the target wave room + the SFU creds. */
@@ -122,6 +201,11 @@ export interface RtmsBridgeConfig {
    *  inbound MEDIA_DATA_VIDEO frames are mapped + pushed (see pumpVideo). Off (the default): identical
    *  to the audio-only bridge — no video subscription, no video track, no video code path entered. */
   videoEnabled?: boolean;
+  /** #RTMS-fanout WAVE_RTMS_PER_PARTICIPANT — default OFF/false. On: a frame carrying a valid userId is
+   *  demuxed to a per-participant seq + `deps.sinks(userId)` fan-out instead of the single mixed track.
+   *  Off (the default), or the userId is absent/invalid/over the MAX_RTMS_PARTICIPANTS cap: byte-identical
+   *  to today — one mixed track, one outSeq/outVideoSeq counter, deps.ingestSocket()/videoIngestSocket(). */
+  perParticipantEnabled?: boolean;
 }
 
 /**
@@ -148,6 +232,12 @@ export class RtmsBridgeCore {
   private closed = false;
   private readonly framing: IngestFraming;
   private readonly videoEnabled: boolean;
+  private readonly perParticipantEnabled: boolean; // #RTMS-fanout WAVE_RTMS_PER_PARTICIPANT
+  private meetingUuid = ""; // set in start() — only used to log/derive per-participant track names
+  // #RTMS-fanout — per-userId demux state, populated lazily on first valid frame from that participant.
+  // Each entry owns its OWN seq/videoSeq (independent of outSeq/outVideoSeq, which stay mixed-track-only)
+  // and the resolved sink fan-out (deps.sinks(userId), called once and cached here).
+  private readonly participants = new Map<string, { seq: number; videoSeq: number; sinks: ParticipantSink[] }>();
 
   constructor(
     private readonly deps: RtmsBridgeDeps,
@@ -157,6 +247,8 @@ export class RtmsBridgeCore {
     this.framing = config.framing ?? "packet";
     // DEFAULT false — WAVE_RTMS_VIDEO off is byte-identical to the pre-video audio-only bridge.
     this.videoEnabled = config.videoEnabled ?? false;
+    // DEFAULT false — WAVE_RTMS_PER_PARTICIPANT off is byte-identical to today's single-mixed-track bridge.
+    this.perParticipantEnabled = config.perParticipantEnabled ?? false;
   }
 
   get isStarted(): boolean {
@@ -171,6 +263,7 @@ export class RtmsBridgeCore {
   async start(event: RtmsStartedEvent): Promise<void> {
     if (this.started || this.closed) return;
     this.started = true;
+    this.meetingUuid = event.meetingUuid;
     const t = this.config.target;
     // Tell the SFU to publish a NEW room track sourced from the PCM we send on t.endpoint. mode:"buffer"
     // is REQUIRED for the SFU to actually establish the pull (agent-ingest-adapter.ts §mode).
@@ -234,10 +327,10 @@ export class RtmsBridgeCore {
     if (!msg) return;
     switch (msg.kind) {
       case "audio":
-        this.pumpAudio(msg.payload);
+        this.pumpAudio(msg.payload, msg.userId);
         break;
       case "video":
-        this.pumpVideo(msg.payload);
+        this.pumpVideo(msg.payload, msg.userId);
         break;
       case "keepalive_req":
         this.media?.send(keepAliveResp(msg.timestamp));
@@ -253,11 +346,28 @@ export class RtmsBridgeCore {
   }
 
   /**
-   * One RTMS audio frame (PCM s16le 16k mono) → 48k-stereo PCM → ≤32KB ingest frames on the SFU
-   * socket. Dropped (not buffered) until the SFU has dialed in (the SFU re-sends continuous audio).
-   * Fail-safe: a transcode/send error is logged and swallowed.
+   * One RTMS audio frame (PCM s16le 16k mono) → 48k-stereo PCM → ≤32KB ingest frames. #RTMS-fanout
+   * WAVE_RTMS_PER_PARTICIPANT: off (default), or the frame's userId is absent/invalid/over the
+   * MAX_RTMS_PARTICIPANTS cap → byte-identical to today (pumpAudioMixed, one outSeq, deps.ingestSocket()).
+   * On + a valid, in-budget userId → demuxed to that participant's own seq + sink fan-out (pumpAudioParticipant).
    */
-  private pumpAudio(rtmsPcm: Uint8Array): void {
+  private pumpAudio(rtmsPcm: Uint8Array, userId?: number): void {
+    if (this.perParticipantEnabled) {
+      const safeId = sanitizeRtmsUserId(userId);
+      if (safeId) {
+        const p = this.getOrCreateParticipant(safeId);
+        if (p) {
+          this.pumpAudioParticipant(rtmsPcm, safeId, p);
+          return;
+        }
+        // over MAX_RTMS_PARTICIPANTS → fall through to the mixed track (cap already logged)
+      }
+    }
+    this.pumpAudioMixed(rtmsPcm);
+  }
+
+  /** The pre-fanout behavior, byte-identical: single outSeq, single deps.ingestSocket(). */
+  private pumpAudioMixed(rtmsPcm: Uint8Array): void {
     const sock = this.deps.ingestSocket();
     if (!sock) return; // ingest not connected yet → drop
     try {
@@ -271,6 +381,53 @@ export class RtmsBridgeCore {
     }
   }
 
+  /** #RTMS-fanout — one participant's audio: transcode once, encode once per chunk with THAT participant's
+   *  own seq, then tee the identical frame bytes to every resolved sink. A throwing sink is logged and
+   *  skipped — never blocks the other sinks (fan-out fail-safety mirrors pumpAudioMixed's transcode guard). */
+  private pumpAudioParticipant(
+    rtmsPcm: Uint8Array,
+    userId: string,
+    p: { seq: number; videoSeq: number; sinks: ParticipantSink[] },
+  ): void {
+    if (p.sinks.length === 0) return; // no sinks resolved yet → drop, fail-safe (mirrors the null-socket drop)
+    try {
+      const bytes = int16ToPcmS16Le(rtmsAudioToSfuPcm(rtmsPcm));
+      for (const chunk of chunkPcm(bytes)) {
+        const frame = encodeIngestFrame(chunk, { sequenceNumber: p.seq++, timestamp: 0 }, this.framing);
+        for (const sink of p.sinks) {
+          try {
+            sink.audio(frame);
+          } catch (e) {
+            this.deps.log("rtms-bridge-sink-audio-error", { userId, message: (e as Error)?.message ?? "unknown" });
+          }
+        }
+      }
+    } catch (e) {
+      this.deps.log("rtms-bridge-audio-error", { userId, message: (e as Error)?.message ?? "unknown" });
+    }
+  }
+
+  /**
+   * Resolve (or lazily create) a participant's demux state. Caps distinct participants at
+   * MAX_RTMS_PARTICIPANTS to bound this map's memory against a spoofed/rotating stream of userIds — over
+   * the cap logs "rtms-participant-cap" and returns null (caller falls back to the mixed track, never an
+   * unbounded map, never a silently dropped participant).
+   */
+  private getOrCreateParticipant(userId: string): { seq: number; videoSeq: number; sinks: ParticipantSink[] } | null {
+    const existing = this.participants.get(userId);
+    if (existing) return existing;
+    if (this.participants.size >= MAX_RTMS_PARTICIPANTS) {
+      this.deps.log("rtms-participant-cap", { meetingUuid: this.meetingUuid, userId, max: MAX_RTMS_PARTICIPANTS });
+      return null;
+    }
+    const trackName = `zoom-${this.meetingUuid}-${userId}`;
+    const sinks = this.deps.sinks?.(userId) ?? [];
+    const p = { seq: 0, videoSeq: 0, sinks };
+    this.participants.set(userId, p);
+    this.deps.log("rtms-bridge-participant-open", { meetingUuid: this.meetingUuid, userId, trackName, sinks: sinks.length });
+    return p;
+  }
+
   /**
    * One RTMS video frame (a JPEG still) → the SFU video-ingest socket, behind WAVE_RTMS_VIDEO. Mirrors
    * pumpAudio's fail-safe contract: dropped (not buffered) until the SFU has dialed the video ingest
@@ -282,8 +439,24 @@ export class RtmsBridgeCore {
    * recorded/perceived downstream is a separate, already-known CF-platform block (issue #147) — this
    * method proves nothing about that and never claims to.
    */
-  private pumpVideo(rtmsJpeg: Uint8Array): void {
+  private pumpVideo(rtmsJpeg: Uint8Array, userId?: number): void {
     if (!this.videoEnabled) return; // defensive — the handshake never subscribes to VIDEO when off
+    if (this.perParticipantEnabled) {
+      const safeId = sanitizeRtmsUserId(userId);
+      if (safeId) {
+        const p = this.getOrCreateParticipant(safeId);
+        if (p) {
+          this.pumpVideoParticipant(rtmsJpeg, safeId, p);
+          return;
+        }
+        // over MAX_RTMS_PARTICIPANTS → fall through to the mixed track (cap already logged)
+      }
+    }
+    this.pumpVideoMixed(rtmsJpeg);
+  }
+
+  /** The pre-fanout behavior, byte-identical: single outVideoSeq, single deps.videoIngestSocket(). */
+  private pumpVideoMixed(rtmsJpeg: Uint8Array): void {
     const sock = this.deps.videoIngestSocket?.();
     if (!sock) return; // video ingest not connected yet (or the DO never wired one) → drop
     try {
@@ -291,6 +464,30 @@ export class RtmsBridgeCore {
       sock.send(encodeIngestFrame(jpeg, { sequenceNumber: this.outVideoSeq++, timestamp: 0 }, this.framing));
     } catch (e) {
       this.deps.log("rtms-bridge-video-error", { message: (e as Error)?.message ?? "unknown" });
+    }
+  }
+
+  /** #RTMS-fanout — one participant's video still: transcode once, encode once with THAT participant's own
+   *  videoSeq, tee the identical frame bytes to every sink that implements the optional `video()` member. */
+  private pumpVideoParticipant(
+    rtmsJpeg: Uint8Array,
+    userId: string,
+    p: { seq: number; videoSeq: number; sinks: ParticipantSink[] },
+  ): void {
+    if (p.sinks.length === 0) return; // no sinks resolved yet → drop, fail-safe
+    try {
+      const jpeg = rtmsVideoToSfuJpeg(rtmsJpeg);
+      const frame = encodeIngestFrame(jpeg, { sequenceNumber: p.videoSeq++, timestamp: 0 }, this.framing);
+      for (const sink of p.sinks) {
+        if (!sink.video) continue;
+        try {
+          sink.video(frame);
+        } catch (e) {
+          this.deps.log("rtms-bridge-sink-video-error", { userId, message: (e as Error)?.message ?? "unknown" });
+        }
+      }
+    } catch (e) {
+      this.deps.log("rtms-bridge-video-error", { userId, message: (e as Error)?.message ?? "unknown" });
     }
   }
 
@@ -323,6 +520,18 @@ export class RtmsBridgeCore {
     }
     this.sig = null;
     this.media = null;
+    // #RTMS-fanout — best-effort close every participant sink (mirrors the leg-close contract above); the
+    // mixed-track ingest/videoIngest sockets are DO-owned and unaffected (same as before this change).
+    for (const p of this.participants.values()) {
+      for (const sink of p.sinks) {
+        try {
+          sink.close();
+        } catch {
+          /* best-effort */
+        }
+      }
+    }
+    this.participants.clear();
     this.deps.log("rtms-bridge-stop", {});
   }
 }

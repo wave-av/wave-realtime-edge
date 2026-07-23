@@ -181,6 +181,16 @@ STREAM_BRIDGE_ENABLED = "1"
 # live Zoom meeting to prove. Arming this flag in a live env is a Jake-named ◆ crossing.
 WAVE_ZOOM_RTMS = "1"
 
+# ── #RTMS-fanout — per-participant demux + multi-protocol sink fan-out (RtmsBridgeCore). DEFAULT OFF / ──
+# FULLY INERT. WAVE_RTMS_PER_PARTICIPANT gates RtmsBridgeCore's perParticipantEnabled (still requires
+# WAVE_ZOOM_RTMS on too — this flag alone changes nothing). Absent/"0" → byte-identical to today: one mixed
+# room track, one outSeq/outVideoSeq counter, deps.ingestSocket()/videoIngestSocket(). On: a frame carrying a
+# valid (allowlisted) userId is demuxed to its own seq + fanned out to deps.sinks(userId) — the live DO does
+# not yet wire a real sinks() implementation (minting a per-participant CF-SFU track, or a MoQ/NDI forwarder;
+# NDI is NEVER emitted from this Worker — that SDK lives in a separate container) — that wiring is a ◆
+# follow-up slice. Flipping this in a live env is a Jake-named ◆ crossing, same class as WAVE_RTMS_VIDEO.
+# WAVE_RTMS_PER_PARTICIPANT = "1"
+
 # ── #82/#114 CASCADE multi-region relay (RT_CASCADE). INERT by default. ──
 # Absent/"0"/"false" → the realtime room path is byte-identical to today: a join routes to the PRIMARY Room
 # DO `idFromName(org:room)` with NO locationHint and NO regional relay. Set RT_CASCADE="1" → a regional join

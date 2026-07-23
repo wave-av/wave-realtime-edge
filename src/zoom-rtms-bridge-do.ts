@@ -49,6 +49,12 @@ export interface ZoomRtmsBridgeDoEnv {
   // DO does not yet mint a video target or accept a live video-ingest-sink socket (◆ follow-up slice) —
   // this only threads the flag into RtmsBridgeCore so its handshake/pump wiring is exercised.
   WAVE_RTMS_VIDEO?: string | boolean;
+  // #RTMS-fanout — independent flag for the per-participant demux + multi-protocol sink fan-out
+  // (RtmsBridgeCore's perParticipantEnabled), still gated by WAVE_ZOOM_RTMS being on too. Absent/"0"/false
+  // → audio/video stay on the single mixed track, byte-identical to today. The DO does not yet wire a real
+  // `sinks()` implementation (minting a per-participant CF-SFU track, or a MoQ/NDI forwarder) — that's a ◆
+  // follow-up slice; this only threads the flag into RtmsBridgeCore so its demux/fan-out wiring is exercised.
+  WAVE_RTMS_PER_PARTICIPANT?: string | boolean;
   ZOOM_APPS_CLIENT_ID?: string; // General-app Client ID — the RTMS handshake clientId (fails closed if unset)
   ZOOM_APPS_CLIENT_SECRET?: string; // signs the RTMS handshake — never logged/returned
   CF_CALLS_APP_ID?: string; // CF Realtime SFU app id (createIngestAdapter) — unset → fails closed
@@ -63,6 +69,12 @@ export interface ZoomRtmsBridgeDoEnv {
 /** Truthy-flag check for the video ingest leg (mirrors zoomRtmsEnabled's pattern). */
 export function rtmsVideoEnabled(env: { WAVE_RTMS_VIDEO?: string | boolean }): boolean {
   const v = env.WAVE_RTMS_VIDEO;
+  return v === true || v === "1" || v === "true";
+}
+
+/** Truthy-flag check for the per-participant demux + sink fan-out (mirrors zoomRtmsEnabled's pattern). */
+export function rtmsPerParticipantEnabled(env: { WAVE_RTMS_PER_PARTICIPANT?: string | boolean }): boolean {
+  const v = env.WAVE_RTMS_PER_PARTICIPANT;
   return v === true || v === "1" || v === "true";
 }
 
@@ -184,6 +196,7 @@ export class ZoomRtmsBridgeDO {
       target,
       framing: this.env.AGENT_INGEST_FRAMING,
       videoEnabled: rtmsVideoEnabled(this.env),
+      perParticipantEnabled: rtmsPerParticipantEnabled(this.env),
     });
     await this.core.start(event);
     return true;
