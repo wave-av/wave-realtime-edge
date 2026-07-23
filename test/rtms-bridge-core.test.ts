@@ -8,10 +8,12 @@ import {
   RtmsBridgeCore,
   pickMediaUrl,
   MAX_RTMS_PARTICIPANTS,
+  MoqTrackSink,
   type RtmsBridgeDeps,
   type RtmsBridgeConfig,
   type RtmsSocket,
   type ParticipantSink,
+  type MoqForwardWriter,
 } from "../src/rtms-bridge-core.js";
 import type { IngestSocket } from "../src/agent-session.js";
 import type { RtmsStartedEvent } from "../src/zoom-rtms-bridge.js";
@@ -362,5 +364,58 @@ describe("RtmsBridgeCore — video (WAVE_RTMS_VIDEO)", () => {
     const jpeg = Uint8Array.from([0xff, 0xd8, 2, 0xff, 0xd9]);
     await legs[1].onMessage(JSON.stringify({ msg_type: 15, content: { data: bytesToBase64(jpeg) } }));
     expect(videoIngestSent).toHaveLength(0);
+  });
+});
+
+// #314 Slice 1 — MoqTrackSink: no writer injected → byte-identical to the pre-#314 inert log-only stub; a
+// writer injected → every audio()/video() call forwards through it (uid, kind, ts, the exact frame bytes),
+// a throwing writer is swallowed (never breaks the pump's fan-out loop), and close() reaches the writer.
+describe("MoqTrackSink (#314 Slice 1)", () => {
+  it("no writer: audio/video are logged only, never touch a writer, close() is a no-op", () => {
+    const logs: Array<{ msg: string; fields: Record<string, unknown> }> = [];
+    const sink = new MoqTrackSink((msg, fields) => logs.push({ msg, fields }), "u1");
+    const frame = Uint8Array.from([1, 2, 3]);
+    sink.audio(frame);
+    sink.video(frame);
+    sink.close();
+    expect(logs.map((l) => l.msg)).toEqual(["rtms-bridge-moq-sink-stub", "rtms-bridge-moq-sink-stub"]);
+  });
+
+  it("writer injected: forwards audio/video with the sanitized uid + injected clock, and close() closes it", () => {
+    const calls: Array<{ uid: string; kind: string; ts: number; payload: Uint8Array }> = [];
+    let closed = false;
+    const writer: MoqForwardWriter = {
+      writeFrame: (uid, kind, ts, payload) => calls.push({ uid, kind, ts, payload }),
+      close: () => {
+        closed = true;
+      },
+    };
+    const sink = new MoqTrackSink(() => {}, "u42", writer, () => 12345);
+    const audioFrame = Uint8Array.from([9, 9]);
+    const videoFrame = Uint8Array.from([7, 7, 7]);
+    sink.audio(audioFrame);
+    sink.video(videoFrame);
+    sink.close();
+    expect(calls).toEqual([
+      { uid: "u42", kind: "audio", ts: 12345, payload: audioFrame },
+      { uid: "u42", kind: "video", ts: 12345, payload: videoFrame },
+    ]);
+    expect(closed).toBe(true);
+  });
+
+  it("a throwing writer is swallowed (logged), never thrown up into the caller", () => {
+    const logs: Array<{ msg: string; fields: Record<string, unknown> }> = [];
+    const writer: MoqForwardWriter = {
+      writeFrame: () => {
+        throw new Error("container unreachable");
+      },
+      close: () => {
+        throw new Error("close failed");
+      },
+    };
+    const sink = new MoqTrackSink((msg, fields) => logs.push({ msg, fields }), "u1", writer);
+    expect(() => sink.audio(Uint8Array.from([1]))).not.toThrow();
+    expect(() => sink.close()).not.toThrow();
+    expect(logs.find((l) => l.msg === "rtms-bridge-moq-sink-error")).toBeTruthy();
   });
 });
