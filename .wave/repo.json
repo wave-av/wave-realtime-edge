@@ -1,0 +1,91 @@
+{
+  "name": "wave-realtime-edge",
+  "kind": "cloudflare-worker",
+  "domain": "rt.wave.online",
+  "purpose": "Edge WebRTC SFU for browser-first, bidirectional interactive media — rooms, calls, and voice agents. Layer 1 of the WAVE Protocol Plane.",
+  "visibility": "public",
+  "primaryLanguage": "TypeScript",
+  "topics": ["edge", "webrtc", "sfu", "x402-metered", "protocol-plane-layer-1"],
+  "capabilities": [
+    {
+      "id": "health",
+      "does": "Unconditional liveness check, GET /health, no auth",
+      "status": "ga"
+    },
+    {
+      "id": "whip-ingest",
+      "does": "IETF WHIP v1 ingest: POST /v1/whip/publish, PATCH/DELETE /v1/whip/resource/{id}",
+      "status": "preview"
+    },
+    {
+      "id": "whep-egress",
+      "does": "IETF WHEP v1 egress: POST /v1/whep/subscribe, PATCH/DELETE /v1/whep/resource/{id}",
+      "status": "preview"
+    },
+    {
+      "id": "presence",
+      "does": "WebSocket room presence/state-sync at /v1/realtime/rooms/{room}/presence",
+      "status": "scaffolded"
+    },
+    {
+      "id": "sfu-core",
+      "does": "Custom SFU on a Cloudflare Durable Object (ROOM binding) for multi-party media",
+      "status": "preview"
+    }
+  ],
+  "claims": [
+    {
+      "id": "custom-domain",
+      "text": "Worker is routed on the custom domain rt.wave.online",
+      "resolver": { "type": "grep", "target": "wrangler.toml", "expect": "routes = [{ pattern = \"rt.wave.online\", custom_domain = true }]" }
+    },
+    {
+      "id": "auth-scheme",
+      "text": "Protocol requests carry a wave-token-v1 Bearer token, forwarded untouched to the gateway",
+      "resolver": { "type": "grep", "target": "docs/REALTIME.md", "expect": "wave-token-v1" }
+    },
+    {
+      "id": "metered-events",
+      "text": "Publishes rtc.session.opened and rtc.session.closed as x402-metered events",
+      "resolver": { "type": "grep", "target": "capabilities.json", "expect": "rtc.session.opened" }
+    },
+    {
+      "id": "whip-armed",
+      "text": "WHIP_INGEST_ENABLED is armed (\"1\") in the deployed wrangler.toml env",
+      "resolver": { "type": "grep", "target": "wrangler.toml", "expect": "WHIP_INGEST_ENABLED = \"1\"" }
+    },
+    {
+      "id": "whep-armed",
+      "text": "WHEP_EGRESS_ENABLED is armed (\"1\") in the deployed wrangler.toml env",
+      "resolver": { "type": "grep", "target": "wrangler.toml", "expect": "WHEP_EGRESS_ENABLED = \"1\"" }
+    },
+    {
+      "id": "presence-default-off",
+      "text": "Presence route is gated by PRESENCE_ENABLED, which is absent from wrangler.toml (default off)",
+      "resolver": { "type": "grep", "target": "src/dispatch-helpers.ts", "expect": "PRESENCE_ENABLED" }
+    },
+    {
+      "id": "protocol-plane-layer",
+      "text": "Repo is tagged protocol-plane-layer-1 in capabilities.json",
+      "resolver": { "type": "grep", "target": "capabilities.json", "expect": "protocol-plane-layer-1" }
+    }
+  ],
+  "endpoints": [
+    { "method": "GET", "path": "/health", "does": "Liveness check, no auth" },
+    { "method": "POST", "path": "/v1/whip/publish", "does": "WHIP ingest offer handshake -> 201 + SDP answer" },
+    { "method": "PATCH", "path": "/v1/whip/resource/{id}", "does": "WHIP trickle-ICE candidate update" },
+    { "method": "DELETE", "path": "/v1/whip/resource/{id}", "does": "WHIP teardown, stops the ingest meter" },
+    { "method": "POST", "path": "/v1/whep/subscribe", "does": "WHEP egress offer handshake -> 201 + SDP answer" },
+    { "method": "PATCH", "path": "/v1/whep/resource/{id}", "does": "WHEP trickle-ICE candidate update" },
+    { "method": "DELETE", "path": "/v1/whep/resource/{id}", "does": "WHEP teardown, stops the egress meter" },
+    { "method": "GET", "path": "/v1/realtime/rooms/{room}/presence", "does": "WebSocket upgrade for room presence/state-sync (PRESENCE_ENABLED gated)" }
+  ],
+  "links": {
+    "repo": "https://github.com/wave-av/wave-realtime-edge"
+  },
+  "transports": [
+    { "name": "WHIP", "direction": "in", "status": "preview" },
+    { "name": "WHEP", "direction": "out", "status": "preview" },
+    { "name": "presence-websocket", "direction": "bidir", "status": "scaffolded" }
+  ]
+}
