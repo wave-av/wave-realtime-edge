@@ -180,13 +180,26 @@ export class CfStreamLiveClientImpl implements CfStreamLiveClient {
   /** Best-effort compensation delete of an orphaned CF input (never throws — compensation must not mask the
    *  original error it is cleaning up after). */
   private async bestEffortDelete(uid: string): Promise<void> {
+    await CfStreamLiveClientImpl.bestEffortDeleteInput(this.fetchFn, this.cfg.accountId, this.cfg.apiToken, uid);
+  }
+
+  /** Public best-effort DELETE of a CF Stream Live input by uid — never throws (logs on failure). Callers that
+   *  create an input OUTSIDE the atomic `createLiveInput` success path (e.g. a synthetic proof probe that must
+   *  not leak a real CF input + KV entries every run) use this to compensate. Static so a caller with only a
+   *  `uid` + the same config (no live client instance needed) can still clean up. */
+  static async bestEffortDeleteInput(
+    fetchFn: typeof fetch,
+    accountId: string,
+    apiToken: string,
+    uid: string,
+  ): Promise<void> {
     try {
-      await this.fetchFn(`${CF_API_BASE}/accounts/${this.cfg.accountId}/stream/live_inputs/${uid}`, {
+      await fetchFn(`${CF_API_BASE}/accounts/${accountId}/stream/live_inputs/${uid}`, {
         method: "DELETE",
-        headers: { authorization: `Bearer ${this.cfg.apiToken}` },
+        headers: { authorization: `Bearer ${apiToken}` },
       });
-    } catch {
-      /* best-effort — the caller already has the fatal reason */
+    } catch (e) {
+      console.warn(`cf-stream-live bestEffortDeleteInput failed uid=${uid}: ${(e as Error)?.message ?? e}`);
     }
   }
 }
