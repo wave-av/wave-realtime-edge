@@ -7,6 +7,8 @@ import { ZoomRtmsBridgeDO } from "../src/zoom-rtms-bridge-do.js";
 import type { RtmsStartedEvent } from "../src/zoom-rtms-bridge.js";
 import { rtmsHandshakeSignature } from "../src/rtms-auth.js";
 import { signalingHandshakeReq } from "../src/rtms-protocol.js";
+import { bytesToBase64 } from "../src/twilio-mediastream.js";
+import { int16ToPcmS16Le } from "../src/rtms-audio.js";
 
 const EVENT: RtmsStartedEvent = {
   kind: "rtms_started",
@@ -17,19 +19,33 @@ const EVENT: RtmsStartedEvent = {
 
 class FakeWs {
   sent: string[] = [];
+  private listeners: Record<string, Array<(ev: unknown) => void>> = {};
   accept(): void {}
-  addEventListener(): void {}
+  addEventListener(type: string, cb: (ev: unknown) => void): void {
+    (this.listeners[type] ??= []).push(cb);
+  }
   send(d: string): void {
     this.sent.push(d);
   }
   close(): void {}
+  /** Test-only: fire a captured listener (drives the mock Zoom legs' onMessage). */
+  fire(type: string, ev: unknown): void {
+    for (const cb of this.listeners[type] ?? []) cb(ev);
+  }
 }
 
 let serverWS: FakeWs;
+// #RTMS-fanout — every server-side socket the DO's WebSocketPair mock creates, in creation order (so a test
+// can grab the Nth accepted ingest socket — the mixed one, or a specific participant's).
+const serverSockets: FakeWs[] = [];
 beforeAll(() => {
   (globalThis as unknown as { WebSocketPair: unknown }).WebSocketPair = class {
     0 = new FakeWs();
-    1 = (serverWS = new FakeWs());
+    1 = (serverWS = ((): FakeWs => {
+      const ws = new FakeWs();
+      serverSockets.push(ws);
+      return ws;
+    })());
   } as unknown;
 });
 
@@ -42,8 +58,13 @@ const kv = (mapped: boolean) =>
   }) as unknown;
 
 const dialed: FakeWs[] = [];
-const zoomFetch = (async (url: string) => {
+/** #RTMS-fanout — every /adapters/websocket/new create call, so a test can assert distinct trackNames were
+ *  requested (one per participant) instead of just counting invocations. */
+const adapterCreates: Array<{ trackName: string; endpoint: string }> = [];
+const zoomFetch = (async (url: string, init?: { body?: string }) => {
   if (String(url).includes("/adapters/websocket/new")) {
+    const body = init?.body ? (JSON.parse(init.body) as { tracks: Array<{ trackName: string; endpoint: string }> }) : { tracks: [] };
+    if (body.tracks[0]) adapterCreates.push({ trackName: body.tracks[0].trackName, endpoint: body.tracks[0].endpoint });
     return { ok: true, status: 200, json: async () => ({ tracks: [{ adapterId: "in_1", sessionId: "cf_pub" }] }) } as unknown as Response;
   }
   const ws = new FakeWs();
@@ -128,6 +149,88 @@ describe("ZoomRtmsBridgeDO — start: armed + mapped dials Zoom", () => {
     expect(dialed).toHaveLength(1);
     const sig = await rtmsHandshakeSignature("APPID123", EVENT.meetingUuid, EVENT.rtmsStreamId, "s3cr3t");
     expect(dialed[0].sent[0]).toBe(signalingHandshakeReq(EVENT.meetingUuid, EVENT.rtmsStreamId, sig));
+  });
+});
+
+describe("ZoomRtmsBridgeDO — per-participant sinks (#RTMS-fanout WAVE_RTMS_PER_PARTICIPANT)", () => {
+  const ackFrame = (audioUrl: string): string =>
+    JSON.stringify({ msg_type: 2, status_code: 0, media_server: { server_urls: { audio: audioUrl } } });
+  const audioFrame = (userId: number | string, samples: number[]): string =>
+    JSON.stringify({ msg_type: 14, content: { user_id: userId, data: bytesToBase64(int16ToPcmS16Le(new Int16Array(samples))) } });
+  const flushAsync = async (): Promise<void> => {
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+  };
+  const ingestUpgrade = (path: string): Request => new Request(`https://zoom-rtms${path}`, { headers: { Upgrade: "websocket" } });
+
+  it("flag OFF: no per-participant track is ever requested — byte-identical single mixed track", async () => {
+    dialed.length = 0;
+    adapterCreates.length = 0;
+    serverSockets.length = 0;
+    const doo = new ZoomRtmsBridgeDO(mkState(), armed()); // WAVE_RTMS_PER_PARTICIPANT absent
+    await doo.fetch(startReq());
+    await doo.fetch(ingestUpgrade("/ingest")); // the mixed slot
+    dialed[0].fire("message", { data: ackFrame("wss://media.zoom.us/audio") });
+    await flushAsync(); // let the media-leg dial + its addEventListener registration settle
+    dialed[1].fire("message", { data: audioFrame(5, [1, 2, 3, 4]) });
+    await flushAsync();
+    expect(adapterCreates).toHaveLength(1); // only the one mixed-track create from start(), never a per-user one
+    expect(adapterCreates[0].trackName).toBe("zoom-mtg");
+    expect(serverSockets[0].sent).toHaveLength(1); // the mixed socket got the frame
+  });
+
+  it("flag ON + 2 userIds: 2 distinct ingest tracks are created, each sink gets only its user's frames", async () => {
+    dialed.length = 0;
+    adapterCreates.length = 0;
+    serverSockets.length = 0;
+    const doo = new ZoomRtmsBridgeDO(mkState(), armed({ WAVE_RTMS_PER_PARTICIPANT: "1" }));
+    await doo.fetch(startReq());
+    dialed[0].fire("message", { data: ackFrame("wss://media.zoom.us/audio") });
+    await flushAsync(); // let the media-leg dial + its addEventListener registration settle
+
+    // First frame per user: sinks() fires the async createIngest, but no socket has dialed back yet → dropped.
+    dialed[1].fire("message", { data: audioFrame(5, [1, 2, 3, 4]) });
+    dialed[1].fire("message", { data: audioFrame(9, [5, 6, 7, 8]) });
+    await flushAsync();
+
+    expect(adapterCreates).toHaveLength(3); // start()'s mixed track + one per user
+    const track5 = "zoom-mtg-uuid-xyz-5";
+    const track9 = "zoom-mtg-uuid-xyz-9";
+    expect(adapterCreates.map((a) => a.trackName)).toEqual(expect.arrayContaining([track5, track9]));
+    expect(adapterCreates.find((a) => a.trackName === track5)?.endpoint).toContain(`/${track5}`);
+
+    // Now the SFU dials BACK each participant's minted endpoint — the DO must route each socket by trackName.
+    await doo.fetch(ingestUpgrade(`/zoom/rtms/ingest/${EVENT.meetingUuid}/acme/sess-12345678/${track5}`));
+    const sock5 = serverSockets[serverSockets.length - 1];
+    await doo.fetch(ingestUpgrade(`/zoom/rtms/ingest/${EVENT.meetingUuid}/acme/sess-12345678/${track9}`));
+    const sock9 = serverSockets[serverSockets.length - 1];
+    expect(sock5).not.toBe(sock9);
+
+    // Second frame per user: the cached ParticipantSink now finds its socket live and sends.
+    dialed[1].fire("message", { data: audioFrame(5, [1, 2, 3, 4]) });
+    dialed[1].fire("message", { data: audioFrame(9, [5, 6, 7, 8]) });
+
+    expect(sock5.sent).toHaveLength(1);
+    expect(sock9.sent).toHaveLength(1);
+    expect(sock5.sent[0]).not.toBe(sock9.sent[0]); // distinct seq counters per participant
+    expect(adapterCreates).toHaveLength(3); // no re-create on the second frame (idempotent per trackName)
+  });
+
+  it("flag ON + an invalid userId still falls back to the mixed track (no per-participant track requested)", async () => {
+    dialed.length = 0;
+    adapterCreates.length = 0;
+    serverSockets.length = 0;
+    const doo = new ZoomRtmsBridgeDO(mkState(), armed({ WAVE_RTMS_PER_PARTICIPANT: "1" }));
+    await doo.fetch(startReq());
+    await doo.fetch(ingestUpgrade("/ingest")); // the mixed slot
+    const mixedSock = serverSockets[serverSockets.length - 1];
+    dialed[0].fire("message", { data: ackFrame("wss://media.zoom.us/audio") });
+    await flushAsync(); // let the media-leg dial + its addEventListener registration settle
+    dialed[1].fire("message", { data: audioFrame(1e21, [1, 2, 3, 4]) }); // fails SAFE_RTMS_USER_ID
+    await flushAsync();
+
+    expect(adapterCreates).toHaveLength(1); // only start()'s mixed track — sinks() never reached
+    expect(mixedSock.sent).toHaveLength(1); // frame landed on the mixed socket instead
   });
 });
 
