@@ -91,9 +91,47 @@ function checkIpv4(ip: string): string | null {
   return null;
 }
 
+/** Expand a (non dotted-quad-embedded) IPv6 address string into its 8 hex-group array, handling `::` zero
+ *  compression. Returns null for anything that isn't a plain 8-group-expandable IPv6 literal (e.g. one still
+ *  carrying an embedded IPv4 dotted-quad tail, or malformed input) — callers that need the dotted-quad form
+ *  handle it separately. */
+function expandIpv6Groups(ip: string): string[] | null {
+  if (ip.includes(".")) return null; // embedded IPv4 dotted-quad tail — not this function's job
+  if (ip.includes("::")) {
+    const parts = ip.split("::");
+    if (parts.length > 2) return null; // more than one "::" is invalid
+    const head = parts[0] ? parts[0].split(":") : [];
+    const tail = parts[1] ? parts[1].split(":") : [];
+    const missing = 8 - (head.length + tail.length);
+    if (missing < 0) return null;
+    return [...head, ...Array(missing).fill("0"), ...tail];
+  }
+  const groups = ip.split(":");
+  return groups.length === 8 ? groups : null;
+}
+
+/** IPv4-mapped IPv6 (`::ffff:0:0/96`) detected in HEX-GROUP form — i.e. `::ffff:7f00:1` rather than the textual
+ *  `::ffff:127.0.0.1`. The WHATWG URL parser canonicalizes a bracketed IPv4-mapped literal to this hex-group form
+ *  for non-special schemes (rtmp/srt aren't in the URL spec's "special scheme" list), so a check that only
+ *  matches the dotted-quad textual form never fires for URLs that actually reach this guard. Reconstructs the
+ *  embedded 32 bits from the last two 16-bit groups into 4 octets. Returns the octets, or null if `ip` isn't in
+ *  the `::ffff:0:0/96` hex-group form. */
+function mappedIpv4HexGroupOctets(ip: string): [number, number, number, number] | null {
+  const groups = expandIpv6Groups(ip);
+  if (!groups) return null;
+  const prefixIsZero = groups.slice(0, 5).every((g) => g === "" || Number(`0x${g || "0"}`) === 0);
+  if (!prefixIsZero || groups[5] !== "ffff") return null;
+  const hi = Number(`0x${groups[6] || "0"}`);
+  const lo = Number(`0x${groups[7] || "0"}`);
+  if (!Number.isFinite(hi) || !Number.isFinite(lo) || hi > 0xffff || lo > 0xffff) return null;
+  return [(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff];
+}
+
 /** REJECT-list for IPv6: loopback (::1), unspecified (::), link-local (fe80::/10), unique-local/ULA (fc00::/7 —
- *  the IPv6 analogue of RFC1918), multicast (ff00::/8), IPv4-mapped (::ffff:a.b.c.d — re-checked as IPv4 so a
- *  mapped-private address can't bypass the v4 rules). Deny-by-default, same contract as `checkIpv4`. */
+ *  the IPv6 analogue of RFC1918), multicast (ff00::/8), IPv4-mapped (::ffff:0:0/96 — re-checked as IPv4 so a
+ *  mapped-private address can't bypass the v4 rules), in EITHER textual form the mapped address may arrive in:
+ *  dotted-quad (`::ffff:127.0.0.1`) or hex-group (`::ffff:7f00:1`, what a non-special-scheme URL parser
+ *  canonicalizes it to). Deny-by-default, same contract as `checkIpv4`. */
 function checkIpv6(ip: string): string | null {
   const norm = ip.toLowerCase();
   if (norm === "::1") return `loopback IPv6 address (${ip})`;
@@ -101,8 +139,19 @@ function checkIpv6(ip: string): string | null {
   if (/^fe[89ab][0-9a-f]:/.test(norm)) return `link-local IPv6 address (fe80::/10: ${ip})`;
   if (/^f[cd][0-9a-f]{2}:/.test(norm)) return `unique-local IPv6 address (fc00::/7 ULA: ${ip})`;
   if (/^ff/.test(norm)) return `multicast IPv6 address (ff00::/8: ${ip})`;
-  const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(norm);
-  if (mapped) return checkIpv4(mapped[1]) ? `IPv4-mapped ${checkIpv4(mapped[1])}` : null;
+
+  const mappedDotted = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(norm);
+  if (mappedDotted) {
+    const v4reason = checkIpv4(mappedDotted[1]);
+    return v4reason ? `IPv4-mapped ${v4reason}` : null;
+  }
+
+  const hexGroupOctets = mappedIpv4HexGroupOctets(norm);
+  if (hexGroupOctets) {
+    const v4reason = checkIpv4(hexGroupOctets.join("."));
+    return v4reason ? `IPv4-mapped ${v4reason}` : null;
+  }
+
   return null;
 }
 
@@ -180,7 +229,10 @@ export async function validateDestinationUrl(
     return { ok: false, reason: `scheme '${scheme}' not allowed for kind '${kind}' (allowed: ${allowedSchemes.join(", ")})` };
   }
 
-  const hostname = u.hostname.toLowerCase();
+  // Strip a single trailing "." (a syntactically-valid FQDN root-label dot) BEFORE any hostname comparison —
+  // otherwise "169.254.169.254." / "foo.local." skip the fast paths below and only get caught (if at all) by
+  // DNS resolution, which may not even reject them.
+  const hostname = u.hostname.toLowerCase().replace(/\.$/, "");
   if (!hostname) return { ok: false, reason: "destination url has no hostname" };
   if (hostname === "169.254.169.254" || DENIED_HOSTNAMES.has(hostname)) {
     return { ok: false, reason: `denied metadata/reserved hostname (${hostname})` };
