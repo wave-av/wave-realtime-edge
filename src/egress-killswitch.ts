@@ -1,14 +1,26 @@
 /**
  * EGRESS COST KILL-SWITCH (#278, W0 — cost-governance safety backstop). The org is running egress cost
  * ~161% over budget; this module is the STOP mechanism, not a new feature. It adds four independent guards
- * around the egress backends (egress-arm.ts / egress-runpod-nvenc.ts), each cheap and each fail-closed:
+ * around the egress backends (egress-arm.ts / egress-runpod-nvenc.ts):
  *
- *  1. CONCURRENCY CAP — per-org + global limits on simultaneously-armed egress streams (`evaluateArm`).
+ *  1. CONCURRENCY CAP — per-org + global limits on simultaneously-armed egress streams (`evaluateArm`). This
+ *     is a BEST-EFFORT SOFT BACKSTOP, not a hard guarantee: it is a KV-backed check-then-act (`evaluateArm`
+ *     reads, caller separately calls `registerArmed`), and Cloudflare KV is eventually consistent — a
+ *     concurrent burst of arms can all read the same stale under-cap count and all pass, overshooting the
+ *     configured cap. A true hard per-org cap needs request serialization (e.g. a per-org Durable Object) and
+ *     is tracked separately as #15 ("collapse concurrent arm-races"); this module does NOT attempt that here.
  *  2. MAX-DURATION AUTO-STOP — a stream armed longer than a configured ceiling is force-disarmed (`sweepExpired`).
  *  3. GLOBAL KILL SWITCH — one flag, checked before every arm, that stops ALL new egress and can be told to
  *     tear down everything currently armed (`activateKillSwitch`).
  *  4. COGS CIRCUIT BREAKER — accumulates the ALREADY-MEASURED `cogsUsd()` (egress-runpod-nvenc.ts) per org per
  *     time window; crossing budget trips the breaker + fires an alert (`circuitBreakerCheck`).
+ *
+ * WHICH GUARDS ARE ACTUALLY HARD. Only three of the above are genuine hard guarantees: the GLOBAL KILL SWITCH
+ * (disarm-all), the MAX-DURATION AUTO-STOP, and the COGS CIRCUIT BREAKER — all three act on state that is
+ * read back and corrected on a later pass (sweep / next circuit check), so eventual KV consistency only delays
+ * them, it doesn't let them be bypassed. The CONCURRENCY CAP (#1) is soft and can overshoot under a concurrent
+ * burst — see #15 for the fix. Do not rely on the concurrency cap alone to bound cost; it is a speed bump, not
+ * a wall.
  *
  * STORE SEAM. All state lives behind the injected `KillswitchStore` interface — a minimal (get/put/delete)
  * subset of Cloudflare's `KVNamespace` (a real `KVNamespace` binding satisfies this structurally, no adapter
@@ -116,6 +128,7 @@ export async function registerDisarmed(store: KillswitchStore, streamId: string)
 
 // ── 1. Concurrent-stream cap ─────────────────────────────────────────────────────────────────────────────
 
+/** Best-effort soft caps (see `evaluateArm`) — not a hard guarantee under concurrent bursts. */
 export interface ConcurrencyLimits {
   readonly perOrg: number;
   readonly global: number;
@@ -130,13 +143,21 @@ export type ArmDecision = { readonly ok: true } | { readonly ok: false; readonly
 /** Decide whether a NEW stream may arm, WITHOUT mutating any state (read-only decision). Checks, in order: the
  *  global kill switch, the per-org cap, then the global cap — so a killed org never even reaches the cap math.
  *  Callers that accept the decision must separately call `registerArmed` (kept separate so a caller can, e.g.,
- *  re-check other conditions between decide and commit without a partial write). */
+ *  re-check other conditions between decide and commit without a partial write).
+ *
+ *  SOFT CAP, NOT HARD: this is check-then-act against eventually-consistent KV. Concurrent callers can all read
+ *  the same stale `armed` snapshot, all see themselves under cap, and all proceed — the cap can overshoot under
+ *  a concurrent burst. Do not rely on this for a hard guarantee; that needs per-org request serialization
+ *  (tracked as #15, "collapse concurrent arm-races"). The hard backstops are the kill switch, max-duration
+ *  auto-stop, and the cogs circuit breaker. */
 export async function evaluateArm(
   store: KillswitchStore,
   orgId: string,
   limits: ConcurrencyLimits = DEFAULT_CONCURRENCY_LIMITS,
 ): Promise<ArmDecision> {
   if (await isKillSwitchActive(store)) return { ok: false, reason: "killswitch" };
+  // Check-then-act against KV — see the SOFT CAP note above and #15. This read can be stale under a
+  // concurrent burst, so `orgCount`/`armed.length` here are a best-effort estimate, not an authoritative lock.
   const armed = await readRegistry(store);
   const orgCount = armed.filter((e) => e.orgId === orgId).length;
   if (orgCount >= limits.perOrg) return { ok: false, reason: "org_cap" };

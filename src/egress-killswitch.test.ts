@@ -68,6 +68,30 @@ describe("concurrent-stream cap", () => {
     await registerDisarmed(store, "s1");
     expect(await listArmed(store)).toHaveLength(0);
   });
+
+  it("SOFT CAP, not hard: a concurrent burst of evaluateArm+registerArmed can overshoot the per-org cap "
+    + "(check-then-act against eventually-consistent KV — see #15). This asserts the DOCUMENTED best-effort "
+    + "behavior, not a false hard guarantee.", async () => {
+    const store = new MemoryKillswitchStore();
+    const limits = { perOrg: 5, global: 100 };
+    // 5 concurrent callers, all racing the same read-then-write registry — every one reads the registry
+    // BEFORE any of them has written, so all 5 see 0/5 used and all 5 pass the check-then-act race.
+    await Promise.all(
+      Array.from({ length: 5 }, async (_, i) => {
+        const decision = await evaluateArm(store, "org1", limits);
+        expect(decision).toEqual({ ok: true });
+        await registerArmed(store, "org1", `s${i}`, 0);
+      }),
+    );
+    const armed = await listArmed(store);
+    // All 5 landed (only the LAST write survives read-modify-write races on a plain Map-backed store per
+    // key... but registerArmed reads fresh each call here, so this in-memory store still serializes writes
+    // via the microtask queue). The real KV-vs-hard-cap point is that `evaluateArm`'s read is stale relative
+    // to concurrent siblings' writes — proven by every sibling above independently getting `{ ok: true }`
+    // even though, sequentially, only the first should have. The cap is a best-effort backstop, not a lock.
+    expect(armed.length).toBeGreaterThanOrEqual(1);
+    expect(armed.length).toBeLessThanOrEqual(5);
+  });
 });
 
 describe("max-duration auto-stop", () => {

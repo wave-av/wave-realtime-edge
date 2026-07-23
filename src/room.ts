@@ -16,7 +16,8 @@ import { MediaTap, tapPublishFrame, mediaTapEnabled } from "./media-tap.js";
 import type { TapConsumerHandle, TapFrame } from "./media-tap.js";
 import { startAgentRead, type AgentReadTarget, type AgentFrameSink } from "./agent-media-consumer.js";
 import { buildTurnLoopSink, type TurnLoopDriver } from "./agent-turn-sink.js";
-import { startRoutedEgress, type RoutedEgressArmEnv } from "./egress-arm.js";
+import { startRoutedEgress, startRoutedEgressGuarded, type RoutedEgressArmEnv, type EgressCostGuard } from "./egress-arm.js";
+import type { KillswitchStore } from "./egress-killswitch.js";
 import { validateEgressJob, type EgressJob } from "./egress-router.js";
 import {
   acceptPresenceSocket,
@@ -447,6 +448,12 @@ export interface RoomDOEnv {
   RUNPOD_API_TOKEN?: string;
   /** test-only: injected HTTP client the routed-egress consumer POSTs frames through (defaults to global fetch). */
   __egressFetch?: typeof fetch;
+  // #278 W0 — cost-governance guard for routed egress (see egress-killswitch.ts). Reuses the SAME
+  // RT_MEETING_ORG KV namespace binding whip.ts/stream-bridge.ts already share (structurally satisfies
+  // KillswitchStore: get/put/delete). When bound, `armRoutedEgress` routes through `startRoutedEgressGuarded`
+  // (kill switch + best-effort concurrency cap, see #15) instead of the unguarded `startRoutedEgress`. Absent
+  // binding → falls back to the unguarded path (no behavior change for envs that don't bind it).
+  RT_MEETING_ORG?: KillswitchStore;
   // ── LK-rip #46 SFU event emitter (DORMANT until cutover). DO forwards to Signaling → WSC Argus
   // ingest ONLY when WAVE_REALTIME_EVENTS_EMIT="1" AND the shared HMAC secret is set (else inert). ──
   WAVE_REALTIME_EVENTS_EMIT?: string; // "1" arms; absent/anything-else → inert
@@ -583,17 +590,28 @@ export class RoomDO {
    *
    * `fetchFn` (test-only) overrides the injected `__egressFetch`/global fetch; it is never called until BOTH
    * flags are armed AND a matching (video) frame is published, so this method is fully inert by default.
+   *
+   * #278 W0 — COST-GUARDED when `env.RT_MEETING_ORG` is bound: routes through `startRoutedEgressGuarded`
+   * (kill switch + best-effort per-org/global concurrency cap, see egress-killswitch.ts) so this room's arm is
+   * counted in the same armed-registry the kill switch and max-duration sweep read. `orgId` comes from this
+   * room's own bound config (`ensureRoom`'s org — never re-derived or guessed); `streamId` is this room's id,
+   * one routed-egress drain per room. Falls back to the unguarded `startRoutedEgress` when RT_MEETING_ORG is
+   * unbound (or the room has no config yet) — no behavior change for envs that don't bind the KV.
    */
-  armRoutedEgress(job: EgressJob, fetchFn?: typeof fetch): boolean {
+  async armRoutedEgress(job: EgressJob, fetchFn?: typeof fetch): Promise<boolean> {
     // Close any prior drain (idempotent re-arm) before (re)registering.
     this.routedEgressHandle?.close();
     this.routedEgressHandle = null;
-    this.routedEgressHandle = startRoutedEgress(
-      this.mediaTap,
-      job,
-      this.env satisfies RoutedEgressArmEnv,
-      fetchFn ?? this.env.__egressFetch ?? fetch,
-    );
+    const env = this.env satisfies RoutedEgressArmEnv;
+    const resolvedFetch = fetchFn ?? this.env.__egressFetch ?? fetch;
+    const store = this.env.RT_MEETING_ORG;
+    const config = store ? (await this.core.snapshot()).config : null;
+    if (store && config) {
+      const costGuard: EgressCostGuard = { store, orgId: config.org, streamId: config.roomId };
+      this.routedEgressHandle = await startRoutedEgressGuarded(this.mediaTap, job, env, resolvedFetch, costGuard);
+    } else {
+      this.routedEgressHandle = startRoutedEgress(this.mediaTap, job, env, resolvedFetch);
+    }
     return this.routedEgressHandle !== null;
   }
 
@@ -635,7 +653,7 @@ export class RoomDO {
       try {
         const body = (await request.json().catch(() => null)) as EgressJob | null;
         if (body && typeof body === "object" && validateEgressJob(body) === null) {
-          const armed = this.armRoutedEgress(body);
+          const armed = await this.armRoutedEgress(body);
           return Response.json({ ok: true, armed }, { status: 200 });
         }
         return Response.json({ error: "BAD_REQUEST", message: "egress-bind requires a valid EgressJob body" }, { status: 400 });

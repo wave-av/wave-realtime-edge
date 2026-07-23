@@ -492,10 +492,21 @@ RECORDER_PUBLIC_WSS = "wss://wave-realtime-edge-canary.jakefineman.workers.dev/v
 binding = "RT_RECORDINGS"
 bucket_name = "wave-realtime-recordings-canary"
 
-# meetingId→org map — restated (same namespace id is fine; canary shares the lookup map).
+# meetingId→org map — MUST be a DISTINCT namespace from the top-level (prod) binding above: this same
+# binding now also backs the #278 egress kill-switch/cost-guard registry (egress-killswitch.ts), so sharing
+# the prod id here would let canary egress arm/disarm mutate PROD kill-switch + concurrency-cap state.
+# ◆ NOT YET CREATED — no canary-specific RT_MEETING_ORG namespace exists in this repo/account today. Do NOT
+# reuse the prod id as a stopgap. Before canary carries any egress-guarded traffic, create one:
+#   wrangler kv namespace create RT_MEETING_ORG_CANARY   (same CF account as the prod namespace, d674452f)
+# and paste its id below. Until then this id is a placeholder and canary deploys of this binding will fail
+# closed (structurally invalid id) rather than silently sharing prod state — intentional, not an oversight.
+# Inert-for-now note: canary does NOT currently arm routed egress with a cost guard (RT_MEETING_ORG is not
+# read by any canary-only code path beyond the pre-existing WHIP/meeting-lookup reuse below), so the shared
+# id was latent, not actively corrupting prod state as merged — but it must still be split before canary ever
+# carries egress, per the #278 review.
 [[env.canary.kv_namespaces]]
 binding = "RT_MEETING_ORG"
-id = "4acd6ec7b04546ba8767f2353d5394e8"
+id = "TODO-canary-rt-meeting-org"
 
 # ROOM DO — restated so the canary worker boots (room.ts RoomDO; migrations v1 inherited from top level).
 [[env.canary.durable_objects.bindings]]
