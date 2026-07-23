@@ -48,6 +48,9 @@ import {
   type ConcurrencyLimits,
   type KillswitchStore,
 } from "./egress-killswitch.js";
+import { validateDestinationUrl, type DestKind, type SsrfGuardOptions } from "./ssrf-guard.js";
+import { egressDestMgmtEnabled, resolveDestinationForArm, type EgressDestinationsEnv } from "./egress-destinations.js";
+import type { CfStreamEgressClient } from "./egress-cf-stream-passthrough.js";
 
 /** Env fields this factory reads. Reuses the SAME var/secret names the P2/P3 backend Env interfaces already
  *  declare (`EgressWaveRenderEnv.WAVE_RENDER_URL`/`WAVE_INTERNAL_RENDER_TOKEN`,
@@ -204,4 +207,96 @@ export async function startRoutedEgressGuarded(
   // media-tap's contract, so no await is threaded through the frame-publish path.
   void pumpConsumer(handle, consumer);
   return handle;
+}
+
+/**
+ * W1 SLICE-2B O1 (wre#287) — SSRF-AT-CONNECT (SHARED helper, lands here — the arm/connect path). A stored
+ * destination cleared `validateDestinationUrl` at CREATE time (`egress-destinations.ts` POST), but DNS can
+ * rebind between create and the moment the arm actually dials out (documented on `validateDestinationUrl` and
+ * on `resolveDestinationForArm`, both of which explicitly punt the re-check to the caller). This is that
+ * re-check: it re-runs the SAME deny-by-default, DNS-rebind-safe validation immediately before any outbound
+ * provision/dial, so a destination that resolved to a public IP at create time but a private/metadata/CGNAT IP
+ * NOW is refused here — never provisioned. Fail-closed: any `{ok:false}` from `validateDestinationUrl` (parse
+ * failure, denied host, resolver outage) surfaces as a typed refusal, never a throw into the media path.
+ */
+export type ConnectSsrfCheckResult = { readonly ok: true } | { readonly ok: false; readonly reason: string };
+
+export async function assertDestinationSafeAtConnect(
+  dest: { readonly kind: DestKind; readonly url: string },
+  deps: Pick<SsrfGuardOptions, "resolveHost" | "fetchFn"> = {},
+): Promise<ConnectSsrfCheckResult> {
+  const result = await validateDestinationUrl(dest.kind, dest.url, deps);
+  return result.ok ? { ok: true } : { ok: false, reason: result.reason };
+}
+
+/** Env this O1 arm path reads: BOTH `EGRESS_ROUTER_ENABLED` (shared egress-router flag) AND
+ *  `EGRESS_DEST_MGMT_ENABLED` (destination CRUD's own flag) must be armed — either alone leaves the path INERT,
+ *  same strict true/"1"/"true" predicates every other flag in this codebase uses. */
+export interface ExternalRtmpRestreamArmEnv extends EgressDestinationsEnv {
+  EGRESS_ROUTER_ENABLED?: string | boolean;
+}
+
+/** The outcome of one O1 external-RTMP restream arm attempt. Discriminated so a refusal (inert, not-found,
+ *  foreign-org, SSRF-at-connect reject, or a non-2xx CF reply) is never mistaken for a provisioned output. */
+export type ExternalRtmpRestreamOutcome =
+  | { readonly status: "provisioned"; readonly outputId: string }
+  | { readonly status: "refused"; readonly httpStatus: number; readonly reason: string };
+
+/** Join a destination's separately-stored `{url, streamKey}` (`resolveDestinationForArm`) into the single
+ *  combined rtmp(s) URL `CfStreamEgressTarget.rtmpDestination` already carries (`host/app/streamKey` — the exact
+ *  shape `egress-cf-stream-passthrough.test.ts` exercises). The concrete CF adapter
+ *  (`egress-cf-stream-live-output-client.ts`) splits it back apart into CF's real two-field wire body. */
+function joinRtmpDestination(dest: { url: string; streamKey?: string }): string {
+  if (!dest.streamKey) return dest.url;
+  return dest.url.endsWith("/") ? `${dest.url}${dest.streamKey}` : `${dest.url}/${dest.streamKey}`;
+}
+
+/**
+ * ARM an external RTMP restream (O1, wre#287): re-stream an already-ingested Zoom CF Live Input out to a
+ * customer's EXTERNAL RTMP destination by creating a CF Stream Live Output. INERT unless BOTH
+ * `EGRESS_ROUTER_ENABLED` and `EGRESS_DEST_MGMT_ENABLED` are armed — no behavior change with either flag off.
+ *
+ * FLOW (fail-closed at every step, never a throw into the media path):
+ *   1. Flags off → refused (404), no lookups performed.
+ *   2. `resolveDestinationForArm(env, org, destId)` — null (absent OR foreign-org) → refused (404). Never
+ *      distinguishes "absent" from "foreign org" in the reason text (mirrors the HTTP GET's fail-closed shape).
+ *   3. `assertDestinationSafeAtConnect(dest)` — the SSRF re-check, run BEFORE any outbound provision/dial. A
+ *      reject (DNS-rebind or otherwise) → refused (403), NO provision call reaches CF.
+ *   4. `client.provisionOutput(...)` — the concrete CF Live Output create. A non-2xx CF reply is a typed refusal
+ *      carrying CF's status, never a throw.
+ */
+export async function armExternalRtmpRestream(
+  env: ExternalRtmpRestreamArmEnv,
+  org: string,
+  destId: string,
+  target: { readonly sessionId: string; readonly trackName: string },
+  client: CfStreamEgressClient,
+  deps: Pick<SsrfGuardOptions, "resolveHost" | "fetchFn"> = {},
+): Promise<ExternalRtmpRestreamOutcome> {
+  if (!egressRouterEnabled(env) || !egressDestMgmtEnabled(env)) {
+    return { status: "refused", httpStatus: 404, reason: "external rtmp restream is not armed" };
+  }
+
+  const dest = await resolveDestinationForArm(env, org, destId);
+  if (!dest) {
+    return { status: "refused", httpStatus: 404, reason: "destination not found" };
+  }
+
+  // SSRF-AT-CONNECT — re-runs BEFORE any outbound provision/dial (see assertDestinationSafeAtConnect docstring
+  // above). Catches a DNS rebind between the destination's create-time validation and this connect attempt.
+  const safe = await assertDestinationSafeAtConnect(dest, deps);
+  if (!safe.ok) {
+    return { status: "refused", httpStatus: 403, reason: `destination failed SSRF-at-connect check: ${safe.reason}` };
+  }
+
+  const result = await client.provisionOutput({
+    sessionId: target.sessionId,
+    trackName: target.trackName,
+    output: "simulcast",
+    rtmpDestination: joinRtmpDestination(dest),
+  });
+  if (!result.ok) {
+    return { status: "refused", httpStatus: result.status, reason: result.reason };
+  }
+  return { status: "provisioned", outputId: result.outputId };
 }
