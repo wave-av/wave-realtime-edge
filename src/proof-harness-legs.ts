@@ -12,6 +12,7 @@ import type { LegProbe } from "./proof-harness.js";
 import { CfStreamLiveClientImpl, type CfStreamLiveClientConfig, type StreamInputKv } from "./cf-stream-live-client.js";
 import { registerRecording, type RegisterConfig, type RegisterRecordingInput } from "./recordings-register.js";
 import { rtmsHandshakeSignature } from "./rtms-auth.js";
+import { randomUUID } from "node:crypto";
 
 /**
  * `rtmp-in` — synthetic CF Stream Live-input provision. Runs the SAME `CfStreamLiveClientImpl.createLiveInput`
@@ -107,13 +108,17 @@ export function vodRegisterProbe(
  */
 export function rtmsInProbe(
   clientId = "proof-harness",
-  clientSecret = "proof-harness-secret",
+  clientSecret?: string,
   signFn: typeof rtmsHandshakeSignature = rtmsHandshakeSignature,
 ): LegProbe {
+  // No secret value is hardcoded here: an explicit caller-supplied value wins, otherwise fall back to an
+  // env-configured probe secret, otherwise mint a fresh random one per invocation — this probe only exercises
+  // the WebCrypto HMAC signing path (a well-formed 64-hex signature), so the actual secret VALUE is arbitrary.
+  const secret = clientSecret ?? process.env.PROOF_HARNESS_RTMS_SECRET ?? randomUUID();
   return async () => {
     const meetingUuid = "proof-harness-meeting";
     const rtmsStreamId = "proof-harness-stream";
-    const sig = await signFn(clientId, meetingUuid, rtmsStreamId, clientSecret);
+    const sig = await signFn(clientId, meetingUuid, rtmsStreamId, secret);
     if (typeof sig !== "string" || !/^[0-9a-f]{64}$/i.test(sig)) {
       return { verdict: "fail", markers: { sigLen: sig?.length }, note: "handshake signature not a 64-hex HMAC-SHA256" };
     }
