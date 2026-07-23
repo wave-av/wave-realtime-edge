@@ -161,6 +161,20 @@ EGRESS_ROUTER_ENABLED = "0"  # INERT — #75 P2/P3/P4 backends built; arming is 
 # an internal/loopback/link-local/metadata/CGNAT(tailnet) address before the container-start sink.
 INGRESS_ROUTER_ENABLED = "1"  # ARMED 2026-07-15 (Jake-named ◆, whep-live-egress epic): the ONLY runtime caller is maybeHandleWhepSources (whep-sources.ts) → arms POST/GET /v1/whep/sources (gatewayGate + x-wave-org). P3/P4 backends re-export the flag but are never instantiated, so no other live behavior changes. Requires the Stream token bound (CLOUDFLARE_STREAM_API_TOKEN, provisioned).
 
+# ── W1 O3 (wre#289) — external egress DESTINATION management. DEFAULT OFF / FULLY INERT. ──
+# EGRESS_DEST_MGMT_ENABLED gates POST/GET/DELETE /v1/egress/destinations[/{id}] (src/egress-destinations.ts) —
+# the security foundation the O1/O2 external-RTMP/SRT restream arm will consume next (resolveDestinationForArm).
+# A SIBLING flag, not a reuse of INGRESS_ROUTER_ENABLED: this is new destination-CRUD + crypto surface and gets
+# its own Jake-named ◆ arm. Absent/"0" → the route falls through to the 501 catch-all, UNCHANGED. Every create
+# runs the #17 SSRF guard (src/ssrf-guard.ts, deny-by-default, DNS-rebind-safe) before persisting a url, and
+# encrypts streamKey/passphrase at rest (#18, src/dest-key-crypto.ts, AES-256-GCM) before any KV write.
+EGRESS_DEST_MGMT_ENABLED = "0"  # INERT — arming is a ◆ Jake crossing (requires DEST_KEY_ENCRYPTION_KEY provisioned)
+
+# DEST_KEY_ENCRYPTION_KEY is a wrangler SECRET — `wrangler secret put DEST_KEY_ENCRYPTION_KEY` (Doppler wave/prd).
+# TODO(doppler ◆): base64-encoded 32-byte (256-bit) AES-GCM key; value NOT set here — Jake-named crossing.
+# Unset → create-time encryption throws → the route 503s (DEST_KEY_CRYPTO_NOT_CONFIGURED), never a silent
+# plaintext fallback.
+
 # ── B1 (#91-a) — CF Stream Live → SFU bridge control plane (POST /v1/stream/bridge/webhook). DEFAULT OFF. ──
 # STREAM_BRIDGE_ENABLED gates the self-authenticating CF Stream webhook receiver (src/stream-bridge.ts). Absent/
 # "0" → the route falls through to the honest 501 catch-all, UNCHANGED — the whole bridge is inert. The webhook
