@@ -64,26 +64,74 @@ describe("#293 rtmpInProbe", () => {
     expect(receipt.verdict).toBe("fail");
     expect(receipt.note).toMatch(/no usable rtmp endpoint/);
   });
+
+  it("best-effort DELETEs the created uid after a successful create (no leaked live input)", async () => {
+    const calls: { method: string; url: string }[] = [];
+    const fetchFn = (async (url: string, init?: RequestInit) => {
+      calls.push({ method: init?.method ?? "GET", url: String(url) });
+      if ((init?.method ?? "GET") === "DELETE") return new Response("{}", { status: 200 });
+      return new Response(
+        JSON.stringify({ success: true, result: { uid: "28064cd43cee30dd62c728da2152c61d", rtmps: { url: "rtmp://live.example/x", streamKey: "sk" } } }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const probe = rtmpInProbe({ accountId: "acct", apiToken: "tok", kv: fakeKv(), fetchFn });
+    const receipt = await runLeg("rtmp-in", probe, () => 0);
+    expect(receipt.verdict).toBe("pass");
+    const deleteCall = calls.find((c) => c.method === "DELETE");
+    expect(deleteCall).toBeDefined();
+    expect(deleteCall!.url).toContain("28064cd43cee30dd62c728da2152c61d");
+  });
 });
 
 describe("#293 vodRegisterProbe", () => {
   const cfg = { gatewayOrigin: "https://api.wave.example", serviceToken: "tok" };
+  const ALLOW_LISTED_BUCKETS = new Set(["wave-recordings-enam", "wave-recordings-eu"]);
 
-  it("passes on a 2xx register", async () => {
+  /** Fake gateway that enforces the SAME residency allow-list the real gateway enforces — the fake that
+   *  would have caught the original bug (a fake that always 200s never would have). */
+  function fakeGatewayEnforcingAllowlist(): typeof fetch {
+    return (async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (!ALLOW_LISTED_BUCKETS.has(body.bucket)) {
+        return new Response(JSON.stringify({ reason: "residency_bucket_mismatch" }), { status: 403 });
+      }
+      return new Response(JSON.stringify({ recordingId: "rec_1", deduped: false }), { status: 200 });
+    }) as unknown as typeof fetch;
+  }
+
+  it("passes on a 2xx register (real allow-listed bucket)", async () => {
     const fetchImpl = (async () =>
       new Response(JSON.stringify({ recordingId: "rec_1", deduped: false }), { status: 200 })) as unknown as typeof fetch;
-    const probe = vodRegisterProbe(cfg, fetchImpl);
+    const probe = vodRegisterProbe(cfg, fetchImpl, { bucket: "wave-recordings-enam" });
     const receipt = await runLeg("vod-register", probe, () => 123);
     expect(receipt.verdict).toBe("pass");
     expect(receipt.markers).toMatchObject({ recordingId: "rec_1" });
   });
 
-  it("fails on a non-2xx register", async () => {
-    const fetchImpl = (async () => new Response(JSON.stringify({ reason: "residency_bucket_mismatch" }), { status: 403 })) as unknown as typeof fetch;
+  it("passes against a fake that ENFORCES the residency allow-list — the default synthetic bucket is " +
+    "deliberately non-allow-listed, so the expected 403 residency_bucket_mismatch proves reachable+authed " +
+    "without writing a synthetic prod row (the bug: this used to report 'fail' on every real, healthy tick)", async () => {
+    const probe = vodRegisterProbe(cfg, fakeGatewayEnforcingAllowlist()); // default (non-allow-listed) bucket
+    const receipt = await runLeg("vod-register", probe, () => 123);
+    expect(receipt.verdict).toBe("pass");
+    expect(receipt.markers).toMatchObject({ reason: "residency_bucket_mismatch", status: 403 });
+  });
+
+  it("fails on a genuine non-residency rejection (e.g. auth failure)", async () => {
+    const fetchImpl = (async () => new Response(JSON.stringify({ reason: "unauthorized" }), { status: 401 })) as unknown as typeof fetch;
     const probe = vodRegisterProbe(cfg, fetchImpl);
     const receipt = await runLeg("vod-register", probe, () => 123);
     expect(receipt.verdict).toBe("fail");
-    expect(receipt.markers).toMatchObject({ status: 403 });
+    expect(receipt.markers).toMatchObject({ status: 401 });
+  });
+
+  it("fails on a 403 that is NOT the expected residency_bucket_mismatch reason", async () => {
+    const fetchImpl = (async () => new Response(JSON.stringify({ reason: "forbidden_org" }), { status: 403 })) as unknown as typeof fetch;
+    const probe = vodRegisterProbe(cfg, fetchImpl);
+    const receipt = await runLeg("vod-register", probe, () => 123);
+    expect(receipt.verdict).toBe("fail");
+    expect(receipt.markers).toMatchObject({ status: 403, reason: "forbidden_org" });
   });
 
   it("fails when unconfigured (no gatewayOrigin/serviceToken)", async () => {
@@ -101,6 +149,21 @@ describe("#293 rtmsInProbe", () => {
     const receipt = await runLeg("rtms-in", probe, () => 0);
     expect(receipt.verdict).toBe("pass");
     expect(receipt.markers.sigLen).toBe(64);
+  });
+
+  it("fails when the signature is malformed (not 64-hex) — the historical WebCrypto-unavailable failure mode", async () => {
+    const badSignFn = (async () => "not-a-hex-signature") as unknown as typeof import("../src/rtms-auth.js").rtmsHandshakeSignature;
+    const probe = rtmsInProbe("proof-harness", "proof-harness-secret", badSignFn);
+    const receipt = await runLeg("rtms-in", probe, () => 0);
+    expect(receipt.verdict).toBe("fail");
+    expect(receipt.note).toMatch(/not a 64-hex HMAC-SHA256/);
+  });
+
+  it("fails when the signature is empty/undefined", async () => {
+    const badSignFn = (async () => undefined) as unknown as typeof import("../src/rtms-auth.js").rtmsHandshakeSignature;
+    const probe = rtmsInProbe("proof-harness", "proof-harness-secret", badSignFn);
+    const receipt = await runLeg("rtms-in", probe, () => 0);
+    expect(receipt.verdict).toBe("fail");
   });
 });
 

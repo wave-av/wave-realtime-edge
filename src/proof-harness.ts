@@ -17,7 +17,7 @@
  *     never an uncaught rejection (a cron tick must survive one wedged leg to still report the other four).
  *   - `runProofHarness` runs every leg in `LEG_NAMES`, backfilling any leg the caller didn't wire with a
  *     `"stub"` verdict (upstream not built yet — explicit and visible, never silently skipped).
- *   - `gateDecision` is the merge-gate policy: a `"stub"` leg does NOT block (nothing to prove yet); a
+ *   - `legGate` is the merge-gate policy: a `"stub"` leg does NOT block (nothing to prove yet); a
  *     `"fail"` on any REQUIRED leg does. Once a leg's real probe lands, it stops being a stub and starts
  *     gating for real — no engine change needed, only the probe wiring in `proof-harness-legs.ts`.
  */
@@ -122,12 +122,17 @@ export function legGate(receipt: LegReceipt, opts: { allowStub?: boolean } = {})
 
 /** The cron/synthetic-monitoring gate over a FULL harness run: which of the `requiredLegs` (typically every
  *  leg with a real, non-stub probe wired) came back `"fail"`. An empty `blocking` list = green synthetic
- *  run — the W0 exit receipt issue #293 asks for. */
+ *  run — the W0 exit receipt issue #293 asks for. `stubLegs` is surfaced ALONGSIDE `blocking` (not folded
+ *  into `allow`) so a consumer can never read `allow:true` as "all five transports proven live" when some are
+ *  still on the default stub (no upstream probe wired yet, see `proof-harness-legs.ts`) — a stub is invisible
+ *  to `allow` by design (it must not block), but it should never be silently invisible to a human reading the
+ *  gate result either. */
 export function harnessGate(
   result: ProofHarnessResult,
   requiredLegs: readonly LegName[] = LEG_NAMES,
-): { allow: boolean; blocking: readonly LegName[] } {
+): { allow: boolean; blocking: readonly LegName[]; stubLegs: readonly LegName[] } {
   const required = new Set(requiredLegs);
   const blocking = result.receipts.filter((r) => required.has(r.leg) && r.verdict === "fail").map((r) => r.leg);
-  return { allow: blocking.length === 0, blocking };
+  const stubLegs = result.receipts.filter((r) => required.has(r.leg) && r.verdict === "stub").map((r) => r.leg);
+  return { allow: blocking.length === 0, blocking, stubLegs };
 }

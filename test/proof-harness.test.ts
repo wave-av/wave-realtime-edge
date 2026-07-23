@@ -130,7 +130,7 @@ describe("#293 harnessGate — cron/synthetic-monitoring gate", () => {
       fakeClock(),
     );
     const gate = harnessGate(result, ["rtmp-in"]);
-    expect(gate).toEqual({ allow: true, blocking: [] });
+    expect(gate).toEqual({ allow: true, blocking: [], stubLegs: [] });
   });
 
   it("a failed required leg blocks and is named", async () => {
@@ -139,7 +139,7 @@ describe("#293 harnessGate — cron/synthetic-monitoring gate", () => {
       fakeClock(),
     );
     const gate = harnessGate(result, ["vod-register"]);
-    expect(gate).toEqual({ allow: false, blocking: ["vod-register"] });
+    expect(gate).toEqual({ allow: false, blocking: ["vod-register"], stubLegs: [] });
   });
 
   it("a failed leg NOT in requiredLegs does not block", async () => {
@@ -157,5 +157,15 @@ describe("#293 harnessGate — cron/synthetic-monitoring gate", () => {
       fakeClock(),
     );
     expect(harnessGate(result).allow).toBe(false);
+  });
+
+  it("surfaces stubLegs alongside blocking so allow:true is never mistaken for '5 transports proven live'", async () => {
+    const result = await runProofHarness(
+      { "rtmp-in": async () => ({ verdict: "pass", markers: {} }) },
+      fakeClock(),
+    );
+    const gate = harnessGate(result); // default requiredLegs = every leg
+    expect(gate.allow).toBe(true); // stubs never block…
+    expect([...gate.stubLegs].sort()).toEqual(["ext-rtmp-out", "ext-srt-out", "rtms-in", "vod-register"].sort()); // …but are visible
   });
 });
