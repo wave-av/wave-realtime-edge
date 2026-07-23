@@ -1,6 +1,6 @@
 /**
- * WHEP-A (whep-live-egress-golive epic) — the source PROVISION + DISCOVERY surface, symmetric with the WHIP
- * publish mint. Two verbs on ONE path, `/v1/whep/sources`:
+ * WHEP-A (whep-live-egress-golive epic) — the source PROVISION + DISCOVERY + TEARDOWN surface, symmetric with the
+ * WHIP publish mint. Three verbs on `/v1/whep/sources[/{uid}]`:
  *
  *   • POST /v1/whep/sources  — provision a CF Stream Live source for the caller's org. Body:
  *       `{ sourceKind, room, sourceUrl?, maxCostRank? }`. Routes through the authoritative `ingressRoute`; only a
@@ -8,6 +8,10 @@
  *       `201 { uid, endpoints }` — the `uid` is the WHEP `?resource=` key, `endpoints` the RTMPS/SRT push targets.
  *   • GET  /v1/whep/sources  — list the caller org's live sources `{ sources: [{uid, room, createdAt}] }` from the
  *       reverse KV index (org-scoped; a viewer only ever sees their OWN org's sources — tenant isolation §9.6).
+ *   • DELETE /v1/whep/sources/{uid} — teardown (W1 slice-1's teardown half; consumed by wave-zoom
+ *       livestream-teardown). OWNERSHIP-checked against the forward KV binding: absent → idempotent 200 (already
+ *       gone), foreign org → 403. Best-effort deletes the CF Stream Live input (fail-open on the CF call — a
+ *       webhook/job retry must never 500 on this), then cleans BOTH KV keys. Returns `200 {ok:true, uid}`.
  *
  * AUTH + org are enforced UPSTREAM by the worker dispatch (gatewayGate + `x-wave-org`), identical to the WHIP/WHEP
  * blocks; `org` arrives already validated. This module never trusts an org from the body. Gated INERT behind
@@ -22,9 +26,13 @@ import type { IngestJob, IngestSourceKind } from "./ingress-router.js";
 import { INGEST_SOURCE_KINDS } from "./ingress-router.js";
 import {
   CfStreamLiveClientImpl,
+  LIVE_INPUT_UID,
+  ORG_STREAM_INPUTS_PREFIX,
   readOrgStreamInputs,
+  type OrgStreamInputEntry,
   type StreamInputKv,
 } from "./cf-stream-live-client.js";
+import { STREAM_INPUT_ORG_PREFIX } from "./stream-bridge.js";
 
 /** Env fields this handler reads. Extends the backend's flag/creds env with the account id + KV binding the
  *  concrete adapter needs. All are `wrangler secret`/`--var` populated (Doppler `wave/prd`) — never in source. */
@@ -72,6 +80,82 @@ function parseProvisionBody(body: unknown): { job: IngestJob } | { error: string
   return { job };
 }
 
+/** Match `/v1/whep/sources/{uid}` and return the (possibly empty) RAW (still percent-encoded) uid segment; `null`
+ *  when the path isn't a teardown path at all (so the caller can fall back to the bare-path GET/POST handling /
+ *  null fall-through). Decoding is deferred to the caller (`decodeTeardownUid`) so a malformed percent-encoding
+ *  can be turned into a clean 400 instead of an unguarded `URIError` thrown from path-matching. */
+function matchTeardownPath(pathname: string): string | null {
+  const prefix = `${SOURCES_PATH}/`;
+  if (!pathname.startsWith(prefix)) return null;
+  return pathname.slice(prefix.length);
+}
+
+/** Decode + shape-validate a raw teardown uid segment. Returns the decoded uid, or an error reason string on
+ *  malformed percent-encoding (`URIError`) or a uid that doesn't match the CF Stream live-input shape (32
+ *  lowercase hex — the SAME shape `CfStreamLiveClientImpl` writes/reads, `cf-stream-live-client.ts`). Rejecting
+ *  bad-shape uids here is defense-in-depth: the KV ownership check below already gates cross-org exploitation,
+ *  but there's no reason to let an obviously-invalid uid reach the CF delete call at all. */
+function decodeTeardownUid(rawUid: string): { uid: string } | { error: string } {
+  let uid: string;
+  try {
+    uid = decodeURIComponent(rawUid);
+  } catch {
+    return { error: "uid path segment is not valid percent-encoding" };
+  }
+  if (!LIVE_INPUT_UID.test(uid)) {
+    return { error: "uid must be a 32-char lowercase-hex CF Stream live-input id" };
+  }
+  return { uid };
+}
+
+/** Remove ONE uid from an org's reverse index (read-modify-write), tolerating an absent/corrupt index (no-op). */
+async function removeFromReverseIndex(kv: StreamInputKv, org: string, uid: string): Promise<void> {
+  const existing = await readOrgStreamInputs(kv, org);
+  const next: OrgStreamInputEntry[] = existing.filter((e) => e.uid !== uid);
+  if (next.length === existing.length) return; // uid wasn't present — nothing to write
+  await kv.put(`${ORG_STREAM_INPUTS_PREFIX}${org}`, JSON.stringify(next));
+}
+
+/**
+ * DELETE `/v1/whep/sources/{uid}` — teardown. Ownership-checked against the forward KV binding; absent → treated
+ * as already-gone (idempotent 200, no error — a retry/redelivery must never fail here). Foreign org → 403. The CF
+ * Stream Live delete is best-effort/fail-open (`bestEffortDeleteInput` never throws) so a CF outage can't block
+ * KV cleanup or turn a retry into a 500.
+ */
+async function teardownSource(
+  kv: StreamInputKv,
+  env: WhepSourcesEnv,
+  org: string,
+  uid: string,
+  deps: WhepSourcesDeps,
+): Promise<Response> {
+  const ownerKey = `${STREAM_INPUT_ORG_PREFIX}${uid}`;
+  const owner = await kv.get(ownerKey);
+  if (owner === null) {
+    // Already gone (never existed / already torn down) — idempotent success, not an error.
+    return Response.json({ ok: true, uid }, { status: 200 });
+  }
+  if (owner !== org) {
+    return jsonError("WHEP_SOURCE_FORBIDDEN", "source belongs to a different org", 403);
+  }
+
+  const creds = resolveCfCreds(env);
+  if (creds) {
+    const fetchFn = deps.fetchFn ?? fetch.bind(globalThis);
+    await CfStreamLiveClientImpl.bestEffortDeleteInput(fetchFn, creds.accountId, creds.apiToken, uid).catch((e) => {
+      // bestEffortDeleteInput itself never throws, but guard the call site too — KV cleanup must proceed either way.
+      console.warn(`whep-sources teardown bestEffortDeleteInput threw org=${org} uid=${uid}: ${(e as Error)?.message ?? e}`);
+    });
+  } else {
+    console.warn(`whep-sources teardown SKIPPED CF delete (no creds configured) org=${org} uid=${uid} — KV still cleaned`);
+  }
+
+  await kv.delete(ownerKey);
+  await removeFromReverseIndex(kv, org, uid);
+
+  return Response.json({ ok: true, uid }, { status: 200 });
+}
+
 /**
  * Handle `/v1/whep/sources`. Returns a Response for a recognized method, or `null` for an unrecognized method/path
  * so the caller falls through to the 501 catch-all (same null-fallthrough contract as handleWhip/handleWhep).
@@ -91,12 +175,28 @@ export async function handleWhepSources(
   deps: WhepSourcesDeps = {},
 ): Promise<Response | null> {
   const url = new URL(request.url);
-  if (url.pathname !== SOURCES_PATH) return null;
+  const teardownUid = matchTeardownPath(url.pathname);
+  if (url.pathname !== SOURCES_PATH && teardownUid === null) return null;
 
   const kv = env.RT_MEETING_ORG;
   if (!kv) {
     // config-no-silent-noop: a missing KV binding is a misconfiguration, not a silent empty.
     return jsonError("WHEP_SOURCES_NOT_CONFIGURED", "RT_MEETING_ORG KV binding is not configured", 503);
+  }
+
+  // ── DELETE /v1/whep/sources/{uid}: teardown (W1 slice-1's teardown half) ──
+  if (teardownUid !== null) {
+    if (request.method !== "DELETE") {
+      return jsonError("WHEP_METHOD_NOT_ALLOWED", "DELETE to teardown a source", 405);
+    }
+    if (!teardownUid) {
+      return jsonError("WHEP_BAD_REQUEST", "uid is required in the path", 400);
+    }
+    const decoded = decodeTeardownUid(teardownUid);
+    if ("error" in decoded) {
+      return jsonError("WHEP_BAD_REQUEST", decoded.error, 400);
+    }
+    return teardownSource(kv, env, org, decoded.uid, deps);
   }
 
   // ── GET: discover this org's live sources (no CF creds needed — pure KV read) ──
@@ -171,7 +271,8 @@ export async function handleWhepSources(
 /**
  * Dispatch wrapper mirroring `maybeHandleIngestBridge` / `maybeHandleStreamBridge`: keeps the route-dispatch
  * hot path a one-liner (file-size-two-tier-gate) and co-locates the flag + gateway-trust + org gating with the
- * handler it guards. Returns null (fall-through) when the path isn't `/v1/whep/sources` or the router is INERT.
+ * handler it guards. Returns null (fall-through) when the path isn't `/v1/whep/sources[/{uid}]` or the router is
+ * INERT.
  */
 export async function maybeHandleWhepSources(
   request: Request,
@@ -180,7 +281,8 @@ export async function maybeHandleWhepSources(
   safeOrg: RegExp,
 ): Promise<Response | null> {
   const url = new URL(request.url);
-  if (url.pathname !== SOURCES_PATH || !ingressRouterEnabled(env)) return null;
+  const isSourcesPath = url.pathname === SOURCES_PATH || matchTeardownPath(url.pathname) !== null;
+  if (!isSourcesPath || !ingressRouterEnabled(env)) return null;
   const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
   if (denied) return denied;
   const org = request.headers.get("x-wave-org") ?? "";

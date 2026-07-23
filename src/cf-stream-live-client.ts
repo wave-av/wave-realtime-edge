@@ -34,6 +34,7 @@ import type {
 export interface StreamInputKv {
   get(key: string): Promise<string | null>;
   put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<void>;
+  delete(key: string): Promise<void>;
 }
 
 /** Reverse-index KV key prefix: `org → [its live-input uids]`, powering org-scoped source discovery. Distinct
@@ -67,8 +68,9 @@ export interface CfStreamLiveClientConfig {
 
 const CF_API_BASE = "https://api.cloudflare.com/client/v4";
 const DEFAULT_TTL_SECONDS = 60 * 60 * 24 * 14; // 14d — parity with route-dispatch RT_MEETING_ORG writes
-/** A CF Stream live-input uid is 32 lowercase hex — the SAME shape WHEP validates as `?resource=`. */
-const LIVE_INPUT_UID = /^[0-9a-f]{32}$/;
+/** A CF Stream live-input uid is 32 lowercase hex — the SAME shape WHEP validates as `?resource=`. Exported so
+ *  callers (whep-sources.ts teardown) can pre-validate a path-derived uid against the SAME shape before use. */
+export const LIVE_INPUT_UID = /^[0-9a-f]{32}$/;
 
 /** Shape of the CF create-live-input reply we consume (grounded against the live API 2026-07-15). */
 interface CfCreateInputResult {
