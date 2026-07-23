@@ -7,6 +7,7 @@ import { describe, it, expect, vi } from "vitest";
 import { RoomDO } from "../src/room.js";
 import type { RoomDOEnv } from "../src/room.js";
 import type { EgressJob } from "../src/egress-router.js";
+import { MemoryKillswitchStore, listArmed, activateKillSwitch } from "../src/egress-killswitch.js";
 
 function memStorage() {
   const map = new Map<string, unknown>();
@@ -50,7 +51,7 @@ describe("#75 — RoomDO routed-egress arm", () => {
   it("armRoutedEgress drains a tapped video frame to the decided backend WHEN ARMED (one subscribe, fanned)", async () => {
     const fetchSpy = vi.fn(async () => new Response(null, { status: 200 }));
     const do_ = await seededRoom(armedEnv());
-    expect(do_.armRoutedEgress(COMPOSITE_JOB, fetchSpy as unknown as typeof fetch)).toBe(true);
+    expect(await do_.armRoutedEgress(COMPOSITE_JOB, fetchSpy as unknown as typeof fetch)).toBe(true);
     await do_.feedRecorderFrame("sess-1", "cam", FRAME);
     await new Promise((r) => setTimeout(r, 0));
     expect(fetchSpy).toHaveBeenCalledWith(
@@ -62,7 +63,7 @@ describe("#75 — RoomDO routed-egress arm", () => {
   it("is byte-identically INERT when EGRESS_ROUTER_ENABLED is off (no consumer, no fetch)", async () => {
     const fetchSpy = vi.fn(async () => new Response(null, { status: 200 }));
     const do_ = await seededRoom(armedEnv({ EGRESS_ROUTER_ENABLED: "0" }));
-    expect(do_.armRoutedEgress(COMPOSITE_JOB, fetchSpy as unknown as typeof fetch)).toBe(false);
+    expect(await do_.armRoutedEgress(COMPOSITE_JOB, fetchSpy as unknown as typeof fetch)).toBe(false);
     expect(do_.mediaTap.consumerCount).toBe(0);
     await do_.feedRecorderFrame("sess-1", "cam", FRAME);
     await new Promise((r) => setTimeout(r, 0));
@@ -72,7 +73,7 @@ describe("#75 — RoomDO routed-egress arm", () => {
   it("is byte-identically INERT when MEDIA_TAP_ENABLED is off (no consumer, no fetch)", async () => {
     const fetchSpy = vi.fn(async () => new Response(null, { status: 200 }));
     const do_ = await seededRoom(armedEnv({ MEDIA_TAP_ENABLED: "0" }));
-    expect(do_.armRoutedEgress(COMPOSITE_JOB, fetchSpy as unknown as typeof fetch)).toBe(false);
+    expect(await do_.armRoutedEgress(COMPOSITE_JOB, fetchSpy as unknown as typeof fetch)).toBe(false);
     expect(do_.mediaTap.consumerCount).toBe(0);
     await do_.feedRecorderFrame("sess-1", "cam", FRAME);
     await new Promise((r) => setTimeout(r, 0));
@@ -103,8 +104,44 @@ describe("#75 — RoomDO routed-egress arm", () => {
   it("re-arm is idempotent (only one routed-egress drain across the same tap)", async () => {
     const fetchSpy = vi.fn(async () => new Response(null, { status: 200 }));
     const do_ = await seededRoom(armedEnv());
-    do_.armRoutedEgress(COMPOSITE_JOB, fetchSpy as unknown as typeof fetch);
-    do_.armRoutedEgress(COMPOSITE_JOB, fetchSpy as unknown as typeof fetch);
+    await do_.armRoutedEgress(COMPOSITE_JOB, fetchSpy as unknown as typeof fetch);
+    await do_.armRoutedEgress(COMPOSITE_JOB, fetchSpy as unknown as typeof fetch);
     expect(do_.mediaTap.consumerCount).toBe(1);
+  });
+
+  // #278 W0 — proves the room.ts:591 call site is actually wired to the GUARDED variant, not just present
+  // standalone (the criticism the guard "protects zero live traffic"): with RT_MEETING_ORG bound, arming
+  // records the room in the shared armed-registry, and the global kill switch stops a subsequent arm.
+  describe("#278 W0 — cost-guarded wiring (RT_MEETING_ORG bound)", () => {
+    it("armRoutedEgress records the room in the shared armed-registry via startRoutedEgressGuarded", async () => {
+      const store = new MemoryKillswitchStore();
+      const fetchSpy = vi.fn(async () => new Response(null, { status: 200 }));
+      const do_ = await seededRoom(armedEnv({ RT_MEETING_ORG: store }));
+      expect(await do_.armRoutedEgress(COMPOSITE_JOB, fetchSpy as unknown as typeof fetch)).toBe(true);
+      const armed = await listArmed(store);
+      expect(armed).toEqual([{ streamId: "room-1", orgId: ORG, armedAt: expect.any(Number) }]);
+    });
+
+    it("armRoutedEgress is rejected once the global kill switch is active (guard actually enforced)", async () => {
+      const store = new MemoryKillswitchStore();
+      await activateKillSwitch(store, () => {});
+      const fetchSpy = vi.fn(async () => new Response(null, { status: 200 }));
+      const do_ = await seededRoom(armedEnv({ RT_MEETING_ORG: store }));
+      expect(await do_.armRoutedEgress(COMPOSITE_JOB, fetchSpy as unknown as typeof fetch)).toBe(false);
+      expect(do_.mediaTap.consumerCount).toBe(0);
+      await do_.feedRecorderFrame("sess-1", "cam", FRAME);
+      await new Promise((r) => setTimeout(r, 0));
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it("the egress-bind intent awaits the guarded arm (armed:true, registry populated)", async () => {
+      const store = new MemoryKillswitchStore();
+      const do_ = await seededRoom(
+        armedEnv({ RT_MEETING_ORG: store, __egressFetch: vi.fn(async () => new Response(null, { status: 200 })) as unknown as typeof fetch }),
+      );
+      const res = await do_.fetch(new Request("https://room/egress-bind", { method: "POST", body: JSON.stringify(COMPOSITE_JOB) }));
+      expect(await res.json()).toMatchObject({ ok: true, armed: true });
+      expect(await listArmed(store)).toHaveLength(1);
+    });
   });
 });

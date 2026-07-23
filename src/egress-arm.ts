@@ -41,6 +41,13 @@ import { egressRoute, type EgressBackend, type EgressJob } from "./egress-router
 import { egressRouterEnabled } from "./egress-wave-render.js";
 import { mediaTapEnabled, pumpConsumer } from "./media-tap.js";
 import type { MediaConsumer, MediaTap, TapConsumerHandle, TapFrame, TapSelector } from "./media-tap.js";
+import {
+  evaluateArm,
+  registerArmed,
+  registerDisarmed,
+  type ConcurrencyLimits,
+  type KillswitchStore,
+} from "./egress-killswitch.js";
 
 /** Env fields this factory reads. Reuses the SAME var/secret names the P2/P3 backend Env interfaces already
  *  declare (`EgressWaveRenderEnv.WAVE_RENDER_URL`/`WAVE_INTERNAL_RENDER_TOKEN`,
@@ -132,6 +139,20 @@ export function buildRoutedEgressConsumer(
  * (pumpConsumer loops until the handle closes); the returned handle.close() ends it. Re-subscribing the same
  * consumer id closes the prior handle (MediaTap.subscribe contract), so a re-arm is idempotent.
  */
+/** Cost-governance guard for `startRoutedEgress` (#278, W0 — kill-switch backstop). Optional: when omitted,
+ *  arming behaves exactly as before (no cap, no registry bookkeeping) — additive, not a behavior change for
+ *  existing callers. When supplied, EVERY arm is checked against `evaluateArm` (global kill switch, then
+ *  per-org + global concurrency caps, in that order — see egress-killswitch.ts) BEFORE the tap subscription is
+ *  created; a rejected arm returns `null` exactly like the existing "not armed" path, so callers do not need a
+ *  new branch. `orgId`/`streamId` identify the stream in the shared armed-registry the kill switch and the
+ *  max-duration sweep (`sweepExpired`) both read. */
+export interface EgressCostGuard {
+  readonly store: KillswitchStore;
+  readonly orgId: string;
+  readonly streamId: string;
+  readonly limits?: ConcurrencyLimits;
+}
+
 export function startRoutedEgress(
   tap: MediaTap,
   job: EgressJob,
@@ -142,6 +163,43 @@ export function startRoutedEgress(
   if (!routedEgressArmed(env)) return null;
   const consumer = buildRoutedEgressConsumer(job, env, fetchFn, opts);
   const handle = tap.subscribe(consumer.id, consumer.selector);
+  // Detached drain — pumpConsumer returns only when the handle closes (room end / re-arm). Isolated per
+  // media-tap's contract, so no await is threaded through the frame-publish path.
+  void pumpConsumer(handle, consumer);
+  return handle;
+}
+
+/** Cost-governed variant of `startRoutedEgress` (#278, W0 — kill-switch backstop). Every arm is checked
+ *  against `evaluateArm` (global kill switch first, then per-org + global concurrency caps — see
+ *  egress-killswitch.ts) BEFORE the tap subscription is created; a rejected arm returns `null`, exactly like
+ *  the existing "not armed" path, so no new branch is needed at call sites that adopt this. On success, the
+ *  stream is recorded in the shared armed-registry (`registerArmed`) that the kill switch and the
+ *  max-duration sweep (`sweepExpired`) both read, and the returned handle's `close()` is wrapped to also
+ *  deregister it (`registerDisarmed`) — so a normal room-end/re-arm teardown keeps the registry accurate
+ *  without every caller remembering to do it. Async (unlike `startRoutedEgress`) because the cap check reads
+ *  the store; a plain arm with no cost governance keeps using the sync function above unchanged. */
+export async function startRoutedEgressGuarded(
+  tap: MediaTap,
+  job: EgressJob,
+  env: RoutedEgressArmEnv,
+  fetchFn: typeof fetch,
+  costGuard: EgressCostGuard,
+  opts: { id?: string; selector?: TapSelector } = {},
+): Promise<TapConsumerHandle | null> {
+  if (!routedEgressArmed(env)) return null;
+
+  const { store, orgId, streamId, limits } = costGuard;
+  const decision = await evaluateArm(store, orgId, limits);
+  if (!decision.ok) return null; // killswitch active, or org/global concurrency cap reached
+  await registerArmed(store, orgId, streamId);
+
+  const consumer = buildRoutedEgressConsumer(job, env, fetchFn, opts);
+  const handle = tap.subscribe(consumer.id, consumer.selector);
+  const originalClose = handle.close.bind(handle);
+  handle.close = () => {
+    originalClose();
+    void registerDisarmed(store, streamId);
+  };
   // Detached drain — pumpConsumer returns only when the handle closes (room end / re-arm). Isolated per
   // media-tap's contract, so no await is threaded through the frame-publish path.
   void pumpConsumer(handle, consumer);
