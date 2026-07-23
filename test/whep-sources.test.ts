@@ -204,6 +204,25 @@ describe("handleWhepSources", () => {
       expect(kv.store.has(`${STREAM_INPUT_ORG_PREFIX}${UID}`)).toBe(false);
     });
 
+    it("400 WHEP_BAD_REQUEST on malformed percent-encoding — never a thrown 500", async () => {
+      const kv = fakeKv();
+      const req = new Request("https://edge/v1/whep/sources/%", { method: "DELETE" });
+      const res = await handleWhepSources(req, env({ RT_MEETING_ORG: kv }), "acme", { fetchFn: okFetch() });
+      expect(res?.status).toBe(400);
+      const j = (await res!.json()) as { error: string };
+      expect(j.error).toBe("WHEP_BAD_REQUEST");
+    });
+
+    it("400 WHEP_BAD_REQUEST when the decoded uid doesn't match the CF live-input shape", async () => {
+      const kv = fakeKv();
+      const res = await handleWhepSources(del("not-a-valid-uid"), env({ RT_MEETING_ORG: kv }), "acme", {
+        fetchFn: okFetch(),
+      });
+      expect(res?.status).toBe(400);
+      const j = (await res!.json()) as { error: string };
+      expect(j.error).toBe("WHEP_BAD_REQUEST");
+    });
+
     it("401/gateway-reject without x-wave-internal (dispatch wrapper)", async () => {
       const e = { ...env(), WAVE_INTERNAL_SECRET: "s3cret" };
       const res = await maybeHandleWhepSources(del(UID), e, gatewayGate, SAFE_ORG);

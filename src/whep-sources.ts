@@ -26,6 +26,7 @@ import type { IngestJob, IngestSourceKind } from "./ingress-router.js";
 import { INGEST_SOURCE_KINDS } from "./ingress-router.js";
 import {
   CfStreamLiveClientImpl,
+  LIVE_INPUT_UID,
   ORG_STREAM_INPUTS_PREFIX,
   readOrgStreamInputs,
   type OrgStreamInputEntry,
@@ -79,12 +80,32 @@ function parseProvisionBody(body: unknown): { job: IngestJob } | { error: string
   return { job };
 }
 
-/** Match `/v1/whep/sources/{uid}` and return the (possibly empty) uid segment; `null` when the path isn't a
- *  teardown path at all (so the caller can fall back to the bare-path GET/POST handling / null fall-through). */
+/** Match `/v1/whep/sources/{uid}` and return the (possibly empty) RAW (still percent-encoded) uid segment; `null`
+ *  when the path isn't a teardown path at all (so the caller can fall back to the bare-path GET/POST handling /
+ *  null fall-through). Decoding is deferred to the caller (`decodeTeardownUid`) so a malformed percent-encoding
+ *  can be turned into a clean 400 instead of an unguarded `URIError` thrown from path-matching. */
 function matchTeardownPath(pathname: string): string | null {
   const prefix = `${SOURCES_PATH}/`;
   if (!pathname.startsWith(prefix)) return null;
-  return decodeURIComponent(pathname.slice(prefix.length));
+  return pathname.slice(prefix.length);
+}
+
+/** Decode + shape-validate a raw teardown uid segment. Returns the decoded uid, or an error reason string on
+ *  malformed percent-encoding (`URIError`) or a uid that doesn't match the CF Stream live-input shape (32
+ *  lowercase hex — the SAME shape `CfStreamLiveClientImpl` writes/reads, `cf-stream-live-client.ts`). Rejecting
+ *  bad-shape uids here is defense-in-depth: the KV ownership check below already gates cross-org exploitation,
+ *  but there's no reason to let an obviously-invalid uid reach the CF delete call at all. */
+function decodeTeardownUid(rawUid: string): { uid: string } | { error: string } {
+  let uid: string;
+  try {
+    uid = decodeURIComponent(rawUid);
+  } catch {
+    return { error: "uid path segment is not valid percent-encoding" };
+  }
+  if (!LIVE_INPUT_UID.test(uid)) {
+    return { error: "uid must be a 32-char lowercase-hex CF Stream live-input id" };
+  }
+  return { uid };
 }
 
 /** Remove ONE uid from an org's reverse index (read-modify-write), tolerating an absent/corrupt index (no-op). */
@@ -171,7 +192,11 @@ export async function handleWhepSources(
     if (!teardownUid) {
       return jsonError("WHEP_BAD_REQUEST", "uid is required in the path", 400);
     }
-    return teardownSource(kv, env, org, teardownUid, deps);
+    const decoded = decodeTeardownUid(teardownUid);
+    if ("error" in decoded) {
+      return jsonError("WHEP_BAD_REQUEST", decoded.error, 400);
+    }
+    return teardownSource(kv, env, org, decoded.uid, deps);
   }
 
   // ── GET: discover this org's live sources (no CF creds needed — pure KV read) ──
