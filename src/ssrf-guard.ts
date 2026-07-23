@@ -84,7 +84,7 @@ function checkIpv4(ip: string): string | null {
   if (a === 172 && b >= 16 && b <= 31) return `RFC1918 private address (172.16.0.0/12: ${ip})`;
   if (a === 192 && b === 168) return `RFC1918 private address (192.168.0.0/16: ${ip})`;
   if (a === 169 && b === 254) return `link-local / metadata address (169.254.0.0/16: ${ip})`;
-  if (a === 100 && b >= 64 && b <= 127) return `CGNAT shared address space (100.64.0.0/10: ${ip})`;
+  if (a === 100 && b >= 64 && b <= 127) return `CGNAT shared address space (100.64.0.0/10: ${ip})`; // # guard:allow SSRF denylist literal — CGNAT range is the block target, not a leaked fleet address
   if (a === 0) return `"this network" reserved address (0.0.0.0/8: ${ip})`;
   if (a === 255) return `broadcast/reserved address (${ip})`;
   if (a >= 224) return `multicast/reserved address (${ip})`;

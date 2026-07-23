@@ -16,7 +16,7 @@ describe("validateDestinationUrl — deny matrix", () => {
     ["RFC1918 172.16/12", "rtmp://172.16.5.5:1935/live", "172.16.0.0/12"],
     ["RFC1918 192.168/16", "rtmp://192.168.1.1:1935/live", "192.168.0.0/16"],
     ["link-local / metadata IP", "rtmp://169.254.169.254:1935/live", "metadata"],
-    ["CGNAT 100.64/10", "rtmp://100.64.0.1:1935/live", "100.64.0.0/10"],
+    ["CGNAT 100.64/10", "rtmp://100.64.0.1:1935/live", "100.64.0.0/10"], // # guard:allow SSRF denylist test literal — CGNAT range is the block target, not a leaked fleet address
     ["0.0.0.0/8", "rtmp://0.0.0.1:1935/live", "this network"],
     ["broadcast", "rtmp://255.255.255.255:1935/live", "broadcast"],
     ["multicast v4", "rtmp://224.0.0.1:1935/live", "multicast"],

@@ -41,8 +41,16 @@ const DEST_ID = /^[a-f0-9-]{8,64}$/i;
 export const DEST_RECORD_PREFIX = "egress-dest:";
 export const DEST_ORG_INDEX_PREFIX = "egress-dest-index:";
 
-function recordKey(org: string, id: string): string {
-  return `${DEST_RECORD_PREFIX}${org}:${id}`;
+/** Keyed by id ALONE — never scoped by the caller's claimed org. Ownership is enforced by comparing
+ *  `record.org` (the value stamped at create time) against the caller's org AFTER this id-only lookup,
+ *  mirroring `whep-sources.ts`'s `STREAM_INPUT_ORG_PREFIX + uid` forward key. Scoping this lookup by the
+ *  CALLER's org instead (e.g. `${DEST_RECORD_PREFIX}${org}:${id}`) would make a foreign-org request simply
+ *  miss (404 / idempotent-200-delete) rather than hit the ownership check below — silently turning a 403
+ *  into a no-op that looks like "not found" instead of "forbidden", and for DELETE specifically that shape
+ *  previously let an attacker who somehow guessed/observed another org's id "delete" a key that was never
+ *  actually there while the real record survived untouched, i.e. the 403 branch was dead code. */
+function recordKey(id: string): string {
+  return `${DEST_RECORD_PREFIX}${id}`;
 }
 function indexKey(org: string): string {
   return `${DEST_ORG_INDEX_PREFIX}${org}`;
@@ -201,7 +209,7 @@ async function createDestination(
     createdAt: now,
   };
 
-  await kv.put(recordKey(org, id), JSON.stringify(record));
+  await kv.put(recordKey(id), JSON.stringify(record));
   const ids = await readIndex(kv, org);
   if (!ids.includes(id)) await writeIndex(kv, org, [...ids, id]);
 
@@ -210,7 +218,7 @@ async function createDestination(
 
 async function listDestinations(kv: StreamInputKv, org: string): Promise<Response> {
   const ids = await readIndex(kv, org);
-  const records = await Promise.all(ids.map((id) => kv.get(recordKey(org, id))));
+  const records = await Promise.all(ids.map((id) => kv.get(recordKey(id))));
   const destinations = records
     .filter((r): r is string => r !== null)
     .map((r) => redactDestination(JSON.parse(r) as EgressDestinationRecord));
@@ -218,22 +226,26 @@ async function listDestinations(kv: StreamInputKv, org: string): Promise<Respons
 }
 
 async function getDestination(kv: StreamInputKv, org: string, id: string): Promise<Response> {
-  const raw = await kv.get(recordKey(org, id));
+  const raw = await kv.get(recordKey(id));
   if (raw === null) return jsonError("DEST_NOT_FOUND", "destination not found", 404);
   const record = JSON.parse(raw) as EgressDestinationRecord;
+  // Ownership MUST be checked before treating the record as this caller's — the lookup above is by id
+  // ALONE (not org-scoped), so a foreign-org id resolves here every time it exists at all.
   if (record.org !== org) return jsonError("DEST_FORBIDDEN", "destination belongs to a different org", 403);
   return Response.json({ destination: redactDestination(record) }, { status: 200 });
 }
 
 /** Mirrors #310 (whep-sources teardown) EXACTLY: absent → idempotent 200 (retry-safe), foreign org → 403,
- *  otherwise remove the forward record + prune the reverse index. */
+ *  otherwise remove the forward record + prune the reverse index. Ownership is checked BEFORE any delete —
+ *  the forward lookup is by id alone, so skipping this check would let a caller delete another org's
+ *  destination outright (a cross-org IDOR), not merely leak its existence. */
 async function deleteDestination(kv: StreamInputKv, org: string, id: string): Promise<Response> {
-  const raw = await kv.get(recordKey(org, id));
+  const raw = await kv.get(recordKey(id));
   if (raw === null) return Response.json({ ok: true, id }, { status: 200 });
   const record = JSON.parse(raw) as EgressDestinationRecord;
   if (record.org !== org) return jsonError("DEST_FORBIDDEN", "destination belongs to a different org", 403);
 
-  await kv.delete(recordKey(org, id));
+  await kv.delete(recordKey(id));
   const ids = await readIndex(kv, org);
   const next = ids.filter((x) => x !== id);
   if (next.length !== ids.length) await writeIndex(kv, org, next);
@@ -323,7 +335,7 @@ export async function resolveDestinationForArm(
 ): Promise<{ kind: DestKind; url: string; streamKey?: string; passphrase?: string } | null> {
   const kv = env.RT_MEETING_ORG;
   if (!kv) return null;
-  const raw = await kv.get(recordKey(org, destId));
+  const raw = await kv.get(recordKey(destId));
   if (raw === null) return null;
   const record = JSON.parse(raw) as EgressDestinationRecord;
   if (record.org !== org) return null;
