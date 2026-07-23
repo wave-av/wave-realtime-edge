@@ -221,7 +221,12 @@ async function listDestinations(kv: StreamInputKv, org: string): Promise<Respons
   const records = await Promise.all(ids.map((id) => kv.get(recordKey(id))));
   const destinations = records
     .filter((r): r is string => r !== null)
-    .map((r) => redactDestination(JSON.parse(r) as EgressDestinationRecord));
+    .map((r) => JSON.parse(r) as EgressDestinationRecord)
+    // Defense-in-depth: the per-org index should only ever hold this org's ids, but re-check ownership
+    // after the id-only lookup so a corrupted/mis-written index can never leak another org's record —
+    // matches the explicit `record.org !== org` guard in getDestination/deleteDestination.
+    .filter((record) => record.org === org)
+    .map((record) => redactDestination(record));
   return Response.json({ destinations }, { status: 200 });
 }
 
