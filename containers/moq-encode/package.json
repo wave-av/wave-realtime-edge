@@ -1,0 +1,13 @@
+{
+  "name": "wave-moq-encode",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Per-participant MoQ encode+publish container (#314) — decodes the Worker's multiplexed audio/video frame stream and re-encodes+publishes each participant onto its own MoQ track.",
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "ws": "8.21.1"
+  }
+}
