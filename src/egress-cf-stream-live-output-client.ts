@@ -108,6 +108,43 @@ function summarizeErrors(errors: unknown): string {
   return "unknown error";
 }
 
+/** Result of a `deleteOutput` teardown call — `notFound` is a SUCCESS shape (idempotent: an already-gone output
+ *  is the desired end state, not an error), so a caller never has to special-case a retry. */
+export type DeleteOutputResult = { readonly ok: true; readonly notFound: boolean } | { readonly ok: false; readonly status: number; readonly reason: string };
+
+/**
+ * DELETE one CF Stream Live Output (W1 O1 teardown half, wre#287/wave-zoom#46). Mirrors
+ * `CfStreamLiveClientImpl.bestEffortDeleteInput`'s call shape (same `CF_API_BASE`, same bearer auth) but is NOT
+ * best-effort/void — the caller (`/v1/egress/teardown`) needs to know whether the delete actually happened before
+ * emitting the O1 rtmp-out metering event, so this returns a typed result rather than swallowing everything.
+ * IDEMPOTENT: CF replying 404 (output already gone — a prior teardown, or CF's own live-input-delete cascade
+ * already removed it) is treated as `{ok:true, notFound:true}`, never a failure — a redelivered teardown call
+ * must never error just because it's the second attempt. Any other non-2xx CF reply is a typed `{ok:false}`
+ * refusal, never a throw.
+ */
+export async function deleteOutput(
+  fetchFn: typeof fetch,
+  accountId: string,
+  apiToken: string,
+  inputId: string,
+  outputId: string,
+): Promise<DeleteOutputResult> {
+  try {
+    const res = await fetchFn(
+      `${CF_API_BASE}/accounts/${accountId}/stream/live_inputs/${inputId}/outputs/${outputId}`,
+      { method: "DELETE", headers: { authorization: `Bearer ${apiToken}` } },
+    );
+    if (res.status === 404) return { ok: true, notFound: true };
+    if (!res.ok) {
+      const env = (await res.json().catch(() => ({}))) as CfEnvelope;
+      return { ok: false, status: res.status, reason: `cf delete-output failed: ${summarizeErrors(env.errors)}` };
+    }
+    return { ok: true, notFound: false };
+  } catch (e) {
+    return { ok: false, status: 502, reason: `cf delete-output error: ${(e as Error)?.message ?? String(e)}` };
+  }
+}
+
 /**
  * The concrete CF Stream Live Output origin. Implements ONLY `CfStreamEgressClient` — the passthrough backend's
  * injected seam — so it is a drop-in for `CfStreamPassthroughEgressBackend` / the O1 arm wiring alike.

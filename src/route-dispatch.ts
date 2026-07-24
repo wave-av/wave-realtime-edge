@@ -16,6 +16,9 @@ import { handleWhep, whepEgressEnabled, type WhepEnv } from "./whep";
 import { maybeHandleWhepSources, type WhepSourcesEnv } from "./whep-sources";
 // W1 O3 (wre#289) egress destinations (#17 SSRF + #18 encrypt-at-rest). INERT: EGRESS_DEST_MGMT_ENABLED.
 import { maybeHandleEgressDestinations, type EgressDestinationsEnv } from "./egress-destinations";
+// W1 HUB egress arm/teardown (wave-zoom#46) — /v1/egress/arm + /v1/egress/teardown, the spoke-facing thin HTTP
+// wrap of armExternalRtmpRestream (egress-arm.ts). INERT: EGRESS_ROUTER_ENABLED AND EGRESS_DEST_MGMT_ENABLED.
+import { maybeHandleEgressArmRoute, type EgressArmRouteEnv } from "./egress-arm-route";
 // B1 (#91-a) — CF Stream Live → SFU bridge CONTROL PLANE. INERT behind STREAM_BRIDGE_ENABLED. worker.ts only
 // DELEGATES; all matching/auth/dispatch lives in src/stream-bridge.ts (+ cf-stream-bridge-frozen-contract).
 import { maybeHandleStreamBridge } from "./stream-bridge";
@@ -611,6 +614,11 @@ export async function dispatch(
 	// ── W1 O3 (wre#289) egress destinations — /v1/egress/destinations[/{id}]. INERT behind EGRESS_DEST_MGMT_ENABLED. ──
 	const destRes = await maybeHandleEgressDestinations(request, env as EgressDestinationsEnv, gatewayGate, SAFE_ORG);
 	if (destRes) return destRes;
+
+	// ── W1 HUB egress arm/teardown (wave-zoom#46) — /v1/egress/arm + /v1/egress/teardown. INERT behind
+	// EGRESS_ROUTER_ENABLED AND EGRESS_DEST_MGMT_ENABLED (either off → falls through, 501 below). ──
+	const armRes = await maybeHandleEgressArmRoute(request, env as EgressArmRouteEnv, gatewayGate, SAFE_ORG);
+	if (armRes) return armRes;
 
 	// ── #53 IETF WHEP v1 egress — /v1/whep/subscribe + /v1/whep/resource/{id} ──
 	// The egress SIBLING of the WHIP block above. INERT behind WHEP_EGRESS_ENABLED ([vars], default off): when

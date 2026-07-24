@@ -6,6 +6,7 @@
 import { describe, it, expect } from "vitest";
 import {
   CfStreamEgressLiveOutputClient,
+  deleteOutput,
   deriveLiveInputId,
   splitRtmpUrl,
 } from "../src/egress-cf-stream-live-output-client.js";
@@ -154,5 +155,48 @@ describe("CfStreamEgressLiveOutputClient.provisionOutput", () => {
       expect(result).toEqual({ ok: true, outputId: "lo-out-1" });
       expect(fetchFn.calls).toHaveLength(1);
     });
+  });
+});
+
+describe("deleteOutput — W1 teardown half", () => {
+  function fakeDeleteFetch(status: number): typeof fetch & { calls: { url: string; method: string }[] } {
+    const calls: { url: string; method: string }[] = [];
+    const fn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), method: (init?.method ?? "GET").toUpperCase() });
+      return new Response(status >= 400 ? JSON.stringify({ success: false, errors: [{ code: 9, message: "nope" }] }) : null, { status });
+    }) as typeof fetch;
+    (fn as unknown as { calls: unknown }).calls = calls;
+    return fn as typeof fetch & { calls: typeof calls };
+  }
+
+  it("DELETEs the exact CF outputs URL with bearer auth on success", async () => {
+    const fetchFn = fakeDeleteFetch(200);
+    const result = await deleteOutput(fetchFn, "acct123", "tok", UID, "lo-out-1");
+    expect(result).toEqual({ ok: true, notFound: false });
+    expect(fetchFn.calls).toEqual([
+      { url: `https://api.cloudflare.com/client/v4/accounts/acct123/stream/live_inputs/${UID}/outputs/lo-out-1`, method: "DELETE" },
+    ]);
+  });
+
+  it("is idempotent — a CF 404 is a SUCCESS shape (already gone), never a refusal", async () => {
+    const fetchFn = fakeDeleteFetch(404);
+    const result = await deleteOutput(fetchFn, "acct123", "tok", UID, "lo-gone");
+    expect(result).toEqual({ ok: true, notFound: true });
+  });
+
+  it("surfaces any other non-2xx as a typed refusal, never a throw", async () => {
+    const fetchFn = fakeDeleteFetch(401);
+    const result = await deleteOutput(fetchFn, "acct123", "tok", UID, "lo-out-1");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.status).toBe(401);
+  });
+
+  it("maps a thrown fetch error to a typed 502 refusal, never a throw", async () => {
+    const throwingFetch = (async () => {
+      throw new Error("network down");
+    }) as typeof fetch;
+    const result = await deleteOutput(throwingFetch, "acct123", "tok", UID, "lo-out-1");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.status).toBe(502);
   });
 });
