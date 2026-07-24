@@ -182,7 +182,7 @@ EGRESS_DEST_MGMT_ENABLED = "0"  # INERT — arming is a ◆ Jake crossing (requi
 #      any missing → liveE3nSweepDeps returns null → the tick logs `e3n-sweep-inert` and does nothing.
 # KNOWN GAPS before arming in prod (◆ Jake-named, see PR body): NO retention (issue #7 absent — recordings
 # accumulate, though every one is register-tracked, not orphaned) and NO VOD/recording meter SKU (absent —
-# register is metadata-only here, a wave-gateway+wave-pricing follow-up mints the billable meter).
+# register is metadata-only here, a gateway+pricing follow-up mints the billable meter).
 E3N_AUTORECORD_ENABLED = "0"  # INERT — arming is a ◆ Jake crossing (needs retention #7 + the VOD meter SKU first)
 
 # DEST_KEY_ENCRYPTION_KEY is a wrangler SECRET — `wrangler secret put DEST_KEY_ENCRYPTION_KEY` (Doppler wave/prd).

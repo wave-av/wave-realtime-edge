@@ -20,7 +20,7 @@
  * already-registered recording is a single cheap KV read, never a second pull/register call.
  *
  * OUT OF SCOPE (declared, not built here — see PR body): no VOD/recording meter emit (SKU absent — a
- * wave-gateway/wave-pricing add); no retention (issue #7 absent — flag stays OFF until it exists); no
+ * gateway/pricing add); no retention (issue #7 absent — flag stays OFF until it exists); no
  * multi-asset grouping (issue #11 — N reconnects register as N ungrouped rows, same as the live-input KV
  * itself already is).
  */
