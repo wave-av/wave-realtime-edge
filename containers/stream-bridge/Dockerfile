@@ -9,7 +9,7 @@
 #
 # INERT: this image is NOT built or attached by the inert PR. The [[containers]] StreamBridgeContainer block in
 # wrangler.toml stays COMMENTED; building (Path A) or running (Path B) is a Jake-named ◆ go-live crossing.
-FROM node:22-bookworm-slim
+FROM node:26-bookworm-slim
 
 # ffmpeg from the bookworm repo (has libvpx + libopus encoders the source leg needs). Clean the apt lists to
 # keep the layer small. Installed as root before the USER drop below.
