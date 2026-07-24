@@ -52,6 +52,18 @@ const CF_API_BASE = "https://api.cloudflare.com/client/v4";
  *  validates) — re-declared here (not imported) so this adapter has zero dependency on the ingest-side module. */
 const LIVE_INPUT_UID_IN_ROOM = /^cfstream:([0-9a-f]{32})$/;
 
+/** Same 32-lowercase-hex shape as `LIVE_INPUT_UID_IN_ROOM`'s captured uid — used to validate a bare `inputId`
+ *  reaching `deleteOutput` directly (defense-in-depth: the route layer validates too, but this is the ONE
+ *  chokepoint that actually builds the CF DELETE URL, so it must never trust an unvalidated id). */
+const LIVE_INPUT_ID = /^[0-9a-f]{32}$/;
+
+/** CF Stream Live Output uids (wre#323 sec-review CRITICAL fix — path-traversal in `deleteOutput`). CF's create
+ *  reply (`provisionOutput`, this file) hands back a bare alphanumeric uid — never `/`, `.`, or any character
+ *  that could alter a URL path when interpolated. A conservative alphanumeric allowlist (bounded length, so a
+ *  pathologically long id can't be used as a resource-exhaustion vector either) refuses ANYTHING else, INCLUDING
+ *  `../`, `..%2F`-decoded traversal, and empty strings — never guesses at a "close enough" shape. */
+const OUTPUT_ID = /^[a-zA-Z0-9]{1,64}$/;
+
 /** Injected config for the live-output adapter. `accountId`/`apiToken` target the CF Stream account (same
  *  binding shape `CfStreamLiveClientConfig` uses); `fetchFn` is injectable for tests. */
 export interface CfStreamEgressLiveOutputConfig {
@@ -121,6 +133,13 @@ export type DeleteOutputResult = { readonly ok: true; readonly notFound: boolean
  * already removed it) is treated as `{ok:true, notFound:true}`, never a failure — a redelivered teardown call
  * must never error just because it's the second attempt. Any other non-2xx CF reply is a typed `{ok:false}`
  * refusal, never a throw.
+ *
+ * PATH-TRAVERSAL GUARD (wre#323 sec-review CRITICAL fix). Both `inputId` and `outputId` are interpolated
+ * straight into the CF API URL path — a crafted id (`"../../<uid>"`, `..%2F`-decoded, or any `/`/`.` bearing
+ * string) would otherwise collapse the path via URL normalization to reach an ARBITRARY CF API endpoint (proven:
+ * deeper traversal reaches `/zones`). BOTH ids are validated against a strict allowlist BEFORE the URL is built;
+ * a reject returns a typed `{ok:false, status:400}` refusal — never a throw (deleteOutput stays fail-open) and
+ * never a fetch.
  */
 export async function deleteOutput(
   fetchFn: typeof fetch,
@@ -129,6 +148,12 @@ export async function deleteOutput(
   inputId: string,
   outputId: string,
 ): Promise<DeleteOutputResult> {
+  if (!LIVE_INPUT_ID.test(inputId)) {
+    return { ok: false, status: 400, reason: "inputId must be a 32-char lowercase-hex CF Stream live-input id" };
+  }
+  if (!OUTPUT_ID.test(outputId)) {
+    return { ok: false, status: 400, reason: "outputId must be a 1-64 char alphanumeric CF Stream live-output id" };
+  }
   try {
     const res = await fetchFn(
       `${CF_API_BASE}/accounts/${accountId}/stream/live_inputs/${inputId}/outputs/${outputId}`,

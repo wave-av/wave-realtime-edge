@@ -171,22 +171,22 @@ describe("deleteOutput — W1 teardown half", () => {
 
   it("DELETEs the exact CF outputs URL with bearer auth on success", async () => {
     const fetchFn = fakeDeleteFetch(200);
-    const result = await deleteOutput(fetchFn, "acct123", "tok", UID, "lo-out-1");
+    const result = await deleteOutput(fetchFn, "acct123", "tok", UID, "loout1");
     expect(result).toEqual({ ok: true, notFound: false });
     expect(fetchFn.calls).toEqual([
-      { url: `https://api.cloudflare.com/client/v4/accounts/acct123/stream/live_inputs/${UID}/outputs/lo-out-1`, method: "DELETE" },
+      { url: `https://api.cloudflare.com/client/v4/accounts/acct123/stream/live_inputs/${UID}/outputs/loout1`, method: "DELETE" },
     ]);
   });
 
   it("is idempotent — a CF 404 is a SUCCESS shape (already gone), never a refusal", async () => {
     const fetchFn = fakeDeleteFetch(404);
-    const result = await deleteOutput(fetchFn, "acct123", "tok", UID, "lo-gone");
+    const result = await deleteOutput(fetchFn, "acct123", "tok", UID, "logone");
     expect(result).toEqual({ ok: true, notFound: true });
   });
 
   it("surfaces any other non-2xx as a typed refusal, never a throw", async () => {
     const fetchFn = fakeDeleteFetch(401);
-    const result = await deleteOutput(fetchFn, "acct123", "tok", UID, "lo-out-1");
+    const result = await deleteOutput(fetchFn, "acct123", "tok", UID, "loout1");
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.status).toBe(401);
   });
@@ -195,8 +195,56 @@ describe("deleteOutput — W1 teardown half", () => {
     const throwingFetch = (async () => {
       throw new Error("network down");
     }) as typeof fetch;
-    const result = await deleteOutput(throwingFetch, "acct123", "tok", UID, "lo-out-1");
+    const result = await deleteOutput(throwingFetch, "acct123", "tok", UID, "loout1");
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.status).toBe(502);
+  });
+
+  // wre#323 sec-review CRITICAL fix — path-traversal guard on BOTH inputId and outputId.
+  it("refuses a traversal outputId ('../../<uid>') as a typed 400, never a fetch", async () => {
+    const fetchFn = fakeDeleteFetch(200);
+    const result = await deleteOutput(fetchFn, "acct123", "tok", UID, `../../${UID}`);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.status).toBe(400);
+    expect(fetchFn.calls).toHaveLength(0); // NEVER reaches the network
+  });
+
+  it("refuses a percent-encoded traversal outputId ('..%2F' decoded) as a typed 400", async () => {
+    const fetchFn = fakeDeleteFetch(200);
+    const result = await deleteOutput(fetchFn, "acct123", "tok", UID, decodeURIComponent("..%2F..%2Fzones"));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.status).toBe(400);
+    expect(fetchFn.calls).toHaveLength(0);
+  });
+
+  it("refuses an outputId containing a slash ('foo/bar') as a typed 400", async () => {
+    const fetchFn = fakeDeleteFetch(200);
+    const result = await deleteOutput(fetchFn, "acct123", "tok", UID, "foo/bar");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.status).toBe(400);
+    expect(fetchFn.calls).toHaveLength(0);
+  });
+
+  it("refuses an empty outputId as a typed 400", async () => {
+    const fetchFn = fakeDeleteFetch(200);
+    const result = await deleteOutput(fetchFn, "acct123", "tok", UID, "");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.status).toBe(400);
+    expect(fetchFn.calls).toHaveLength(0);
+  });
+
+  it("refuses a traversal inputId as a typed 400, never a fetch", async () => {
+    const fetchFn = fakeDeleteFetch(200);
+    const result = await deleteOutput(fetchFn, "acct123", "tok", "../../etc", "loout1");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.status).toBe(400);
+    expect(fetchFn.calls).toHaveLength(0);
+  });
+
+  it("accepts a valid alphanumeric outputId (the class every existing test above already exercises)", async () => {
+    const fetchFn = fakeDeleteFetch(200);
+    const result = await deleteOutput(fetchFn, "acct123", "tok", UID, "aB3cD4eF");
+    expect(result).toEqual({ ok: true, notFound: false });
+    expect(fetchFn.calls).toHaveLength(1);
   });
 });
