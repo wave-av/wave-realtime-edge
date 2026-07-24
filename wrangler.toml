@@ -443,6 +443,29 @@ new_sqlite_classes = ["AgentSessionDO"]
 name = "ZOOM_RTMS_BRIDGE"
 class_name = "ZoomRtmsBridgeDO"
 
+# ── #314 slice g-prep — MoqPublishContainer DO (per-participant MoQ egress; moq-forward-target.ts reaches it via
+# `getContainer(env.MOQ_PUBLISH, "${org}:${meetingUuid}")`). Mirrors the RECORDER block above verbatim (same
+# rt-encoder-style image shape, same DO wiring), but stays FULLY COMMENTED — unlike RECORDER (armed at infra
+# level in Step A), MOQ_PUBLISH has NO live container/binding yet: `env.MOQ_PUBLISH` is undefined, so
+# `createMoqForwardTarget` (moq-forward-target.ts:179) returns null unconditionally and the whole per-participant
+# egress path never reaches this class. Prod is byte-identical to before this PR.
+# ARM: uncomment this whole block (containers + binding + migration) to enable per-participant MoQ egress (#314).
+# The image path below is a PLACEHOLDER (containers/moq-encode/Dockerfile) — confirm the real image ref/path at
+# arm-time; the migration tag (v6) MUST stay the highest/last tag when uncommented (wrangler applies in array
+# order — see the v4/v5 note below).
+# [[containers]]
+# class_name = "MoqPublishContainer"
+# image = "./containers/moq-encode/Dockerfile"
+# max_instances = 3
+#
+# [[durable_objects.bindings]]
+# name = "MOQ_PUBLISH"
+# class_name = "MoqPublishContainer"
+#
+# [[migrations]]
+# tag = "v6"
+# new_sqlite_classes = ["MoqPublishContainer"]
+
 # ── #91 B2 — StreamBridgeContainer DO migration. Applied as a delta after the live v3 tag (migrations run in
 # array order). Its [[containers]] + [[durable_objects.bindings]] are declared above (binding order is
 # irrelevant; only migration tag order is). v4 MUST stay ahead of v5 below.
