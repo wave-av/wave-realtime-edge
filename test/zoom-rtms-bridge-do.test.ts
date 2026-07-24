@@ -3,12 +3,13 @@
 // upgrade, the fail-CLOSED resolver (no creds / no room mapping → no dial), and that an armed+mapped start
 // actually dials Zoom's signaling leg with the handshake req. The full media sequence is proven in the core.
 import { describe, it, expect, beforeAll } from "vitest";
-import { ZoomRtmsBridgeDO } from "../src/zoom-rtms-bridge-do.js";
+import { ZoomRtmsBridgeDO, zoomRtmsSeams } from "../src/zoom-rtms-bridge-do.js";
 import type { RtmsStartedEvent } from "../src/zoom-rtms-bridge.js";
 import { rtmsHandshakeSignature } from "../src/rtms-auth.js";
 import { signalingHandshakeReq } from "../src/rtms-protocol.js";
 import { bytesToBase64 } from "../src/twilio-mediastream.js";
 import { int16ToPcmS16Le } from "../src/rtms-audio.js";
+import { SAFE_SEGMENT } from "../src/dispatch-helpers.js";
 
 const EVENT: RtmsStartedEvent = {
   kind: "rtms_started",
@@ -311,5 +312,76 @@ describe("ZoomRtmsBridgeDO — stop + unknown intent", () => {
     expect(((await stop.json()) as { stopped: boolean }).stopped).toBe(true);
     const bad = await doo.fetch(new Request("https://zoom-rtms/wat", { method: "POST" }));
     expect(bad.status).toBe(400);
+  });
+});
+
+// #314-unblock — zoomRtmsSeams' onRtmsStarted auto-populates RT_MEETING_ORG so resolveTarget() (fail-CLOSED
+// on a missing/malformed record) has something to dial into, without ever clobbering an operator-set mapping.
+describe("zoomRtmsSeams — RT_MEETING_ORG auto-populate", () => {
+  const B64_UUID = "3Ui8FBwNToWLB4xw4lYkBQ==";
+
+  /** A KV fake that records puts and can be pre-seeded with an existing record. */
+  const fakeKv = (seed?: Record<string, unknown>) => {
+    const store = new Map<string, unknown>(Object.entries(seed ?? {}));
+    return {
+      get: async (k: string) => store.get(k) ?? null,
+      put: async (k: string, v: string) => {
+        store.set(k, JSON.parse(v));
+      },
+      store,
+    };
+  };
+
+  const fakeBridge = () => {
+    const requests: Request[] = [];
+    return {
+      idFromName: (name: string) => name,
+      get: (_id: string) => ({
+        fetch: async (req: Request) => {
+          requests.push(req);
+          return new Response(JSON.stringify({ started: true }));
+        },
+      }),
+      requests,
+    } as unknown as DurableObjectNamespace & { requests: Request[] };
+  };
+
+  it("writes a valid record when RT_MEETING_ORG has no entry, safe even for a base64 meetingUuid", async () => {
+    const kv = fakeKv();
+    const bridge = fakeBridge();
+    const { onRtmsStarted } = zoomRtmsSeams({ ZOOM_RTMS_BRIDGE: bridge as never, RT_MEETING_ORG: kv as never });
+    await onRtmsStarted!({ kind: "rtms_started", meetingUuid: B64_UUID, rtmsStreamId: "s1", serverUrls: "wss://x" });
+    const rec = kv.store.get(B64_UUID) as { org: string; sessionId: string; trackName: string };
+    expect(rec).toBeDefined();
+    expect(SAFE_SEGMENT.test(rec.org)).toBe(true);
+    expect(SAFE_SEGMENT.test(rec.sessionId)).toBe(true);
+    expect(SAFE_SEGMENT.test(rec.trackName)).toBe(true);
+  });
+
+  it("does not overwrite an existing record", async () => {
+    const existing = { org: "acme", sessionId: "sess-real", trackName: "track-real" };
+    const kv = fakeKv({ "mtg-1": existing });
+    const bridge = fakeBridge();
+    const { onRtmsStarted } = zoomRtmsSeams({ ZOOM_RTMS_BRIDGE: bridge as never, RT_MEETING_ORG: kv as never });
+    await onRtmsStarted!({ kind: "rtms_started", meetingUuid: "mtg-1", rtmsStreamId: "s1", serverUrls: "wss://x" });
+    expect(kv.store.get("mtg-1")).toEqual(existing);
+  });
+
+  it("still POSTs /start to the meeting DO after populate", async () => {
+    const kv = fakeKv();
+    const bridge = fakeBridge();
+    const { onRtmsStarted } = zoomRtmsSeams({ ZOOM_RTMS_BRIDGE: bridge as never, RT_MEETING_ORG: kv as never });
+    await onRtmsStarted!({ kind: "rtms_started", meetingUuid: "mtg-2", rtmsStreamId: "s1", serverUrls: "wss://x" });
+    expect(bridge.requests).toHaveLength(1);
+    expect(new URL(bridge.requests[0].url).pathname).toBe("/start");
+  });
+
+  it("unbound RT_MEETING_ORG: no throw, still POSTs /start", async () => {
+    const bridge = fakeBridge();
+    const { onRtmsStarted } = zoomRtmsSeams({ ZOOM_RTMS_BRIDGE: bridge as never });
+    await expect(
+      onRtmsStarted!({ kind: "rtms_started", meetingUuid: "mtg-3", rtmsStreamId: "s1", serverUrls: "wss://x" }),
+    ).resolves.not.toThrow();
+    expect(bridge.requests).toHaveLength(1);
   });
 });

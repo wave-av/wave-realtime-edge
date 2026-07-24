@@ -430,7 +430,32 @@ export class ZoomRtmsBridgeDO {
 interface ZoomRtmsDispatchEnv {
   WAVE_ZOOM_RTMS?: string | boolean;
   WAVE_INTERNAL_SECRET?: string;
+  WAVE_ORG?: string;
   ZOOM_RTMS_BRIDGE?: DurableObjectNamespace;
+  RT_MEETING_ORG?: { get(key: string, type: "json"): Promise<unknown>; put(key: string, value: string): Promise<void> };
+}
+
+/**
+ * #314-unblock — idempotently populate RT_MEETING_ORG[meetingUuid] on a verified rtms_started webhook, so
+ * resolveTarget() (which fails CLOSED to null on a missing/malformed record) has something to dial into.
+ * NEVER clobbers an existing operator-provisioned mapping (only writes when absent). Never throws — a KV
+ * hiccup here must not block the /start POST that follows; log a non-secret error and move on.
+ */
+async function populateMeetingOrg(env: ZoomRtmsDispatchEnv, meetingUuid: string): Promise<void> {
+  const kv = env.RT_MEETING_ORG;
+  if (!kv) return;
+  try {
+    const existing = await kv.get(meetingUuid, "json");
+    if (existing) return; // never clobber an existing mapping
+    const rawOrg = env.WAVE_ORG ?? "default";
+    const org = SAFE_SEGMENT.test(rawOrg) ? rawOrg : "default";
+    const safe = (s: string): string => `zoom-${s}`.replace(/[^A-Za-z0-9_:.-]/g, "").slice(0, 128);
+    const sessionId = safe(meetingUuid);
+    const trackName = safe(meetingUuid);
+    await kv.put(meetingUuid, JSON.stringify({ org, sessionId, trackName }));
+  } catch (e) {
+    console.log(JSON.stringify({ msg: "zoom-rtms-meeting-org-populate-error", meetingUuid, message: (e as Error)?.message ?? "unknown" }));
+  }
 }
 
 /**
@@ -443,6 +468,7 @@ export function zoomRtmsSeams(env: ZoomRtmsDispatchEnv): { onRtmsStarted?: OnRtm
   if (!bridge) return {};
   return {
     onRtmsStarted: async (ev): Promise<void> => {
+      await populateMeetingOrg(env, ev.meetingUuid);
       await bridge.get(bridge.idFromName(ev.meetingUuid)).fetch(new Request("https://zoom-rtms/start", {
         method: "POST",
         headers: { "content-type": "application/json" },
