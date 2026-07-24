@@ -87,5 +87,41 @@
     { "name": "WHIP", "direction": "in", "status": "preview" },
     { "name": "WHEP", "direction": "out", "status": "preview" },
     { "name": "presence-websocket", "direction": "bidir", "status": "scaffolded" }
+  ],
+  "install": [
+    { "manager": "npm", "cmd": "npm install" }
+  ],
+  "quickstart": {
+    "lang": "bash",
+    "code": "npx wrangler dev      # local dev (health only until substrate lands)\nnpm run typecheck\nnpm run test          # contract tests (vitest)\nnpm run deploy        # wrangler deploy"
+  },
+  "sections": [
+    {
+      "kind": "prose",
+      "heading": "Status",
+      "body": "Early scaffold. The Worker serves /health; all other routes return 501 REALTIME_NOT_IMPLEMENTED. The substrate decision — custom SFU on Workers + Durable Objects vs. LiveKit — is Wave-1 work and not yet made.\n\nAn OpenAPI 3.1 spec (docs/api/openapi.yaml) and contract test suite exist and are passing (#10/#12); the runtime implementation is the open work.\n\nLike Stripe is for payments and Resend is for email — WAVE is for live streaming and video. This spoke is the interactive media layer: 2-way N-N calls and voice agents, the complement to wave-moq-edge (1-to-many broadcast)."
+    },
+    {
+      "kind": "table",
+      "heading": "Which spoke to use",
+      "columns": ["Use case", "Spoke"],
+      "rows": [
+        ["1-1 or N-N call (rooms, voice agents)", "wave-realtime-edge"],
+        ["1-to-many livestream", "wave-moq-edge"],
+        ["Studio-grade broadcast (NDI/Dante/SRT)", "wave-bridge-edge"],
+        ["Browser playback of recorded content", "the clip service"]
+      ]
+    },
+    {
+      "kind": "code",
+      "heading": "Architecture",
+      "lang": "text",
+      "body": "browser ──WebRTC──▶ wave-realtime-edge (this spoke)\n                      │  edge SFU · CF Workers + DOs (substrate TBD)\n                      │  /api/* → api.wave.online (gateway-enforced)\n                      ▼\n                  the WAVE API gateway → auth · scope · meter"
+    },
+    {
+      "kind": "prose",
+      "heading": "See also",
+      "body": "docs/api/openapi.yaml — OpenAPI 3.1 contract (passing contract tests)\ndocs/REALTIME.md — substrate decision notes\nthreat-model.md, SECURITY.md, CONTRIBUTING.md"
+    }
   ]
 }
