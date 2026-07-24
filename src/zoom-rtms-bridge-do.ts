@@ -26,10 +26,12 @@
  */
 import {
   RtmsBridgeCore,
+  MoqTrackSink,
   type RtmsBridgeDeps,
   type RtmsSocket,
   type BridgeTarget,
   type ParticipantSink,
+  type MoqForwardWriter,
 } from "./rtms-bridge-core.js";
 import {
   zoomRtmsEnabled,
@@ -40,10 +42,11 @@ import {
 import { createIngestAdapter, type IngestFraming } from "./agent-ingest-adapter.js";
 import type { IngestSocket } from "./agent-session.js";
 import { mintRecorderToken, verifyRecorderToken } from "./encoders/recorder-auth.js";
+import { createMoqForwardTarget, type MoqForwardTargetEnv } from "./encoders/moq-forward-target.js";
 import { SAFE_SEGMENT, ZOOM_RTMS_INGEST_ROUTE } from "./dispatch-helpers.js";
 
 /** Env the ZoomRtmsBridgeDO reads. INERT unless WAVE_ZOOM_RTMS is truthy. All creds referenced, not valued. */
-export interface ZoomRtmsBridgeDoEnv {
+export interface ZoomRtmsBridgeDoEnv extends MoqForwardTargetEnv {
   WAVE_ZOOM_RTMS?: string | boolean; // truthy arms; absent/"0"/false → fully inert
   // #88 M2 — independent flag for the VIDEO ingest leg (RTMS video frame → SFU video track push), still
   // gated by WAVE_ZOOM_RTMS being on too. Absent/"0"/false → audio-only, byte-identical to pre-video. The
@@ -114,6 +117,10 @@ export class ZoomRtmsBridgeDO {
   private target: BridgeTarget | null = null; // set once startBridge resolves a target
   private readonly ingestByTrack = new Map<string, IngestSocket>(); // trackName -> the SFU's inbound socket
   private readonly requestedParticipantTracks = new Set<string>(); // trackName -> createIngest already fired
+  // #314 Slice 1 — the ONE persistent multiplexed MoQ-container WS for this meeting (lazily built, shared by
+  // every participant's MoqTrackSink). `undefined` = not yet resolved; `null` = resolved inert (flag off, no
+  // MOQ_PUBLISH binding, or invalid org/meetingUuid); an object = the live forwarder. See getMoqTarget().
+  private moqTarget: MoqForwardWriter | null | undefined = undefined;
 
   constructor(_state: DurableObjectStateLike, env?: ZoomRtmsBridgeDoEnv) {
     this.env = env ?? {};
@@ -321,7 +328,32 @@ export class ZoomRtmsBridgeDO {
         self.requestedParticipantTracks.delete(trackName);
       },
     };
-    return [sink];
+    const sinks: ParticipantSink[] = [sink];
+    // #314 Slice 1 — an ADDITIONAL container-egress sink, on top of (never instead of) the SFU-track sink
+    // above. Only ever added when getMoqTarget() resolves live (flag on AND MOQ_PUBLISH bound AND a valid
+    // namespace) — otherwise this is a no-op and `sinks` stays exactly the single-entry array it is today.
+    const moq = this.getMoqTarget();
+    if (moq) sinks.push(new MoqTrackSink((msg, fields) => console.log(JSON.stringify({ msg, ...fields })), userId, moq));
+    return sinks;
+  }
+
+  /**
+   * #314 Slice 1 — lazily resolve (once per DO instance) the ONE MoqForwardWriter every participant's
+   * MoqTrackSink shares for this meeting. Resolves to `null` (cached, never retried) when
+   * WAVE_RTMS_PER_PARTICIPANT is off, MOQ_PUBLISH is unbound, or org/meetingUuid haven't been resolved yet
+   * (resolveTarget hasn't run) — INERT by default: with no `[[containers]] MOQ_PUBLISH` binding provisioned,
+   * this always returns null and MoqTrackSink stays the log-only stub it was before #314.
+   */
+  private getMoqTarget(): MoqForwardWriter | null {
+    if (this.moqTarget !== undefined) return this.moqTarget;
+    if (!rtmsPerParticipantEnabled(this.env) || !this.env.MOQ_PUBLISH || !this.resolvedOrg || !this.meetingUuid) {
+      this.moqTarget = null;
+      return null;
+    }
+    this.moqTarget = createMoqForwardTarget(this.env, this.resolvedOrg, this.meetingUuid, (msg, fields) =>
+      console.log(JSON.stringify({ msg, ...fields })),
+    );
+    return this.moqTarget;
   }
 
   /**

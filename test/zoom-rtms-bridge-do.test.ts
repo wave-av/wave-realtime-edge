@@ -18,13 +18,15 @@ const EVENT: RtmsStartedEvent = {
 };
 
 class FakeWs {
-  sent: string[] = [];
+  sent: unknown[] = [];
+  readyState = 1; // OPEN — only consulted by MoqForwardTarget's send() (#314 tests)
+  bufferedAmount = 0;
   private listeners: Record<string, Array<(ev: unknown) => void>> = {};
   accept(): void {}
   addEventListener(type: string, cb: (ev: unknown) => void): void {
     (this.listeners[type] ??= []).push(cb);
   }
-  send(d: string): void {
+  send(d: unknown): void {
     this.sent.push(d);
   }
   close(): void {}
@@ -34,18 +36,17 @@ class FakeWs {
   }
 }
 
-let serverWS: FakeWs;
 // #RTMS-fanout — every server-side socket the DO's WebSocketPair mock creates, in creation order (so a test
 // can grab the Nth accepted ingest socket — the mixed one, or a specific participant's).
 const serverSockets: FakeWs[] = [];
 beforeAll(() => {
   (globalThis as unknown as { WebSocketPair: unknown }).WebSocketPair = class {
     0 = new FakeWs();
-    1 = (serverWS = ((): FakeWs => {
+    1 = ((): FakeWs => {
       const ws = new FakeWs();
       serverSockets.push(ws);
       return ws;
-    })());
+    })();
   } as unknown;
 });
 
@@ -231,6 +232,75 @@ describe("ZoomRtmsBridgeDO — per-participant sinks (#RTMS-fanout WAVE_RTMS_PER
 
     expect(adapterCreates).toHaveLength(1); // only start()'s mixed track — sinks() never reached
     expect(mixedSock.sent).toHaveLength(1); // frame landed on the mixed socket instead
+  });
+});
+
+describe("ZoomRtmsBridgeDO — #314 Slice 1 MoQ container egress (WAVE_RTMS_PER_PARTICIPANT + MOQ_PUBLISH)", () => {
+  const ackFrame = (audioUrl: string): string =>
+    JSON.stringify({ msg_type: 2, status_code: 0, media_server: { server_urls: { audio: audioUrl } } });
+  const audioFrame = (userId: number | string, samples: number[]): string =>
+    JSON.stringify({ msg_type: 14, content: { user_id: userId, data: bytesToBase64(int16ToPcmS16Le(new Int16Array(samples))) } });
+  const flushAsync = async (): Promise<void> => {
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
+  };
+
+  /** A minimal MOQ_PUBLISH container-namespace stub: fetch() returns a fresh FakeWs (captured), one per id. */
+  const moqBinding = (moqWs: FakeWs[]) =>
+    ({
+      get: (id: string) => ({
+        fetch: async () => {
+          const ws = new FakeWs();
+          moqWs.push(ws);
+          return { webSocket: ws } as unknown as Response;
+        },
+        id,
+      }),
+      idFromName: (id: string) => id,
+    }) as unknown;
+
+  it("flag ON + MOQ_PUBLISH bound: writes multiplexed frames for two participants over ONE shared container WS", async () => {
+    dialed.length = 0;
+    adapterCreates.length = 0;
+    const moqWs: FakeWs[] = [];
+    const doo = new ZoomRtmsBridgeDO(mkState(), armed({ WAVE_RTMS_PER_PARTICIPANT: "1", MOQ_PUBLISH: moqBinding(moqWs) }));
+    await doo.fetch(startReq());
+    dialed[0].fire("message", { data: ackFrame("wss://media.zoom.us/audio") });
+    await flushAsync();
+    dialed[1].fire("message", { data: audioFrame(5, [1, 2, 3, 4]) });
+    dialed[1].fire("message", { data: audioFrame(9, [5, 6, 7, 8]) });
+    await flushAsync();
+    dialed[1].fire("message", { data: audioFrame(5, [1, 2, 3, 4]) });
+    dialed[1].fire("message", { data: audioFrame(9, [5, 6, 7, 8]) });
+    await flushAsync();
+
+    expect(moqWs).toHaveLength(1); // ONE container WS opened for the whole meeting, shared across participants
+    const sent = moqWs[0].sent as Uint8Array[];
+    expect(sent.length).toBeGreaterThan(0);
+    // frame header byte 1 is the uidLen; decode the uid bytes to prove BOTH participants' frames landed on it.
+    const uids = sent.map((f) => new TextDecoder().decode(f.slice(2, 2 + f[1])));
+    expect(uids).toEqual(expect.arrayContaining(["5", "9"]));
+  });
+
+  it("flag OFF (MOQ_PUBLISH bound anyway): no container WS is ever opened — inert", async () => {
+    dialed.length = 0;
+    const moqWs: FakeWs[] = [];
+    const doo = new ZoomRtmsBridgeDO(mkState(), armed({ MOQ_PUBLISH: moqBinding(moqWs) })); // flag absent
+    await doo.fetch(startReq());
+    dialed[0].fire("message", { data: ackFrame("wss://media.zoom.us/audio") });
+    await flushAsync();
+    dialed[1].fire("message", { data: audioFrame(5, [1, 2, 3, 4]) });
+    await flushAsync();
+    expect(moqWs).toHaveLength(0);
+  });
+
+  it("flag ON but MOQ_PUBLISH unbound: no container WS attempted — MoqTrackSink never even constructed", async () => {
+    dialed.length = 0;
+    const doo = new ZoomRtmsBridgeDO(mkState(), armed({ WAVE_RTMS_PER_PARTICIPANT: "1" })); // no MOQ_PUBLISH
+    const res = await doo.fetch(startReq());
+    expect(((await res.json()) as { started: boolean }).started).toBe(true); // core still starts fine
+    dialed[0].fire("message", { data: ackFrame("wss://media.zoom.us/audio") });
+    await flushAsync();
+    expect(() => dialed[1].fire("message", { data: audioFrame(5, [1, 2, 3, 4]) })).not.toThrow();
   });
 });
 

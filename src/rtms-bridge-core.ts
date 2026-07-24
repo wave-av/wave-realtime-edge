@@ -108,25 +108,61 @@ export interface ParticipantSink {
   close(): void;
 }
 
+/** #314 Slice 1 — the multiplexed per-meeting transport MoqTrackSink writes through, injected by the DO layer
+ *  (encoders/moq-forward-target.ts's MoqForwardTarget implements this) so THIS core file never imports a CF
+ *  container API directly. Defined here (not there) so MoqTrackSink's constructor type doesn't pull in
+ *  `@cloudflare/containers` at all. */
+export type MoqFrameKind = "audio" | "video";
+export interface MoqForwardWriter {
+  writeFrame(uid: string, kind: MoqFrameKind, ts: number, payload: Uint8Array): void;
+  close(): void;
+}
+
 /**
  * ◆ follow-up slice: real impl crosses into wave-moq-edge (a separate container/service) — publishing a
- * MoQ track is out of scope for this Worker. This is an INERT forwarder stub: logs one structured line
- * per call and does nothing else — no socket, no buffering, no network. Never constructed by default;
- * a caller opts in by wiring it into their own `RtmsBridgeDeps.sinks()` implementation.
+ * MoQ track is out of scope for this Worker. WITHOUT an injected `writer` this stays the INERT forwarder
+ * stub it always was: logs one structured line per call and does nothing else — no socket, no buffering,
+ * no network; byte-identical to before #314. A caller (the DO's `sinks()`, per #314 Slice 1) opts in by
+ * injecting a `MoqForwardWriter` (the DO constructs one ONLY when WAVE_RTMS_PER_PARTICIPANT is on AND its
+ * MOQ_PUBLISH container binding exists — see zoom-rtms-bridge-do.ts) — every audio()/video() call is then
+ * forwarded through it instead of logged. Fail-safe either way: a throwing writer is caught + logged, never
+ * thrown up into pumpAudio/pumpVideo's fan-out loop.
  */
 export class MoqTrackSink implements ParticipantSink {
   constructor(
     private readonly log: (msg: string, fields: Record<string, unknown>) => void,
     private readonly userId: string,
+    private readonly writer?: MoqForwardWriter,
+    private readonly now: () => number = () => Date.now(),
   ) {}
   audio(frame: Uint8Array): void {
+    if (this.writer) {
+      this.forward("audio", frame);
+      return;
+    }
     this.log("rtms-bridge-moq-sink-stub", { userId: this.userId, kind: "audio", bytes: frame.byteLength });
   }
   video(frame: Uint8Array): void {
+    if (this.writer) {
+      this.forward("video", frame);
+      return;
+    }
     this.log("rtms-bridge-moq-sink-stub", { userId: this.userId, kind: "video", bytes: frame.byteLength });
   }
+  private forward(kind: MoqFrameKind, frame: Uint8Array): void {
+    try {
+      this.writer!.writeFrame(this.userId, kind, this.now(), frame);
+    } catch (e) {
+      this.log("rtms-bridge-moq-sink-error", { userId: this.userId, kind, message: (e as Error)?.message ?? "unknown" });
+    }
+  }
   close(): void {
-    /* inert — no socket to close */
+    if (!this.writer) return; // inert stub — no socket to close (byte-identical to before #314)
+    try {
+      this.writer.close();
+    } catch {
+      /* best-effort */
+    }
   }
 }
 
