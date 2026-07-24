@@ -9,6 +9,6 @@
     "test": "vitest run --config vitest.config.mjs"
   },
   "dependencies": {
-    "werift": "0.23.0"
+    "werift": "0.24.0"
   }
 }
