@@ -7,6 +7,7 @@ import { scheduledStreamPoll } from "./stream-bridge-poll";
 import { scheduledIngestReconcile } from "./ingest-bridge";
 import { scheduledWhipSweep, WHIP_SWEEP_CRON } from "./whip-sweep";
 import { scheduledContainerHealth } from "./container-health-alarm";
+import { scheduledE3nRecordingSweep } from "./e3n-recording-sweep";
 import { buildPullSink, type Env } from "./dispatch-helpers";
 
 /**
@@ -68,4 +69,9 @@ export async function scheduledHandler(
 	// interval dwell #234 asks for while keeping this to 4 CF API reads an hour. INERT unless
 	// CONTAINER_HEALTH_ALARM_ENABLED=1 + CF_API_TOKEN/CF_ACCOUNT_ID bound. Never throws.
 	if (!isSweepOnlyTick) scheduledContainerHealth(env, ctx, env.RT_MEETING_ORG);
+
+	// E3n (wre#290) auto-record→VOD completion sweep (Axis A2+B1, INERT unless E3N_AUTORECORD_ENABLED + every
+	// required binding present). Gated to the FIFTEEN-minute tick — recording completion is not latency
+	// sensitive the way live-input lifecycle is, and this keeps the CF Stream API call volume bounded.
+	if (!isSweepOnlyTick) scheduledE3nRecordingSweep(env, ctx);
 }

@@ -64,6 +64,11 @@ export interface CfStreamLiveClientConfig {
   readonly now?: () => number;
   /** KV TTL (seconds) for both bindings. Matches the 14-day window other RT_MEETING_ORG writes use. */
   readonly ttlSeconds?: number;
+  /** E3n (wre#290) auto-record flag, resolved by the caller from `E3N_AUTORECORD_ENABLED`. Absent/false → the
+   *  input is created with `recording:{mode:"off"}` (today's byte-identical behavior). True → `"automatic"`, so
+   *  CF Stream records every broadcast on this input for the completion-sweep (`e3n-recording-sweep.ts`) to
+   *  correlate and register as VOD. This is the ONLY behavioral flip E3n makes here — no new I/O either way. */
+  readonly autoRecordEnabled?: boolean;
 }
 
 const CF_API_BASE = "https://api.cloudflare.com/client/v4";
@@ -108,6 +113,7 @@ export class CfStreamLiveClientImpl implements CfStreamLiveClient {
   private readonly fetchFn: typeof fetch;
   private readonly now: () => number;
   private readonly ttl: number;
+  private readonly autoRecord: boolean;
 
   constructor(private readonly cfg: CfStreamLiveClientConfig) {
     // BIND to globalThis: the Workers/undici global `fetch` throws "Illegal invocation" when called as a
@@ -116,10 +122,13 @@ export class CfStreamLiveClientImpl implements CfStreamLiveClient {
     this.fetchFn = cfg.fetchFn ?? fetch.bind(globalThis);
     this.now = cfg.now ?? Date.now;
     this.ttl = cfg.ttlSeconds ?? DEFAULT_TTL_SECONDS;
+    this.autoRecord = cfg.autoRecordEnabled === true;
   }
 
   async createLiveInput(req: CfStreamLiveIngestRequest): Promise<CfStreamLiveResult> {
-    // 1. Create the CF Stream Live input (recording off; defaultCreator carries the org for CF-side attribution).
+    // 1. Create the CF Stream Live input. E3n (wre#290): recording mode flips to "automatic" ONLY when the
+    //    caller resolved `E3N_AUTORECORD_ENABLED` truthy — default stays "off", byte-identical to today.
+    //    defaultCreator carries the org for CF-side attribution either way.
     let created: CfCreateInputResult;
     try {
       const res = await this.fetchFn(`${CF_API_BASE}/accounts/${this.cfg.accountId}/stream/live_inputs`, {
@@ -127,7 +136,7 @@ export class CfStreamLiveClientImpl implements CfStreamLiveClient {
         headers: { authorization: `Bearer ${this.cfg.apiToken}`, "content-type": "application/json" },
         body: JSON.stringify({
           meta: { name: `wave:${req.org}:${req.room}` },
-          recording: { mode: "off" },
+          recording: { mode: this.autoRecord ? "automatic" : "off" },
           defaultCreator: req.org,
         }),
       });

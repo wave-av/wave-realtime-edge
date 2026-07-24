@@ -170,6 +170,21 @@ INGRESS_ROUTER_ENABLED = "1"  # ARMED 2026-07-15 (Jake-named ◆, whep-live-egre
 # encrypts streamKey/passphrase at rest (#18, src/dest-key-crypto.ts, AES-256-GCM) before any KV write.
 EGRESS_DEST_MGMT_ENABLED = "0"  # INERT — arming is a ◆ Jake crossing (requires DEST_KEY_ENCRYPTION_KEY provisioned)
 
+# ── E3n (wre#290) — auto-record → VOD register. DEFAULT OFF / FULLY INERT. ──
+# ONE flag gates BOTH halves (they ship together — auto-record alone would leak orphan/unbilled CF recordings):
+#   1. cf-stream-live-client.ts createLiveInput() flips recording.mode "off"→"automatic" for NEW live inputs.
+#   2. e3n-recording-sweep.ts's */15 cron correlates completed recordings (list CF videos by liveInput uid,
+#      NOT the unverified video-ready webhook field) → pulls bytes into R2 (org-prefixed key, RT_RECORDINGS_ENAM,
+#      the same gateway-allowlisted jurisdiction bucket the proven RT-P2.5 residency path uses) → registers with
+#      the gateway (recordings-register.ts, metadata-only). Absent/"0" → byte-identical to today (recording:off,
+#      sweep is a no-op every tick). Requires CF_STREAM_API_TOKEN/CLOUDFLARE_STREAM_API_TOKEN + CF_ACCOUNT_ID +
+#      RT_MEETING_ORG + RT_RECORDINGS_ENAM + WAVE_GATEWAY_ORIGIN/GATEWAY_BASE_URL + WAVE_SERVICE_TOKEN bound —
+#      any missing → liveE3nSweepDeps returns null → the tick logs `e3n-sweep-inert` and does nothing.
+# KNOWN GAPS before arming in prod (◆ Jake-named, see PR body): NO retention (issue #7 absent — recordings
+# accumulate, though every one is register-tracked, not orphaned) and NO VOD/recording meter SKU (absent —
+# register is metadata-only here, a wave-gateway+wave-pricing follow-up mints the billable meter).
+E3N_AUTORECORD_ENABLED = "0"  # INERT — arming is a ◆ Jake crossing (needs retention #7 + the VOD meter SKU first)
+
 # DEST_KEY_ENCRYPTION_KEY is a wrangler SECRET — `wrangler secret put DEST_KEY_ENCRYPTION_KEY` (Doppler wave/prd).
 # TODO(doppler ◆): base64-encoded 32-byte (256-bit) AES-GCM key; value NOT set here — Jake-named crossing.
 # Unset → create-time encryption throws → the route 503s (DEST_KEY_CRYPTO_NOT_CONFIGURED), never a silent

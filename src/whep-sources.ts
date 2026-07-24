@@ -33,10 +33,11 @@ import {
   type StreamInputKv,
 } from "./cf-stream-live-client.js";
 import { STREAM_INPUT_ORG_PREFIX } from "./stream-bridge.js";
+import { e3nAutorecordEnabled, type E3nAutorecordEnv } from "./e3n-autorecord.js";
 
 /** Env fields this handler reads. Extends the backend's flag/creds env with the account id + KV binding the
  *  concrete adapter needs. All are `wrangler secret`/`--var` populated (Doppler `wave/prd`) — never in source. */
-export interface WhepSourcesEnv extends CfStreamLiveIngestEnv {
+export interface WhepSourcesEnv extends CfStreamLiveIngestEnv, E3nAutorecordEnv {
   /** CF Stream account id (the account live inputs live on — `c23f0a`). Injected at deploy (`CF_ACCOUNT_ID`). */
   CF_ACCOUNT_ID?: string;
   CLOUDFLARE_ACCOUNT_ID?: string; // Doppler-populated alias
@@ -226,6 +227,7 @@ export async function handleWhepSources(
       kv,
       fetchFn: deps.fetchFn,
       now: deps.now,
+      autoRecordEnabled: e3nAutorecordEnabled(env),
     });
     const backend = new CfStreamLiveIngestBackend(client);
     let outcome: Awaited<ReturnType<typeof backend.provision>>;

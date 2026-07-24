@@ -205,6 +205,31 @@ describe("CfStreamLiveClientImpl — createLiveInput", () => {
     expect(res.ok).toBe(true); // provision succeeds despite reverse-index write throwing
     expect(kv.store.get(`${STREAM_INPUT_ORG_PREFIX}${UID}`)).toBe("acme");
   });
+
+  // E3n (wre#290) — the ONE behavioral flip: recording.mode "off" (default) vs "automatic" (flag on).
+  it("keeps recording.mode 'off' when autoRecordEnabled is absent/false (byte-identical default)", async () => {
+    const calls: unknown[] = [];
+    const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push(JSON.parse(String(init?.body ?? "{}")));
+      return fakeFetch()(input, init);
+    }) as typeof fetch;
+    const kv = fakeKv();
+    const client = new CfStreamLiveClientImpl({ accountId: "a", apiToken: "t", kv, fetchFn });
+    await client.createLiveInput(req());
+    expect((calls[0] as { recording: { mode: string } }).recording.mode).toBe("off");
+  });
+
+  it("flips recording.mode to 'automatic' when autoRecordEnabled is true", async () => {
+    const calls: unknown[] = [];
+    const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push(JSON.parse(String(init?.body ?? "{}")));
+      return fakeFetch()(input, init);
+    }) as typeof fetch;
+    const kv = fakeKv();
+    const client = new CfStreamLiveClientImpl({ accountId: "a", apiToken: "t", kv, fetchFn, autoRecordEnabled: true });
+    await client.createLiveInput(req());
+    expect((calls[0] as { recording: { mode: string } }).recording.mode).toBe("automatic");
+  });
 });
 
 describe("readOrgStreamInputs", () => {
