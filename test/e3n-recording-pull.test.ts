@@ -32,6 +32,17 @@ describe("isCompletedRecording", () => {
 });
 
 describe("listCfVideosForLiveInput", () => {
+  it("filters by CF's documented `live_input_id` query param — NOT the response-body field name `liveInput` (F1 fix)", async () => {
+    let requestedUrl = "";
+    const fetchFn = (async (url: string) => {
+      requestedUrl = url;
+      return new Response(JSON.stringify({ success: true, result: [] }), { status: 200 });
+    }) as unknown as typeof fetch;
+    await listCfVideosForLiveInput(fetchFn, "acct", "tok", "in1");
+    expect(requestedUrl).toContain("live_input_id=in1");
+    expect(requestedUrl).not.toContain("liveInput=");
+  });
+
   it("parses a successful list into narrowed summaries", async () => {
     const fetchFn = (async () =>
       new Response(
@@ -64,11 +75,11 @@ describe("listCfVideosForLiveInput", () => {
 describe("requestCfDownloadUrl", () => {
   it("ready:true with a url once CF's download job settles", async () => {
     const fetchFn = (async () =>
-      new Response(JSON.stringify({ success: true, result: { default: { status: "ready", url: "https://cf.example/dl.mp4" } } }), {
+      new Response(JSON.stringify({ success: true, result: { default: { status: "ready", url: "https://videodelivery.net/dl.mp4" } } }), {
         status: 200,
       })) as typeof fetch;
     const res = await requestCfDownloadUrl(fetchFn, "a", "t", "v1");
-    expect(res).toEqual({ ready: true, url: "https://cf.example/dl.mp4" });
+    expect(res).toEqual({ ready: true, url: "https://videodelivery.net/dl.mp4" });
   });
 
   it("ready:false while CF is still muxing (distinct from a hard failure)", async () => {
@@ -89,7 +100,7 @@ describe("pullCfRecordingBytes", () => {
     const fetchFn = (async () =>
       new Response("bytes", { status: 200, headers: { "content-length": "5" } })) as typeof fetch;
     const r2 = fakeR2();
-    const res = await pullCfRecordingBytes(fetchFn, "https://cf.example/dl.mp4", r2 as never, "org1/e3n-recordings/v1/recording.mp4");
+    const res = await pullCfRecordingBytes(fetchFn, "https://videodelivery.net/dl.mp4", r2 as never, "org1/e3n-recordings/v1/recording.mp4");
     expect(res).toEqual({ bytes: 5 });
     expect(r2.store.has("org1/e3n-recordings/v1/recording.mp4")).toBe(true);
   });
@@ -107,14 +118,27 @@ describe("pullCfRecordingBytes", () => {
     expect(r2.store.size).toBe(0);
   });
 
+  it("rejects an https URL that passes the public-IP check but ISN'T a CF Stream host (F3 hardening)", async () => {
+    let called = false;
+    const fetchFn = (async () => {
+      called = true;
+      return new Response("x", { status: 200 });
+    }) as typeof fetch;
+    const r2 = fakeR2();
+    const res = await pullCfRecordingBytes(fetchFn, "https://evil.example.com/dl.mp4", r2 as never, "org1/e3n-recordings/v1/recording.mp4");
+    expect(res).toBeNull();
+    expect(called).toBe(false);
+    expect(r2.store.size).toBe(0);
+  });
+
   it("null on a non-2xx fetch, a network error, or an R2 put failure — never a partial object", async () => {
     const nonOk = (async () => new Response("no", { status: 404 })) as typeof fetch;
-    expect(await pullCfRecordingBytes(nonOk, "https://cf.example/dl.mp4", fakeR2() as never, "k")).toBeNull();
+    expect(await pullCfRecordingBytes(nonOk, "https://videodelivery.net/dl.mp4", fakeR2() as never, "k")).toBeNull();
 
     const throws = (async () => {
       throw new Error("net");
     }) as typeof fetch;
-    expect(await pullCfRecordingBytes(throws, "https://cf.example/dl.mp4", fakeR2() as never, "k")).toBeNull();
+    expect(await pullCfRecordingBytes(throws, "https://videodelivery.net/dl.mp4", fakeR2() as never, "k")).toBeNull();
 
     const ok = (async () => new Response("bytes", { status: 200 })) as typeof fetch;
     const failingR2 = {
@@ -122,7 +146,7 @@ describe("pullCfRecordingBytes", () => {
         throw new Error("r2 boom");
       },
     };
-    expect(await pullCfRecordingBytes(ok, "https://cf.example/dl.mp4", failingR2 as never, "k")).toBeNull();
+    expect(await pullCfRecordingBytes(ok, "https://videodelivery.net/dl.mp4", failingR2 as never, "k")).toBeNull();
   });
 });
 

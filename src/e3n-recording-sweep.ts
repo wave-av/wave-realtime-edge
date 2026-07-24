@@ -53,10 +53,13 @@ export const E3N_REGISTERED_TTL_SECONDS = 60 * 60 *24 * 90; // 90d
  *  region-registry SSOT (never a hand-kept literal — `registries-consolidated`) so a built register() call
  *  is guaranteed gateway-allowlisted (never `residency_bucket_mismatch`). E3n has no per-session
  *  `request.cf.continent` to derive a zone from (CF Stream inputs are pushed to, not joined), so it uses
- *  this single fixed placement for W1 (single-tenant, single-region) rather than inventing one. */
-const E3N_RECORDING_REGION = regionForBinding("RT_RECORDINGS_ENAM");
-export const E3N_RECORDING_ZONE = E3N_RECORDING_REGION?.zone ?? "us-east";
-export const E3N_RECORDING_BUCKET_NAME = E3N_RECORDING_REGION?.bucketName ?? "wave-recordings-enam";
+ *  this single fixed placement for W1 (single-tenant, single-region) rather than inventing one.
+ *
+ *  NO LITERAL FALLBACK (load-bearing disable-gate): `liveE3nSweepDeps` re-resolves this binding fresh and
+ *  returns null (sweep INERT) when it's absent — a hardcoded `?? "us-east"` / `?? "wave-recordings-enam"`
+ *  fallback here would silently keep sweeping the region after `region-registry.ts` flips
+ *  `RT_RECORDINGS_ENAM.enabled` to false, defeating the registry's disable gate. */
+const E3N_RECORDING_BINDING = "RT_RECORDINGS_ENAM";
 
 export interface E3nSweepResult {
   scanned: number;
@@ -69,8 +72,16 @@ export interface E3nSweepResult {
   missingOrg: number;
 }
 
+/** The `sourceProtocol` value register() carries for every E3n CF-Stream-sourced recording — distinct from
+ *  the SFU/WHIP residency path's default so the gateway's analytics never misattribute a CF Stream pull as a
+ *  WHIP session. Must be a member of the gateway's allowed sourceProtocol set. */
+export const E3N_SOURCE_PROTOCOL = "cf-stream-recording";
+
 /** Injected seam so the whole sweep unit-tests with no real network/KV/R2 (mirrors PollDeps). */
 export interface E3nSweepDeps {
+  /** The fixed residency zone this sweep instance registers into — RESOLVED (never defaulted) from the
+   *  region-registry at `liveE3nSweepDeps` construction time (see the disable-gate note there). */
+  zone: string;
   /** Every live input we have a forward org binding for (KV list on `stream-input-org:`). */
   listLiveInputs(): Promise<{ uid: string }[]>;
   /** Re-resolve a live input's org FRESH at pull time (defends a TTL-expired/deleted binding mid-sweep —
@@ -86,7 +97,13 @@ export interface E3nSweepDeps {
    *  next tick, distinguished only in logs — both are equally "not durable yet" to the caller). */
   pullToR2(video: CfVideoSummary, org: string): Promise<{ r2Key: string; bucket: string } | null>;
   /** Register the durable R2 object with the gateway. */
-  register(input: { org: string; r2Key: string; bucket: string; zone: string }): Promise<{ ok: boolean }>;
+  register(input: {
+    org: string;
+    r2Key: string;
+    bucket: string;
+    zone: string;
+    sourceProtocol: string;
+  }): Promise<{ ok: boolean }>;
   log?(msg: string, fields: Record<string, unknown>): void;
 }
 
@@ -117,6 +134,12 @@ export async function sweepE3nRecordings(deps: E3nSweepDeps): Promise<E3nSweepRe
     }
 
     for (const video of videos) {
+      // Defense-in-depth cross-tenant guard: `listVideosForInput` filters server-side by `live_input_id`,
+      // but if that filter is ever dropped/mis-sent (the exact CRITICAL bug this line defends against — CF
+      // silently ignores an unknown query param and returns the WHOLE account's video list), never attribute
+      // a video to an org it didn't come from. `video.liveInput` is the CF video object's own back-reference
+      // to its source live input (parsed in `e3n-recording-pull.ts`'s `listCfVideosForLiveInput`).
+      if (video.liveInput !== uid) continue;
       if (!isCompletedRecording(video)) continue;
       out.completed++;
 
@@ -143,7 +166,13 @@ export async function sweepE3nRecordings(deps: E3nSweepDeps): Promise<E3nSweepRe
       }
 
       const result = await deps
-        .register({ org, r2Key: pulled.r2Key, bucket: pulled.bucket, zone: E3N_RECORDING_ZONE })
+        .register({
+          org,
+          r2Key: pulled.r2Key,
+          bucket: pulled.bucket,
+          zone: deps.zone,
+          sourceProtocol: E3N_SOURCE_PROTOCOL,
+        })
         .catch(() => ({ ok: false }));
       if (!result.ok) {
         // Bytes are durable in R2 (deterministic key — a retry overwrites, not duplicates), but the register
@@ -173,8 +202,9 @@ export interface E3nSweepRuntimeEnv extends E3nAutorecordEnv {
   CF_STREAM_API_TOKEN?: string;
   CLOUDFLARE_STREAM_API_TOKEN?: string;
   RT_MEETING_ORG?: KVNamespace;
-  /** The residency bucket E3n recordings land in (see `E3N_RECORDING_ZONE`) — reused, already
-   *  gateway-allowlisted (proven live by the RT-P2.5 residency register path). */
+  /** The residency bucket E3n recordings land in — reused, already gateway-allowlisted (proven live by the
+   *  RT-P2.5 residency register path). Its zone/bucket-name are resolved fresh from the region-registry at
+   *  `liveE3nSweepDeps` construction time (see the disable-gate note on `E3N_RECORDING_BINDING`). */
   RT_RECORDINGS_ENAM?: R2Bucket;
   WAVE_GATEWAY_ORIGIN?: string;
   GATEWAY_BASE_URL?: string;
@@ -193,6 +223,11 @@ export function liveE3nSweepDeps(
   fetchFn: typeof fetch = fetch,
 ): E3nSweepDeps | null {
   if (!e3nAutorecordEnabled(env)) return null;
+  // Re-resolve the residency region FRESH here (never a cached/hardcoded literal) so this sweep goes INERT
+  // the moment `region-registry.ts` disables `RT_RECORDINGS_ENAM` — a literal `?? "us-east"` fallback would
+  // silently keep sweeping the region after the registry disable-gate fires, defeating it.
+  const region = regionForBinding(E3N_RECORDING_BINDING);
+  if (!region) return null;
   const kv = env.RT_MEETING_ORG;
   const accountId = env.CF_ACCOUNT_ID;
   const apiToken = resolveCfStreamToken(env);
@@ -206,6 +241,7 @@ export function liveE3nSweepDeps(
   };
 
   return {
+    zone: region.zone,
     async listLiveInputs() {
       const listed = await kv.list({ prefix: STREAM_INPUT_ORG_PREFIX, limit: MAX_SWEEP_INPUTS_PER_TICK });
       return listed.keys.map((k) => ({ uid: k.name.slice(STREAM_INPUT_ORG_PREFIX.length) }));
@@ -226,7 +262,7 @@ export function liveE3nSweepDeps(
       const key = e3nRecordingKey(org, video.uid);
       const pulled = await pullCfRecordingBytes(fetchFn, dl.url, bucket, key);
       if (!pulled) return null;
-      return { r2Key: key, bucket: E3N_RECORDING_BUCKET_NAME };
+      return { r2Key: key, bucket: region.bucketName };
     },
     async register(input) {
       const r = await registerRecording(input, registerCfg, log, fetchFn);

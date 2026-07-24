@@ -1,8 +1,14 @@
 // E3n (wre#290) Axis A2 — the cron-sweep correlate→pull→register orchestration. Pure: every dependency is
 // injected, no real CF/KV/R2/gateway network. Covers: happy path, missing org KV, pull failure (fail-safe, no
 // double-register), and re-sweep idempotency (a re-tick never re-pulls/re-registers an already-landed video).
-import { describe, it, expect, vi } from "vitest";
-import { sweepE3nRecordings, type E3nSweepDeps } from "../src/e3n-recording-sweep.js";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import {
+  sweepE3nRecordings,
+  liveE3nSweepDeps,
+  E3N_SOURCE_PROTOCOL,
+  type E3nSweepDeps,
+  type E3nSweepRuntimeEnv,
+} from "../src/e3n-recording-sweep.js";
 import { isCompletedRecording, type CfVideoSummary } from "../src/e3n-recording-pull.js";
 
 const completedVideo = (uid: string): CfVideoSummary => ({
@@ -18,6 +24,7 @@ function baseDeps(overrides: Partial<E3nSweepDeps> = {}): E3nSweepDeps & { regis
   const registeredSet = new Set<string>();
   return {
     registeredSet,
+    zone: "us-east",
     async listLiveInputs() {
       return [{ uid: "in1" }];
     },
@@ -50,7 +57,13 @@ describe("sweepE3nRecordings — happy path", () => {
     const deps = baseDeps({ register: registerSpy });
     const out = await sweepE3nRecordings(deps);
     expect(out).toMatchObject({ scanned: 1, completed: 1, registered: 1, alreadyRegistered: 0, missingOrg: 0, pullPending: 0, registerFailed: 0 });
-    expect(registerSpy).toHaveBeenCalledWith({ org: "org-1", r2Key: "org-1/e3n-recordings/v1/recording.mp4", bucket: "wave-recordings-enam", zone: "us-east" });
+    expect(registerSpy).toHaveBeenCalledWith({
+      org: "org-1",
+      r2Key: "org-1/e3n-recordings/v1/recording.mp4",
+      bucket: "wave-recordings-enam",
+      zone: "us-east",
+      sourceProtocol: E3N_SOURCE_PROTOCOL,
+    });
     expect(deps.registeredSet.has("v1")).toBe(true);
   });
 
@@ -133,5 +146,77 @@ describe("sweepE3nRecordings — list failures don't abort the tick", () => {
 describe("isCompletedRecording sanity (imported for cross-module contract check)", () => {
   it("matches the sweep's own gate", () => {
     expect(isCompletedRecording(completedVideo("v1"))).toBe(true);
+  });
+});
+
+describe("sweepE3nRecordings — cross-tenant leak guard (F1 CRITICAL)", () => {
+  it("when CF's list is unfiltered (multiple live inputs' videos returned), pulls/registers ONLY the video whose liveInput matches the swept uid", async () => {
+    // This is the exact bug: `listVideosForInput` (in production, CF's list endpoint) returns the WHOLE
+    // account's videos rather than just this live input's — the mock the author's tests missed.
+    const foreignVideo: CfVideoSummary = { uid: "v-foreign", liveInput: "in-OTHER-ORG", readyToStream: true, state: "ready", duration: 10, created: null };
+    const matchingVideo: CfVideoSummary = completedVideo("v-mine");
+    const pullSpy = vi.fn(async (video: CfVideoSummary, org: string) => ({
+      r2Key: `${org}/e3n-recordings/${video.uid}/recording.mp4`,
+      bucket: "wave-recordings-enam",
+    }));
+    const registerSpy = vi.fn(async () => ({ ok: true }));
+    const deps = baseDeps({
+      listVideosForInput: async () => [foreignVideo, matchingVideo],
+      pullToR2: pullSpy,
+      register: registerSpy,
+    });
+
+    const out = await sweepE3nRecordings(deps);
+
+    expect(out.completed).toBe(1); // the foreign video never even counts as "completed" for this input
+    expect(pullSpy).toHaveBeenCalledTimes(1);
+    expect(pullSpy).toHaveBeenCalledWith(matchingVideo, "org-1");
+    expect(registerSpy).toHaveBeenCalledTimes(1);
+    expect(registerSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ r2Key: "org-1/e3n-recordings/v-mine/recording.mp4" }),
+    );
+    expect(deps.registeredSet.has("v-foreign")).toBe(false);
+    expect(deps.registeredSet.has("v-mine")).toBe(true);
+  });
+});
+
+describe("sweepE3nRecordings — explicit sourceProtocol (F4)", () => {
+  it("register() always carries the CF-Stream-recording sourceProtocol, never the WHIP default", async () => {
+    const registerSpy = vi.fn(async () => ({ ok: true }));
+    const deps = baseDeps({ register: registerSpy });
+    await sweepE3nRecordings(deps);
+    expect(registerSpy).toHaveBeenCalledWith(expect.objectContaining({ sourceProtocol: E3N_SOURCE_PROTOCOL }));
+    expect(E3N_SOURCE_PROTOCOL).not.toBe("whip");
+  });
+});
+
+describe("liveE3nSweepDeps — region disable-gate (F2)", () => {
+  afterEach(() => {
+    vi.doUnmock("../src/region-registry.js");
+    vi.resetModules();
+  });
+
+  const fullyConfiguredEnv = (): E3nSweepRuntimeEnv => ({
+    E3N_AUTORECORD_ENABLED: "1",
+    CF_ACCOUNT_ID: "acct",
+    CF_STREAM_API_TOKEN: "tok",
+    RT_MEETING_ORG: {} as unknown as KVNamespace,
+    RT_RECORDINGS_ENAM: {} as unknown as R2Bucket,
+    WAVE_GATEWAY_ORIGIN: "https://gw.example",
+    WAVE_SERVICE_TOKEN: "svc",
+  });
+
+  it("is null (INERT, no literal fallback) once regionForBinding('RT_RECORDINGS_ENAM') returns null", async () => {
+    vi.resetModules();
+    vi.doMock("../src/region-registry.js", () => ({ regionForBinding: () => null }));
+    const { liveE3nSweepDeps: liveDepsWithDisabledRegion } = await import("../src/e3n-recording-sweep.js");
+    const deps = liveDepsWithDisabledRegion(fullyConfiguredEnv());
+    expect(deps).toBeNull();
+  });
+
+  it("is non-null with a real region resolved (control: every other binding present)", () => {
+    const deps = liveE3nSweepDeps(fullyConfiguredEnv());
+    expect(deps).not.toBeNull();
+    expect(deps?.zone).toBe("us-east");
   });
 });

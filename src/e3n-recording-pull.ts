@@ -19,6 +19,23 @@
  */
 import { isSafePublicHttpsUrl } from "./rtk-webhook.js";
 
+/**
+ * CF Stream MP4 download URLs are documented to be served from these CF-owned hosts. Cheap hardening on top
+ * of the shared `isSafePublicHttpsUrl` guard (which is TRUSTED-SOURCE-ONLY — literal-IP/localhost checks, no
+ * DNS resolution, so it is not a general attacker-input-safe SSRF guard; see its own doc comment in
+ * `rtk-webhook.ts`): even though this URL is CF-API-returned rather than attacker-controlled, assert its
+ * origin really is a CF Stream host before fetching, rather than trusting any https URL CF happened to return.
+ */
+function isCfStreamDownloadHost(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  return (
+    h === "videodelivery.net" ||
+    h.endsWith(".videodelivery.net") ||
+    h === "cloudflarestream.com" ||
+    h.endsWith(".cloudflarestream.com")
+  );
+}
+
 const CF_API_BASE = "https://api.cloudflare.com/client/v4";
 /** Explicit timeout on every CF Stream API call — an unbounded hang would stall the whole sweep tick. */
 const CF_CALL_TIMEOUT_MS = 8_000;
@@ -70,7 +87,14 @@ export async function listCfVideosForLiveInput(
 ): Promise<CfVideoSummary[] | null> {
   const res = await fetchWithTimeout(
     fetchFn,
-    `${CF_API_BASE}/accounts/${accountId}/stream?liveInput=${encodeURIComponent(liveInputUid)}`,
+    // `live_input_id` is CF's documented QUERY-PARAM filter name for this list endpoint — distinct from
+    // `liveInput`, which is the RESPONSE-BODY field name on each returned video object (parsed below into
+    // `CfVideoSummary.liveInput`). Using the body-field name as the query param is silently ignored by CF
+    // (unknown params are dropped, not rejected) and returns the ENTIRE account's unfiltered video list —
+    // a cross-tenant data leak once any consumer trusts this list as pre-filtered. The sweep additionally
+    // re-checks `video.liveInput === uid` per-video (defense-in-depth; see `e3n-recording-sweep.ts`) so a
+    // regression here is caught even if this comment rots.
+    `${CF_API_BASE}/accounts/${accountId}/stream?live_input_id=${encodeURIComponent(liveInputUid)}`,
     { headers: { authorization: `Bearer ${apiToken}` } },
   );
   if (!res || !res.ok) return null;
@@ -148,6 +172,13 @@ export async function pullCfRecordingBytes(
   key: string,
 ): Promise<{ bytes: number } | null> {
   if (!isSafePublicHttpsUrl(url)) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (!isCfStreamDownloadHost(parsed.hostname)) return null;
   let res: Response;
   try {
     res = await fetchFn(url);
