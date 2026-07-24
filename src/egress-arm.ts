@@ -51,6 +51,7 @@ import {
 import { validateDestinationUrl, type DestKind, type SsrfGuardOptions } from "./ssrf-guard.js";
 import { egressDestMgmtEnabled, resolveDestinationForArm, type EgressDestinationsEnv } from "./egress-destinations.js";
 import type { CfStreamEgressClient } from "./egress-cf-stream-passthrough.js";
+import type { RunpodNvencClient, RunpodNvencEncodeRequest, RunpodNvencResult } from "./egress-runpod-nvenc.js";
 
 /** Env fields this factory reads. Reuses the SAME var/secret names the P2/P3 backend Env interfaces already
  *  declare (`EgressWaveRenderEnv.WAVE_RENDER_URL`/`WAVE_INTERNAL_RENDER_TOKEN`,
@@ -318,4 +319,98 @@ export async function armExternalRtmpRestream(
     return { status: "refused", httpStatus: result.status, reason: result.reason };
   }
   return { status: "provisioned", outputId: result.outputId };
+}
+
+/**
+ * W1 SLICE-2B O2 (wre#288) — external SRT restream ARM, the edge-arm-seam half. CF Stream Live Outputs are
+ * RTMP-only (no SRT egress), so — unlike O1's direct CF Live Output — an SRT restream MUST route via the NVENC
+ * transcode leg (`egress-runpod-nvenc.ts`): the origin composites/encodes AND pushes the result live to the SRT
+ * destination, rather than CF fanning it out itself. This arm mirrors `armExternalRtmpRestream` EXACTLY (same
+ * flag gate, same fail-closed resolve/kind/SSRF-at-connect ordering) but dispatches through the injected
+ * `RunpodNvencClient` with the resolved destination attached to the encode request, instead of a CF provision
+ * call.
+ *
+ * INERT / DEFERRED SCOPE. This module ships ZERO live-socket code: the actual SRT push happens inside whatever
+ * concrete `RunpodNvencClient` the caller injects (the runpod-container ◆ GPU-spend task, explicitly out of
+ * scope here) — this arm only builds the request and dispatches it through the seam. Same `EGRESS_ROUTER_ENABLED`
+ * + `EGRESS_DEST_MGMT_ENABLED` flag gate as O1 (both default "0"): no behavior change while either is off.
+ *
+ * FLOW (fail-closed at every step, never a throw into the media path):
+ *   1. Flags off → refused (404), no lookups performed.
+ *   2. `resolveDestinationForArm(env, org, destId)` — thrown/absent/foreign-org → refused (500/404), same as O1.
+ *   3. `dest.kind !== "srt"` → refused (400) — a destination stored as a different kind must never be silently
+ *      pushed as SRT.
+ *   4. `assertDestinationSafeAtConnect(dest)` — the SAME SSRF-at-connect re-check as O1, run BEFORE any dispatch
+ *      to the NVENC client. A reject (DNS-rebind or otherwise) → refused (403), NO `client.encode` call.
+ *   5. `client.encode({ ...request, destination: { url: dest.url, passphrase: dest.passphrase } })` — dispatches
+ *      the NVENC leg with the resolved SRT target attached. A non-2xx/`ok:false` reply is a typed refusal, never
+ *      a throw.
+ */
+export interface ExternalSrtRestreamArmEnv extends EgressDestinationsEnv {
+  EGRESS_ROUTER_ENABLED?: string | boolean;
+}
+
+/** The outcome of one O2 external-SRT restream arm attempt. Discriminated so a refusal (inert, not-found,
+ *  foreign-org, kind-mismatch, SSRF-at-connect reject, or a non-ok NVENC reply) is never mistaken for a
+ *  dispatched stream. */
+export type ExternalSrtRestreamOutcome =
+  | { readonly status: "streamed"; readonly result: RunpodNvencResult }
+  | { readonly status: "refused"; readonly httpStatus: number; readonly reason: string };
+
+/**
+ * ARM an external SRT restream (O2, wre#288): dispatch the NVENC transcode leg to push an already-composited
+ * room view out to a customer's EXTERNAL SRT destination. `request` is the encode job MINUS `destination` (the
+ * caller's already-built width/height/codec/output/latency/sources — the SAME `RunpodNvencEncodeRequest` shape
+ * `RunpodNvencEgressBackend` builds); this function attaches the resolved+SSRF-checked destination and dispatches.
+ * INERT unless BOTH `EGRESS_ROUTER_ENABLED` and `EGRESS_DEST_MGMT_ENABLED` are armed — no behavior change with
+ * either flag off. See the module-level docstring above for the full fail-closed flow.
+ */
+export async function armExternalSrtRestream(
+  env: ExternalSrtRestreamArmEnv,
+  org: string,
+  destId: string,
+  request: Omit<RunpodNvencEncodeRequest, "destination">,
+  client: RunpodNvencClient,
+  deps: Pick<SsrfGuardOptions, "resolveHost" | "fetchFn"> = {},
+): Promise<ExternalSrtRestreamOutcome> {
+  if (!egressRouterEnabled(env) || !egressDestMgmtEnabled(env)) {
+    return { status: "refused", httpStatus: 404, reason: "external srt restream is not armed" };
+  }
+
+  // FAIL-CLOSED ON RESOLVE THROW — same rationale as armExternalRtmpRestream above.
+  let dest: Awaited<ReturnType<typeof resolveDestinationForArm>>;
+  try {
+    dest = await resolveDestinationForArm(env, org, destId);
+  } catch (e) {
+    return {
+      status: "refused",
+      httpStatus: 500,
+      reason: `destination resolve failed, denying by default: ${(e as Error)?.message ?? String(e)}`,
+    };
+  }
+  if (!dest) {
+    return { status: "refused", httpStatus: 404, reason: "destination not found" };
+  }
+
+  // KIND GUARD — this arm dispatches an SRT-destined NVENC request; a destination stored as a different kind
+  // (e.g. `rtmp`) must never be silently pushed as SRT.
+  if (dest.kind !== "srt") {
+    return { status: "refused", httpStatus: 400, reason: `destination kind '${dest.kind}' is not srt` };
+  }
+
+  // SSRF-AT-CONNECT — re-runs BEFORE any dispatch to the NVENC client (see assertDestinationSafeAtConnect
+  // docstring above). Catches a DNS rebind between the destination's create-time validation and this dispatch.
+  const safe = await assertDestinationSafeAtConnect(dest, deps);
+  if (!safe.ok) {
+    return { status: "refused", httpStatus: 403, reason: `destination failed SSRF-at-connect check: ${safe.reason}` };
+  }
+
+  const result = await client.encode({
+    ...request,
+    destination: dest.passphrase ? { url: dest.url, passphrase: dest.passphrase } : { url: dest.url },
+  });
+  if (!result.ok) {
+    return { status: "refused", httpStatus: result.status, reason: result.reason };
+  }
+  return { status: "streamed", result };
 }
