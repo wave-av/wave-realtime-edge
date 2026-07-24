@@ -61,14 +61,33 @@ export interface RunpodNvencEncodeRequest {
   readonly output: EgressOutput;
   readonly latency: EgressLatency;
   readonly sources: readonly EncodeSource[];
+  /**
+   * OPTIONAL — W1 SLICE-2B O2 (wre#288, edge-arm seam). When present, this encode is destined for a LIVE SRT
+   * restream (`armExternalSrtRestream`, egress-arm.ts) rather than a batch artifact: the origin should push the
+   * composited/encoded stream to `url` (an `srt://` destination, already SSRF-checked at connect by the caller)
+   * using `passphrase` if the destination requires one. ABSENT (the default) preserves the existing batch-artifact
+   * contract exactly — every current caller/test is unaffected.
+   *
+   * CONCRETE HANDLING DEFERRED. This field is a pure interface seam only: the actual RunPod-side SRT push (opening
+   * the SRT socket, streaming NVENC output frames to it rather than uploading a finished artifact) is NOT
+   * implemented here — that is the runpod-container ◆ GPU-spend task this edge-arm slice explicitly excludes. A
+   * `RunpodNvencClient` that does not yet support live SRT push should ignore/reject this field, not silently
+   * fabricate a stream.
+   */
+  readonly destination?: { readonly url: string; readonly passphrase?: string };
 }
 
 /** The origin's reply. Discriminated so a non-2xx (e.g. endpoint 5xx / auth 401) carries a stable status + reason and
- *  is never mistaken for a produced artifact. The ok branch carries a REFERENCE to the encoded artifact (video is far
- *  too large to inline, unlike the P2 still) plus `gpuSeconds` — the measured GPU wall-time the encode consumed, the
- *  sole basis for grounded COGS. */
+ *  is never mistaken for a produced artifact. The `artifactKey` ok branch carries a REFERENCE to the encoded artifact
+ *  (video is far too large to inline, unlike the P2 still); the `streamed` ok branch (W1 O2, wre#288) instead confirms
+ *  the encode was pushed LIVE to the request's `destination` (an SRT egress) rather than materializing an artifact —
+ *  no `artifactKey` exists in that case, so the two are kept as SEPARATE `ok: true` variants (never a single shape
+ *  with an optional `artifactKey`, which would let a caller silently treat "streamed, no artifact" as "artifact
+ *  missing/undefined"). Both ok branches carry `gpuSeconds` — the measured GPU wall-time the encode consumed, the
+ *  sole basis for grounded COGS — so `cogsUsd(result.gpuSeconds)` works unchanged for either. */
 export type RunpodNvencResult =
   | { readonly ok: true; readonly artifactKey: string; readonly codec: EgressCodec; readonly gpuSeconds: number }
+  | { readonly ok: true; readonly streamed: true; readonly codec: EgressCodec; readonly gpuSeconds: number }
   | { readonly ok: false; readonly status: number; readonly reason: string };
 
 /** The injected origin seam. The backend depends ONLY on this interface — the concrete adapter (RunPod serverless
