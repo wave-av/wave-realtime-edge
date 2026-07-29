@@ -1,0 +1,55 @@
+# Codecov config for wave-realtime-edge.
+#
+# Coverage is uploaded by .github/workflows/contract-tests.yml (job `test`) from
+# ./coverage/lcov.info, produced by `npm run test:coverage` (vitest v8 provider).
+#
+# NOTE ON THE HEADLINE NUMBER: Codecov's percentage will NOT match vitest's terminal summary.
+# Codecov scores the lcov `DA` line records; vitest reports statements/lines over a different
+# denominator. Measured at the time this file landed: vitest reported 86.29% statements /
+# 88.66% lines over 6383 statements, across 111 test files and 1548 tests. Settle which number
+# a target means BEFORE turning any of these statuses into a blocking gate.
+
+codecov:
+  # Wait for the test job to finish before finalising, so a status is never computed from a
+  # partial upload.
+  require_ci_to_pass: true
+
+coverage:
+  precision: 2
+  round: down
+  range: "70...95"
+
+  status:
+    # informational: true == report the delta, never fail the build. This is deliberate for the
+    # first landing: there is no agreed target yet (see the denominator note above), and a gate
+    # nobody agreed to is a gate people learn to ignore. Flip to blocking once a target is set.
+    project:
+      default:
+        informational: true
+        flags: [worker]
+    patch:
+      default:
+        informational: true
+        flags: [worker]
+
+flags:
+  worker:
+    paths:
+      - src/
+    # carryforward: true is REQUIRED here. contract-tests.yml runs on every PR, but if a future
+    # path filter ever skips it, Codecov would otherwise read "no upload" as "0% coverage" and
+    # report a catastrophic drop on an unrelated PR. Carryforward reuses the last known report
+    # for this flag instead.
+    carryforward: true
+
+# Keep the denominator honest: these are not shipped worker source.
+ignore:
+  - "test/**"
+  - "scripts/**"
+  - "**/*.test.ts"
+  - "**/*.d.ts"
+
+comment:
+  layout: "condensed_header, diff, flags, components"
+  behavior: default
+  require_changes: true

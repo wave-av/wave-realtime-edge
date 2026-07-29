@@ -3,6 +3,8 @@ node_modules/
 *.log
 .env
 .dev.vars
+# `npm run test:coverage` output — uploaded to Codecov by CI, never committed.
+coverage/
 
 # >>> wave claude-project-chassis (managed) — do not edit between these markers >>>
 .claude/settings.local.json

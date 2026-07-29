@@ -14,5 +14,18 @@ export default defineConfig({
 	test: {
 		environment: "node",
 		include: ["src/**/*.test.ts", "test/**/*.test.ts"],
+		coverage: {
+			// v8, not istanbul. The istanbul provider is only required when tests execute inside
+			// workerd, which does not expose V8's profiler (cloudflare/workers-sdk#14463). This
+			// suite runs in `environment: "node"` (see above), so the V8 provider applies.
+			provider: "v8",
+			reporter: ["text", "lcov"],
+			reportsDirectory: "./coverage",
+			// Scope to shipped worker source. `test/` holds the suite and its stubs — including
+			// test/stubs/cloudflare-workers.ts, which exists only to satisfy the alias above and
+			// would otherwise be scored as if it were production code.
+			include: ["src/**/*.ts"],
+			exclude: ["src/**/*.d.ts", "src/**/*.test.ts"],
+		},
 	},
 });
