@@ -9,12 +9,77 @@
 #
 # INERT: this image is NOT built or attached by the inert PR. The [[containers]] StreamBridgeContainer block in
 # wrangler.toml stays COMMENTED; building (Path A) or running (Path B) is a Jake-named ◆ go-live crossing.
+#
+# --- FFmpeg build: FFMPEG9-LEI E7-P3 — proposal, source-pin per E2-P1-POLICY §1 channel 1 (source-tag@canonical) ---
+#
+# WHY 9.0 instead of the bookworm apt package this image used to install: the FFmpeg9-LEI stall verdict
+# (wave-conformance receipts/ffmpeg9-stall-2026-08-05-VERDICT.md, H3) confirmed FFmpeg 9.0's `-readrate` rework
+# (pace on the SLOWEST live stream, not the first-to-finish) eliminates the sparse-subtitle stall this leg's own
+# `-re` flag (server/hls-source.mjs:69) is exposed to: 4 stall events/run on 8.1.1-class vs 0/run on 9.0, N=3x2,
+# reproduced twice. R23 (governance/plans/ffmpeg9-lei/RECEIPTS.md) names THIS file (hls-source.mjs:73 `-c:v libvpx`,
+# :81 `-c:a libopus`) the ONE live `-readrate` beneficiary mapped in the E7 streaming-wins sweep — every other 9.0
+# streaming win in that sweep was parked, unmapped to a site this repo runs. The bookworm apt package this Dockerfile
+# used to install floats on whatever the base image resolves (channel-watch: bookworm apt ships FFmpeg 5.1.9 —
+# THREE majors behind), which is also out of E2-P1-POLICY's four allowed pin channels (apt is only channel-3-
+# compliant if the resolved version is recorded in the same commit as the install line — this image never did that).
+#
+# WHY bookworm, NOT trixie (unlike the proven wave-bridge-edge feat/ffmpeg9-canary recipe this build mirrors):
+# that recipe's builder is `debian:trixie-slim` because it also builds AV2/AVM + Vulkan video, and FFmpeg 9.0's
+# Vulkan video path needs Vulkan headers >=1.3.277 + build-time SPIR-V compilation that bookworm's package set
+# doesn't carry. THIS site needs NEITHER: stream-bridge decodes an HLS ladder (H.264/HEVC/AAC — all via ffmpeg's
+# OWN native decoders, no external lib) and re-encodes to VP8 (libvpx) + Opus (libopus) only — no AV1/AV2, no
+# Vulkan. Passing `--disable-vulkan` (the default — 9.0 does not force Vulkan on unless asked) means this build
+# never crosses the trixie forcing function at all: bookworm + nasm + no-vulkan builds 9.0 cleanly, and the
+# runtime stage stays `node:22-bookworm-slim` (as it already was) with NO glibc-drift risk between builder and
+# runtime stages, because both are bookworm. Minimal blast radius, per the task's stated preference.
+FROM debian:bookworm-slim AS ffmpeg-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential nasm pkg-config \
+    git ca-certificates \
+    libvpx-dev libopus-dev \
+    libssl-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Canonical remote per E2-P1-POLICY §1 channel 1 (git.ffmpeg.org, not the github.com/FFmpeg mirror), fixed tag
+# (not a branch) n9.0 — the exact release this epic adopts ("Lei", 2026-08-04).
+ARG FFMPEG_VERSION=n9.0
+RUN git clone --depth=1 --branch=${FFMPEG_VERSION} https://git.ffmpeg.org/ffmpeg.git /build/ffmpeg
+
+# Configure kept to the codec lineup this site's ffmpeg invocation actually uses (server/hls-source.mjs):
+#   --enable-libvpx   — encoder for VP8 output          (hls-source.mjs:73 `-c:v libvpx`)
+#   --enable-libopus  — encoder for Opus output          (hls-source.mjs:81 `-c:a libopus`)
+#   --enable-openssl  — TLS for the https LL-HLS manifest fetch (`-i <llhls manifest>`, hls-source.mjs comment ~L13)
+# H.264/HEVC/AAC DECODE (the HLS ladder's input codecs) need no --enable-lib* flags at all: ffmpeg ships its own
+# native decoders for all three built directly into libavcodec — only the ENCODER wrappers for H.264/HEVC
+# (libx264/libx265, GPL) would need extra flags, and this leg never encodes to either, so they're deliberately
+# left out (smaller image, no GPL license surface). No AV1/AV2/Vulkan/VVC — none of those appear in this leg's
+# argv, so none of those flags are enabled (mirrors the "keep the configure minimal" instruction: every flag
+# here is traceable to a hls-source.mjs invocation, not a "might as well" addition).
+RUN cd /build/ffmpeg \
+    && ./configure \
+        --prefix=/usr/local \
+        --disable-doc \
+        --disable-vulkan \
+        --enable-libvpx \
+        --enable-libopus \
+        --enable-openssl \
+        --extra-cflags="-I/usr/local/include" \
+        --extra-ldflags="-L/usr/local/lib" \
+    && make -j$(nproc) && make install
+
 FROM node:22-bookworm-slim
 
-# ffmpeg from the bookworm repo (has libvpx + libopus encoders the source leg needs). Clean the apt lists to
-# keep the layer small. Installed as root before the USER drop below.
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+# Runtime shared libs matching the builder's --enable-lib* set + TLS/CA — no ffmpeg-dev/build toolchain here.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libvpx7 libopus0 \
+    libssl3 \
     && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ffmpeg-builder /usr/local/lib/ /usr/local/lib/
+COPY --from=ffmpeg-builder /usr/local/bin/ffmpeg /usr/local/bin/ffprobe /usr/local/bin/
+RUN ldconfig
 
 WORKDIR /app
 
