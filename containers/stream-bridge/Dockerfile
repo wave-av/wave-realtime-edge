@@ -43,8 +43,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Canonical remote per E2-P1-POLICY §1 channel 1 (git.ffmpeg.org, not the github.com/FFmpeg mirror), fixed tag
 # (not a branch) n9.0 — the exact release this epic adopts ("Lei", 2026-08-04).
+#
+# Integrity: a tag is a MUTABLE ref (upstream can re-point it), so the clone is verified against the commit SHA
+# the tag resolved to when this pin was adopted (recorded 2026-08-05 via
+# `git ls-remote https://git.ffmpeg.org/ffmpeg.git 'n9.0^{}'`). If the tag ever moves, the build fails hard
+# instead of silently shipping a different tree.
 ARG FFMPEG_VERSION=n9.0
-RUN git clone --depth=1 --branch=${FFMPEG_VERSION} https://git.ffmpeg.org/ffmpeg.git /build/ffmpeg
+ARG FFMPEG_COMMIT=d32b387f2b0a484599d4587d651891f0c63c4238
+RUN git clone --depth=1 --branch=${FFMPEG_VERSION} https://git.ffmpeg.org/ffmpeg.git /build/ffmpeg \
+    && cd /build/ffmpeg \
+    && actual="$(git rev-parse 'HEAD^{commit}')" \
+    && if [ "${actual}" != "${FFMPEG_COMMIT}" ]; then \
+         echo "FATAL: tag ${FFMPEG_VERSION} resolved to ${actual}, expected ${FFMPEG_COMMIT} — upstream tag moved?" >&2; \
+         exit 1; \
+       fi
 
 # Configure kept to the codec lineup this site's ffmpeg invocation actually uses (server/hls-source.mjs):
 #   --enable-libvpx   — encoder for VP8 output          (hls-source.mjs:73 `-c:v libvpx`)
