@@ -14,7 +14,7 @@
 import { shell } from "@wave-av/spoke-chassis";
 import { TOKENS_CSS } from "./tokens.css";
 
-export const LANDING_INNER = `<h1>wave <span class="acc">Realtime</span></h1>
+export const LANDING_INNER = `<h1>WAVE <span class="acc">Realtime</span></h1>
 <p class="sub">Your broadcast talks back — same gateway, same token, no second stack.</p>
 <div></div>
 <pre>  browser
@@ -37,7 +37,7 @@ export const LANDING_INNER = `<h1>wave <span class="acc">Realtime</span></h1>
 export function landingPage(): string {
   return shell({
     product: "Realtime",
-    title: "wave Realtime — your broadcast talks back, live today.",
+    title: "WAVE Realtime — your broadcast talks back, live today.",
     description:
       "WAVE Realtime — real IETF WHIP ingest, WHEP egress, and RealtimeKit rooms, gated on the exact same gateway and token as WAVE broadcast. Live in production.",
     url: "https://rt.wave.online",
