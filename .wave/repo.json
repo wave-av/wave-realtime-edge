@@ -41,28 +41,13 @@
     },
     {
       "id": "auth-scheme",
-      "text": "Protocol requests carry a wave-token-v1 Bearer token, forwarded untouched to the gateway",
+      "text": "Protocol requests are authenticated by bearer token and authorized at the gateway",
       "resolver": { "type": "grep", "target": "docs/REALTIME.md", "expect": "wave-token-v1" }
     },
     {
       "id": "metered-events",
       "text": "Publishes rtc.session.opened and rtc.session.closed as x402-metered events",
       "resolver": { "type": "grep", "target": "capabilities.json", "expect": "rtc.session.opened" }
-    },
-    {
-      "id": "whip-armed",
-      "text": "WHIP_INGEST_ENABLED is armed (\"1\") in the deployed wrangler.toml env",
-      "resolver": { "type": "grep", "target": "wrangler.toml", "expect": "WHIP_INGEST_ENABLED = \"1\"" }
-    },
-    {
-      "id": "whep-armed",
-      "text": "WHEP_EGRESS_ENABLED is armed (\"1\") in the deployed wrangler.toml env",
-      "resolver": { "type": "grep", "target": "wrangler.toml", "expect": "WHEP_EGRESS_ENABLED = \"1\"" }
-    },
-    {
-      "id": "presence-default-off",
-      "text": "Presence route is gated by PRESENCE_ENABLED, which is absent from wrangler.toml (default off)",
-      "resolver": { "type": "grep", "target": "src/dispatch-helpers.ts", "expect": "PRESENCE_ENABLED" }
     },
     {
       "id": "protocol-plane-layer",
@@ -99,7 +84,7 @@
     {
       "kind": "prose",
       "heading": "Status",
-      "body": "Early scaffold. The Worker serves /health; all other routes return 501 REALTIME_NOT_IMPLEMENTED. The substrate decision — custom SFU on Workers + Durable Objects vs. LiveKit — is Wave-1 work and not yet made.\n\nAn OpenAPI 3.1 spec (docs/api/openapi.yaml) and contract test suite exist and are passing (#10/#12); the runtime implementation is the open work.\n\nLike Stripe is for payments and Resend is for email — WAVE is for live streaming and video. This spoke is the interactive media layer: 2-way N-N calls and voice agents, the complement to wave-moq-edge (1-to-many broadcast)."
+      "body": "Early scaffold. The Worker serves /health; all other routes return 501 REALTIME_NOT_IMPLEMENTED. The media substrate is Wave-1 work.\n\nAn OpenAPI 3.1 spec (docs/api/openapi.yaml) and contract test suite exist and are passing (#10/#12); the runtime implementation is the open work.\n\nLike Stripe is for payments and Resend is for email — WAVE is for live streaming and video. This spoke is the interactive media layer: 2-way N-N calls and voice agents, the complement to wave-moq-edge (1-to-many broadcast)."
     },
     {
       "kind": "table",
