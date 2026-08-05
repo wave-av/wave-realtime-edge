@@ -89,9 +89,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=ffmpeg-builder /usr/local/lib/ /usr/local/lib/
+# Only the binaries cross the stage seam: the configure above has no --enable-shared (FFmpeg's default is
+# static-only), so libav* are linked INTO ffmpeg/ffprobe and the builder's /usr/local/lib holds only .a
+# archives + headers + pkgconfig — hundreds of MB of dead weight at runtime. The binaries' shared deps
+# (libvpx/libopus/libssl) come from the apt install above.
 COPY --from=ffmpeg-builder /usr/local/bin/ffmpeg /usr/local/bin/ffprobe /usr/local/bin/
-RUN ldconfig
 
 WORKDIR /app
 
