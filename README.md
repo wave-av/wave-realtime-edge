@@ -31,7 +31,7 @@ npm run deploy        # wrangler deploy
 
 ## Status
 
-Early scaffold. The Worker serves /health; all other routes return 501 REALTIME_NOT_IMPLEMENTED. The substrate decision — custom SFU on Workers + Durable Objects vs. LiveKit — is Wave-1 work and not yet made.
+Early scaffold. The Worker serves /health; all other routes return 501 REALTIME_NOT_IMPLEMENTED. The media substrate is Wave-1 work.
 
 An OpenAPI 3.1 spec (docs/api/openapi.yaml) and contract test suite exist and are passing (#10/#12); the runtime implementation is the open work.
 
@@ -102,10 +102,7 @@ Every claim below is checked by `npm run verify` against the live repo or endpoi
 | Protocol requests carry a wave-token-v1 Bearer token, forwarded untouched to the gateway | resolved by grepping `docs/REALTIME.md` |
 | Worker is routed on the custom domain rt.wave.online | resolved by grepping `wrangler.toml` |
 | Publishes rtc.session.opened and rtc.session.closed as x402-metered events | resolved by grepping `capabilities.json` |
-| Presence route is gated by PRESENCE_ENABLED, which is absent from wrangler.toml (default off) | resolved by grepping `src/dispatch-helpers.ts` |
 | Repo is tagged protocol-plane-layer-1 in capabilities.json | resolved by grepping `capabilities.json` |
-| WHEP_EGRESS_ENABLED is armed ("1") in the deployed wrangler.toml env | resolved by grepping `wrangler.toml` |
-| WHIP_INGEST_ENABLED is armed ("1") in the deployed wrangler.toml env | resolved by grepping `wrangler.toml` |
 
 ## Topics
 
