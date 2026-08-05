@@ -48,8 +48,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # the tag resolved to when this pin was adopted (recorded 2026-08-05 via
 # `git ls-remote https://git.ffmpeg.org/ffmpeg.git 'n9.0^{}'`). If the tag ever moves, the build fails hard
 # instead of silently shipping a different tree.
-ARG FFMPEG_VERSION=n9.0
-ARG FFMPEG_COMMIT=d32b387f2b0a484599d4587d651891f0c63c4238
+#
+# Deliberately ENV (builder-stage-local, discarded with the stage), NOT ARG: an ARG could be silently
+# overridden per-build (`--build-arg FFMPEG_COMMIT=...`), turning the guard into a no-op. Bumping the pin
+# is a reviewed Dockerfile edit, never a build flag.
+ENV FFMPEG_VERSION=n9.0 \
+    FFMPEG_COMMIT=d32b387f2b0a484599d4587d651891f0c63c4238
 RUN git clone --depth=1 --branch=${FFMPEG_VERSION} https://git.ffmpeg.org/ffmpeg.git /build/ffmpeg \
     && cd /build/ffmpeg \
     && actual="$(git rev-parse 'HEAD^{commit}')" \
