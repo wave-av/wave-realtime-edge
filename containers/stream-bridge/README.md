@@ -75,7 +75,9 @@ remaining proof, and the image must be **rebuilt WITH ffmpeg** (below) before it
 The `image` in `wrangler.toml` is a **pre-pushed CF-managed-registry ref**, NOT the local Dockerfile path —
 `wrangler deploy`/`wrangler containers build` cannot pass the BuildKit secret this image needs for the
 org-internal `@wave-av/whip-publish` (GitHub Packages), and this repo is PUBLIC so the private dep must never
-be vendored in-tree. The Dockerfile now `apt-get install`s ffmpeg. Build ONCE locally and push; deploy just
+be vendored in-tree. The Dockerfile builds FFmpeg n9.0 from source (canonical `git.ffmpeg.org` tag,
+commit-SHA-verified, multi-stage `ffmpeg-builder`; see the Dockerfile header for the FFMPEG9-LEI E7-P3
+rationale) — expect the first build to compile FFmpeg (~minutes). Build ONCE locally and push; deploy just
 references the ref (no build, no token in CI):
 
 ```sh
