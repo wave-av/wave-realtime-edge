@@ -49,10 +49,19 @@ check() {
   # Filter with rg, not grep: BSD/macOS grep has no -P, so a `grep -P` allowlist
   # silently errors out locally while working on GNU/CI — the gate would then
   # disagree with itself depending on where it ran. rg is already required above.
-  local matches
-  matches="$(printf '%s' "$raw" \
-    | rg -vN -- 'guard:allow[[:space:]]+[^[:space:]]' \
-    | rg -vNiP -- "$ABOUT_THE_CONTROL" || true)"
+  local matches filtered filter_rc
+  filtered="$(printf '%s' "$raw" \
+    | rg -vN -- 'guard:allow[[:space:]]+[^[:space:]]')"; filter_rc=$?
+  if (( filter_rc >= 2 )); then
+    echo "::error title=public-repo-guard ($name)::ripgrep failed (exit $filter_rc) filtering allowlisted lines for rule '$name' — failing closed."
+    exit 2
+  fi
+  matches="$(printf '%s' "$filtered" \
+    | rg -vNiP -- "$ABOUT_THE_CONTROL")"; filter_rc=$?
+  if (( filter_rc >= 2 )); then
+    echo "::error title=public-repo-guard ($name)::ripgrep failed (exit $filter_rc) filtering allowlisted lines for rule '$name' — failing closed."
+    exit 2
+  fi
   [[ -z "$matches" ]] && return 0
   local count; count="$(printf '%s\n' "$matches" | grep -c '')"
   # Print the LINE NUMBER only — never the matched text. This annotation is itself
