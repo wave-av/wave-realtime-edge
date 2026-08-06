@@ -131,6 +131,13 @@ export class SentenceChunker {
     if (this.buf.length > this.maxChars) {
       const sp = this.buf.lastIndexOf(" ", this.maxChars);
       if (sp > 0) return sp + 1;
+      // No space inside the window — ONE giant token (a long URL/identifier/base64 blob). Prefer the first
+      // space anywhere (the token's own end: a word boundary, just past maxChars), and grace the token up to
+      // 2×maxChars to reach one. Past that, hard-cut at maxChars even mid-token: bounded memory + audio that
+      // actually starts beat word integrity in a stream this pathological.
+      const firstSp = this.buf.indexOf(" ");
+      if (firstSp > 0 && firstSp <= 2 * this.maxChars) return firstSp + 1;
+      if (this.buf.length > 2 * this.maxChars) return this.maxChars;
     }
     return -1;
   }

@@ -98,6 +98,19 @@ describe("SentenceChunker — where we split", () => {
     expect(c.isEmpty).toBe(true);
     expect(c.flush()).toBe("");
   });
+
+  it("bounds ONE giant space-free token (URL/base64) — emits mid-stream instead of buffering forever", () => {
+    // No space anywhere: past 2×maxChars the guard hard-cuts at maxChars — bounded memory, audio still starts.
+    const { out } = perChar("x".repeat(3 * DEFAULT_MAX_SENTENCE_CHARS));
+    expect(out.length).toBeGreaterThan(0); // emitted via push(), NOT held until flush()
+    expect(out[0]!.length).toBe(DEFAULT_MAX_SENTENCE_CHARS);
+  });
+
+  it("prefers the giant token's OWN end (the first space) over a mid-token cut when it arrives in time", () => {
+    const token = "y".repeat(DEFAULT_MAX_SENTENCE_CHARS + 60); // no space inside the maxChars window...
+    const { out } = perChar(`${token} and then normal words follow here.`);
+    expect(out[0]).toBe(token); // ...but the token ends within the 2×maxChars grace → cut at ITS word boundary
+  });
 });
 
 // ═══════════════════════════ (2) the turn loop ═══════════════════════════
@@ -127,6 +140,10 @@ function rig(opts: {
   throwAfter?: number;
   /** HOLD the Nth (1-based) synthesize call open, so the test can barge in while the turn is mid-utterance. */
   gateTtsCall?: number;
+  /** THROW from the Nth (1-based) synthesize call before any audio (mid-stream TTS failure — the speech lane). */
+  ttsThrowOnCall?: number;
+  /** Yield a defensive tool_use event after the Nth (0-based) delta — the provider mis-behaving in eager mode. */
+  injectToolUseAfter?: number;
 }) {
   const trace: string[] = [];
   const logs: { msg: string; fields: Record<string, unknown> }[] = [];
@@ -145,6 +162,10 @@ function rig(opts: {
       }
       trace.push(`llm:delta${i}`);
       yield { type: "text", text: opts.deltas[i]! } as const;
+      if (opts.injectToolUseAfter !== undefined && i === opts.injectToolUseAfter) {
+        trace.push("llm:tool_use");
+        yield { type: "tool_use", id: "tu_ghost", name: "ghost_tool", input: {} } as const;
+      }
     }
     trace.push("llm:end");
   });
@@ -156,6 +177,9 @@ function rig(opts: {
   const synthesize = vi.fn(async function* (text: string) {
     trace.push(`tts:${text}`);
     spoken.push(text);
+    if (opts.ttsThrowOnCall !== undefined && spoken.length === opts.ttsThrowOnCall) {
+      throw new Error("elevenlabs synthesize returned 500"); // the SPEECH lane dying, mid-turn, before any audio
+    }
     if (opts.gateTtsCall !== undefined && spoken.length === opts.gateTtsCall) {
       gateReached();
       await ttsGate; // hold the turn mid-utterance so the test can barge in over the agent
@@ -309,6 +333,34 @@ describe("D1 — failure modes commit exactly what the listener heard", () => {
     expect(r.spoken).toEqual([]);
     expect(r.core.history().map((m) => m.role)).toEqual(["system"]);
     expect(r.logs.some((l) => l.msg === "agent-turn-empty-llm")).toBe(true);
+  });
+
+  it("mid-stream TTS failure is attributed to the SPEECH lane, not the LLM (stage=tts, reason=tts-error)", async () => {
+    // Sentence 1 reaches the wire, then synthesize() dies on sentence 2 — an ElevenLabs/ingest failure, NOT #344.
+    const r = rig({ deltas: REPLY, ttsThrowOnCall: 2 });
+    await drive(r.core);
+    const err = r.logs.find((l) => l.msg === "agent-turn-error")!;
+    expect(err.fields.message).toContain("elevenlabs");
+    expect(err.fields.stage).toBe("tts"); // debugging must chase the TTS/ingest service, not the LLM gateway
+    const partial = r.logs.find((l) => l.msg === "agent-turn-partial-spoken")!;
+    expect(partial.fields.reason).toBe("tts-error");
+    // Sentence 2 published zero bytes before the throw → only sentence 1 was heard → only sentence 1 committed.
+    expect(r.core.history()[2]!.content).toBe("The capital of France is Paris.");
+    expect(r.logs.some((l) => l.msg === "agent-turn-meter")).toBe(false);
+  });
+
+  it("a defensive tool_use in eager mode fails CLOSED: no full commit, no tail speech, spoken prefix kept", async () => {
+    // Eager mode is entered with NO tools advertised; the provider emits a tool_use anyway (after sentence 1
+    // was already spoken). The turn must not commit the model's tool-turn text as a plain reply, and must not
+    // speak the flushed tail — history stays exactly what the listener heard.
+    const r = rig({ deltas: REPLY, injectToolUseAfter: 1 }); // after ". " — sentence 1 is on the wire by then
+    await drive(r.core);
+    expect(r.spoken).toEqual(["The capital of France is Paris."]); // streaming stopped at the tool_use, tail NOT spoken
+    expect(r.logs.some((l) => l.msg === "agent-turn-unexpected-tool-use")).toBe(true);
+    const history = r.core.history();
+    expect(history[2]!.content).toBe("The capital of France is Paris."); // spoken prefix, NOT acc.assistant
+    expect(r.logs.find((l) => l.msg === "agent-turn-partial-spoken")!.fields.reason).toBe("unexpected-tool-use");
+    expect(r.logs.some((l) => l.msg === "agent-turn-meter")).toBe(false); // a mis-gated turn is not a metered turn
   });
 });
 

@@ -352,11 +352,23 @@ export class TurnTakingCore {
             // HONEST FAILURE (#344 semantics): the turn FAILED, but audio already on the wire cannot be unheard.
             // Commit exactly what was spoken so the next turn's history matches what the listener heard, then
             // rethrow so the outer catch marks the turn failed (agent-turn-error) — never a silent success.
-            this.commitSpoken(working, acc.spoken, "llm-error");
+            // `errorStage` tells WHICH lane died: a synthesize/send throw is a TTS failure, not an LLM one, and
+            // must be logged as such or production debugging chases the wrong upstream.
+            if (acc.errorStage === "tts") stage = "tts";
+            this.commitSpoken(working, acc.spoken, acc.errorStage === "tts" ? "tts-error" : "llm-error");
             throw e;
           }
           if (acc.aborted || this.aborted) {
             this.commitSpoken(working, acc.spoken, "barge-in"); // same rule for barge-in: heard ⇒ remembered
+            return;
+          }
+          if (acc.toolUses.length > 0) {
+            // FAIL-CLOSED (D1 scope guard): eager mode is entered ONLY with no tools advertised, so a tool_use
+            // here means the provider mis-behaved. streamSpeakSentences already stopped speaking at the first
+            // tool_use; committing acc.assistant as a plain reply (or speaking the tail) would desync history
+            // from tool semantics AND from what was heard. Acknowledge only the spoken prefix and abandon.
+            this.deps.log("agent-turn-unexpected-tool-use", { ...this.idFields(), toolUses: acc.toolUses.length });
+            this.commitSpoken(working, acc.spoken, "unexpected-tool-use");
             return;
           }
           const assistant = acc.assistant.trim();

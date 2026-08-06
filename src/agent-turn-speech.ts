@@ -144,6 +144,12 @@ export interface StreamSpeakAcc {
   toolUses: ToolUse[];
   /** True when a barge-in cut the turn (either the stream loop or a speak() call saw the abort flag). */
   aborted: boolean;
+  /**
+   * Which lane a thrown error came from: "tts" when speak()/synthesize/send threw, "llm" (the default) when the
+   * event stream itself threw. Set BEFORE the rethrow so the caller can log the honest stage/reason — a TTS or
+   * ingest failure reported as an LLM upstream error would send production debugging to the wrong service.
+   */
+  errorStage?: "llm" | "tts";
 }
 
 /**
@@ -175,7 +181,17 @@ export async function streamSpeakSentences(
     if (acc.toolUses.length > 0) continue; // never speak text that belongs to a tool-calling turn
     for (const sentence of chunker.push(evt.text)) {
       const bytesBefore = session.pcmBytesOut;
-      const n = await session.speak(sentence);
+      let n: number;
+      try {
+        n = await session.speak(sentence);
+      } catch (e) {
+        acc.errorStage = "tts"; // the SPEECH lane died (synthesize/send), not the LLM stream — attribute honestly
+        // Same rule as barge-in: audio that reached the wire before the throw was HEARD → acc stays honest.
+        if (session.pcmBytesOut > bytesBefore) {
+          acc.spoken = acc.spoken.length > 0 ? `${acc.spoken} ${sentence}` : sentence;
+        }
+        throw e;
+      }
       // A barge-in mid-sentence still counts the sentence as HEARD if any of its audio reached the wire — the
       // listener cannot un-hear a half-sentence, so history must contain it. Aborted with zero bytes published
       // (the common case: the abort landed between sentences) is NOT heard and is correctly left out.
