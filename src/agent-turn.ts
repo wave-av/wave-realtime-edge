@@ -652,7 +652,7 @@ export function buildTurnDeps(
   rawEnv: AgentTurnEnv,
   media: AgentMediaDeps,
   fetchImpl: FetchLike = fetch,
-  org = "",
+  org = "", agentId = "", // agentId → x-wave-agent (gateway per-agent usage attribution, #81 envelope)
 ): AgentTurnDeps & AgentMediaDeps {
   // One canonical gateway base/token for ALL paths (LLM, STT, tools, metering) — either convention provisions all.
   const env = normalizeGatewayEnv(rawEnv);
@@ -673,7 +673,7 @@ export function buildTurnDeps(
       if (!env.WAVE_GATEWAY_BASE || !env.WAVE_GATEWAY_TOKEN) {
         throw new AgentSessionError("LLM_NOT_CONFIGURED", "WAVE gateway base/token not provisioned", 503);
       }
-      yield* streamGatewayLlm(fetchImpl, env, org, messages, tools);
+      yield* streamGatewayLlm(fetchImpl, env, org, messages, tools, agentId);
     },
     async callTool(name: string, input: unknown): Promise<string> {
       if (!env.WAVE_GATEWAY_BASE || !env.WAVE_GATEWAY_TOKEN) {

@@ -124,7 +124,7 @@ export interface RoomTurnLoopInputs {
 export function buildRoomTurnLoopDriver(inputs: RoomTurnLoopInputs): TurnLoopDriver | null {
   if (!voiceAgentEnabled(inputs.env)) return null;
   const org = inputs.org ?? inputs.config.org;
-  const deps = buildTurnDeps(inputs.env, inputs.media, inputs.fetchImpl ?? fetch, org);
+  const deps = buildTurnDeps(inputs.env, inputs.media, inputs.fetchImpl ?? fetch, org, inputs.config.agentId);
   const tools = toolAllowlistFromEnv(inputs.env); // step 5: agent-least-privilege allowlist (env-driven)
   const core = new TurnTakingCore(deps, inputs.config, {
     framing: inputs.env.AGENT_INGEST_FRAMING,

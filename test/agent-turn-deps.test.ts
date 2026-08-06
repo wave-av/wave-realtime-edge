@@ -113,7 +113,8 @@ describe("buildTurnDeps — gateway LLM streaming", () => {
       WAVE_GATEWAY_TOKEN: "t",
       VOICE_AGENT_LLM_MODEL: "claude-opus-4-5",
     };
-    await collect(buildTurnDeps(env, media, fetchImpl).complete([{ role: "user", content: "q" }], []));
+    // #81: org is REQUIRED — the gateway 400s org_required without x-wave-org (agent-spokes.ts:275).
+    await collect(buildTurnDeps(env, media, fetchImpl, "org_acme").complete([{ role: "user", content: "q" }], []));
     const body = JSON.parse((fetchImpl.mock.calls[0] as unknown as [string, RequestInit])[1].body as string);
     expect(body.model).toBe("claude-opus-4-5");
   });
@@ -121,7 +122,7 @@ describe("buildTurnDeps — gateway LLM streaming", () => {
   it("throws LLM_UPSTREAM on a non-200", async () => {
     const fetchImpl = vi.fn(async () => new Response("nope", { status: 502 }));
     const env: AgentTurnEnv = { WAVE_GATEWAY_BASE: "https://api.wave.online", WAVE_GATEWAY_TOKEN: "t" };
-    await expect(collect(buildTurnDeps(env, media, fetchImpl).complete([], []))).rejects.toMatchObject({
+    await expect(collect(buildTurnDeps(env, media, fetchImpl, "org_acme").complete([], []))).rejects.toMatchObject({
       code: "LLM_UPSTREAM",
     });
   });
@@ -285,7 +286,7 @@ describe("buildTurnDeps — fetch body cleanup (DO fetch-pool deadlock guard)", 
     const fetchImpl = vi.fn(async () => new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } }));
     const env: AgentTurnEnv = { WAVE_GATEWAY_BASE: "https://api.wave.online", WAVE_GATEWAY_TOKEN: "t" };
     // Take the first event, then break — simulates the turn aborting mid-stream on barge-in.
-    for await (const _evt of buildTurnDeps(env, media, fetchImpl).complete([{ role: "user", content: "q" }], [])) {
+    for await (const _evt of buildTurnDeps(env, media, fetchImpl, "org_acme").complete([{ role: "user", content: "q" }], [])) {
       break;
     }
     expect(cancelled).toBe(true);
@@ -338,7 +339,7 @@ describe("buildTurnDeps — the established edge convention alone provisions LLM
   it("GATEWAY_BASE_URL + WAVE_SERVICE_TOKEN drives the LLM proxy (no LLM_NOT_CONFIGURED)", async () => {
     const fetchImpl = vi.fn(async () => sseResponse(["ok"]));
     const env: AgentTurnEnv = { GATEWAY_BASE_URL: "https://api.wave.online", WAVE_SERVICE_TOKEN: "svc-tok" };
-    const out = await collect(buildTurnDeps(env, media, fetchImpl).complete([{ role: "user", content: "hi" }], []));
+    const out = await collect(buildTurnDeps(env, media, fetchImpl, "org_acme").complete([{ role: "user", content: "hi" }], []));
     expect(out.map((e) => (e.type === "text" ? e.text : "")).join("")).toBe("ok");
     const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe("https://api.wave.online/v1/internal/messages");
