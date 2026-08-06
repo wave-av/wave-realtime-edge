@@ -63,7 +63,9 @@ export async function logTurnMeter(deps: TurnMeterDeps, ids: Record<string, unkn
       toolsUsed: m.toolsUsed,
     });
   } catch (e) {
-    // Fail-open: a metering error must NEVER break the turn (media-safety). Logged, swallowed.
-    deps.log("agent-turn-meter-error", { ...ids, message: (e as Error)?.message ?? "unknown" });
+    // Fail-open: a metering error must NEVER break the turn (media-safety). Logged, swallowed. `turnId` is in
+    // the log because gateway idempotency is keyed per turn — a dropped usage line must be reconcilable/replayable
+    // from this event alone.
+    deps.log("agent-turn-meter-error", { ...ids, turnId: m.turnId, message: (e as Error)?.message ?? "unknown" });
   }
 }
