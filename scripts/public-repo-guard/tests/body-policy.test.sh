@@ -66,20 +66,20 @@ expect 1 'do-not-share marker in Title Case' \
 AKID_FIXTURE="AKI""A1234567890ABCDEF"
 expect 1 'AWS access key id' \
   "The failing job had ${AKID_FIXTURE} configured."
-# Regression: the about-the-control allowlist must not be able to wave through a
-# pasted credential. Discussing the gate is exactly where a real sample lands.
+# Regression: naming the gate on the line must not wave through a pasted
+# credential. Discussing the gate is exactly where a real sample lands.
 expect 1 'credential on a line that also names the gate still blocks' \
   "public-repo-guard flagged ${AKID_FIXTURE} in the last run, which is correct."
 # Regression: the motivating leak shape — a body discussing the gate WHILE
-# repeating the private repo + wiring detail — must not be exempted by the
-# about-the-control allowlist.
+# repeating the private repo + wiring detail — must still block; gate
+# discussion earns no exemption.
 expect 1 'gate discussion that repeats the leak shape still blocks' \
   'public-repo-guard blocked fixture-repo-a for naming SETTLE_SECRET in the diff.'
 expect 1 'internal tailscale IP' \
   'It resolves to 100.71.4.19 from inside the fleet.'
-# Regression: the about-the-control allowlist must not exempt infrastructure
-# identifiers either — naming the gate does not un-publish the address, id, or
-# path sitting on the same line.
+# Regression: naming the gate must not exempt infrastructure identifiers
+# either — it does not un-publish the address, id, or path sitting on the
+# same line.
 expect 1 'internal IP on a line that also names the gate still blocks' \
   'public-repo-guard flagged 100.71.4.19 in the run, which is correct.'
 CFID_FIXTURE="0123456789abcdef""0123456789abcdef"
@@ -106,6 +106,9 @@ expect 0 'credential NAME with no private repo nearby' \
   'The handler now reads SOME_API_TOKEN from the environment instead of a literal.'
 expect 0 'public runner path is not an operator path' \
   'CI checks out to /home/runner/work/repo/repo before the scan runs.'  # enforce-ignore (fixture)
+# Gate discussion stays deployable through rule PRECISION, not a prose-level
+# exemption (there is none): SECRET_TOKEN is a credential NAME, but with no
+# private repo within reach of it, private-repo-ops stays silent.
 expect 0 'talking about the control' \
   'body-policy blocks a private repo named next to a SECRET_TOKEN; that is intended.'
 expect 0 'explicit guard:allow with a reason' \
@@ -122,8 +125,8 @@ expect 0 'marker MENTIONED in smart quotes' \
   'Blocks operator home paths and “internal-only” text.'
 expect 0 'capitalised marker MENTIONED in quotes is still a description' \
   'The gate now also catches "INTERNAL ONLY" and similar capitalised markers.'
-# Regression: internal-marker is now exempt from the about-the-control allowlist,
-# so the QUOTE lookarounds alone must keep gate discussion deployable.
+# Regression: the QUOTE lookarounds alone must keep gate discussion deployable
+# — internal-marker has no other false-positive protection.
 expect 0 'quoted marker on a line that names the gate still passes' \
   'public-repo-guard treats "internal-only" as a self-identifying marker.'
 expect 1 'marker USED unquoted still blocks' \

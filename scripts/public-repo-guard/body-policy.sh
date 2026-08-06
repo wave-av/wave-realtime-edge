@@ -18,30 +18,38 @@
 # Exit: 0 clean · 1 blocking violation · 2 scanner error (fail closed).
 #
 # Allowlisting: a line carrying `guard:allow <reason>` is exempt (an accidental
-# leak never carries the marker; a deliberate one is visible in a public diff), as
-# is any line matching the ABOUT-THE-CONTROL allowlist below.
+# leak never carries the marker; a deliberate one is visible in a public diff).
+# That is the ONLY line-level escape hatch — see the note above check() for why
+# there is deliberately no prose-level "talking about the control" exemption.
 set -uo pipefail
 
 FILE="${1:-}"
 [[ -n "$FILE" && -f "$FILE" ]] || { echo "::error::body-policy: usage: body-policy.sh <file>"; exit 2; }
 command -v rg >/dev/null 2>&1 || { echo "::error::body-policy: ripgrep (rg) required"; exit 2; }
+# Every rule below needs PCRE2 (`rg -P`: lookarounds, inline flag scoping), and
+# not every rg build has it compiled in — distro packages sometimes ship without
+# it (Ubuntu 22.04's does). Without this probe, each rule would fail closed with
+# an opaque per-rule "ripgrep failed (exit 2)"; probe once up front and say
+# plainly what is missing instead.
+printf 'probe' | rg -qP 'probe' 2>/dev/null || {
+  echo "::error::body-policy: this ripgrep build lacks PCRE2 support (rg -P) — install a PCRE2-enabled build (the official release binaries have it)."
+  exit 2
+}
 
 VIOLATIONS=0
 
-# Lines that TALK ABOUT the control rather than leaking through it. Without this,
-# the gate blocks its own pull requests and every security discussion — the
-# self-referential trap that gets a gate switched off. Ported verbatim in intent
-# from the client-side gate's allowlist, which was built for exactly this.
-ABOUT_THE_CONTROL='(public-repo-guard|body-policy|content-policy|public-github-write-gate|\bNDA\s+(gate|guard|policy|denylist|sweep|scan|hook)\b|\bno\s+NDA\b|responsib\w*\s+disclos|SECURITY\.md)'
-
-# check <BLOCK|WARN> <name> <regex> <why> [no-about]
-#   Pass "no-about" to skip the ABOUT_THE_CONTROL allowlist for that rule.
-#   Credential FORMATS are never legitimate in prose, and a security discussion is
-#   exactly where someone pastes the offending sample — so a line that both names
-#   the gate and carries a live key must still block. `guard:allow <reason>` stays
-#   as the deliberate, visible-in-the-diff escape hatch for those rules.
+# check <BLOCK|WARN> <name> <regex> <why>
+#   An earlier revision also carried a line-level ABOUT_THE_CONTROL allowlist so
+#   that discussion OF the gate could not trip the gate. Review after review
+#   concluded that every rule had to opt OUT of it — a pasted key, a fleet IP, an
+#   unquoted internal-only marker all stay leaks on a line that names the gate —
+#   at which point it was dead code lending false comfort, so it is gone. What
+#   keeps the gate deployable instead: the rules match credential/infrastructure
+#   FORMATS rather than prose, internal-marker carries its own use-vs-mention
+#   quote lookarounds, and `guard:allow <reason>` remains the deliberate,
+#   visible-in-the-diff escape hatch.
 check() {
-  local sev="$1" name="$2" re="$3" why="$4" mode="${5:-}"
+  local sev="$1" name="$2" re="$3" why="$4"
   [[ -z "$re" ]] && { echo "::error::body-policy: internal bug — empty regex for rule '$name'"; exit 2; }
   # rg exit: 0=match, 1=no match, >=2=real error → FAIL CLOSED. A gate that passes
   # because its scanner broke is worse than no gate: it reports success.
@@ -63,13 +71,6 @@ check() {
     echo "::error title=public-repo-guard ($name)::ripgrep failed (exit $frc) applying guard:allow filter for rule '$name' — failing closed."
     exit 2
   fi
-  if [[ "$mode" != "no-about" ]]; then
-    matches="$(printf '%s' "$matches" | rg -vNiP -- "$ABOUT_THE_CONTROL")"; frc=$?
-    if (( frc >= 2 )); then
-      echo "::error title=public-repo-guard ($name)::ripgrep failed (exit $frc) applying about-the-control allowlist for rule '$name' — failing closed."
-      exit 2
-    fi
-  fi
   [[ -z "$matches" ]] && return 0
   local count; count="$(printf '%s\n' "$matches" | grep -c '')"
   # Print the LINE NUMBER only — never the matched text. This annotation is itself
@@ -86,30 +87,29 @@ check() {
 }
 
 # --- Credential formats — never legitimate in prose --------------------------
-# `no-about`: these are format matches on real credential material, which stays a
-# leak even on a line that discusses the gate. The ABOUT_THE_CONTROL allowlist
-# exists for rules that can fire on ordinary prose; it must not be able to wave
-# through a pasted live key.
-check BLOCK stripe-live-key  '(sk|rk)_live_[A-Za-z0-9]{16,}'                 'Live Stripe secret/restricted key'                        no-about
-check BLOCK stripe-account   'acct_[A-Za-z0-9]{16,}'                         'Live Stripe account ID — financial infra, never publish'  no-about
-check BLOCK anthropic-key    'sk-ant-(api|admin)[0-9]{2}-[A-Za-z0-9_-]{20,}' 'Real Anthropic API/admin key'                             no-about
-check BLOCK github-pat       'github_pat_[A-Za-z0-9_]{30,}'                  'GitHub fine-grained PAT'                                  no-about
-check BLOCK supabase-pat     'sbp_[a-f0-9]{40}'                              'Supabase personal access token'                           no-about
-check BLOCK aws-akid         'AKIA[0-9A-Z]{16}'                              'AWS access key ID'                                        no-about
-check BLOCK private-key      '-----BEGIN [A-Z ]*PRIVATE KEY-----'            'Embedded private key material'                            no-about
+# Format matches on real credential material: a pasted live key stays a leak
+# even on a line that discusses the gate (a security discussion is exactly where
+# the offending sample gets pasted), so `guard:allow <reason>` is the only way
+# past these.
+check BLOCK stripe-live-key  '(sk|rk)_live_[A-Za-z0-9]{16,}'                 'Live Stripe secret/restricted key'
+check BLOCK stripe-account   'acct_[A-Za-z0-9]{16,}'                         'Live Stripe account ID — financial infra, never publish'
+check BLOCK anthropic-key    'sk-ant-(api|admin)[0-9]{2}-[A-Za-z0-9_-]{20,}' 'Real Anthropic API/admin key'
+check BLOCK github-pat       'github_pat_[A-Za-z0-9_]{30,}'                  'GitHub fine-grained PAT'
+check BLOCK supabase-pat     'sbp_[a-f0-9]{40}'                              'Supabase personal access token'
+check BLOCK aws-akid         'AKIA[0-9A-Z]{16}'                              'AWS access key ID'
+check BLOCK private-key      '-----BEGIN [A-Z ]*PRIVATE KEY-----'            'Embedded private key material'
 
 # --- Infrastructure identifiers ----------------------------------------------
-# `no-about` for the same reason as the credential formats above: these are
-# format matches on real infrastructure material (a 32-hex account id, a CGNAT
-# fleet address, an operator's home path), not patterns that fire on ordinary
-# prose. "public-repo-guard flagged 100.71.4.19" republishes the address just as
-# surely as a line that names no gate; the line-level allowlist must not be able
-# to wave it through. `guard:allow <reason>` stays as the visible escape hatch.
+# Same footing as the credential formats above: format matches on real
+# infrastructure material (a 32-hex account id, a CGNAT fleet address, an
+# operator's home path), not patterns that fire on ordinary prose.
+# "public-repo-guard flagged 100.71.4.19" republishes the address just as surely
+# as a line that names no gate. `guard:allow <reason>` is the escape hatch.
 # shellcheck disable=SC2016  # $CLOUDFLARE_ACCOUNT_ID is literal guidance text
-check BLOCK cf-account-id    'account_id\s*[:=]\s*["'"'"']?[0-9a-f]{32}'      'Hardcoded Cloudflare account_id — reference the env var instead'                                        no-about
-check BLOCK internal-ip      '100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}'  'Internal Tailscale-CGNAT IP (100.64.0.0/10) — internal fleet address'          no-about
+check BLOCK cf-account-id    'account_id\s*[:=]\s*["'"'"']?[0-9a-f]{32}'      'Hardcoded Cloudflare account_id — reference the env var instead'
+check BLOCK internal-ip      '100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}'  'Internal Tailscale-CGNAT IP (100.64.0.0/10) — internal fleet address'
 # shellcheck disable=SC2016  # $HOME is literal guidance text
-check BLOCK abs-user-path    '/(Users|home)/(?!runner/)[a-z][a-z0-9._-]+/'    'Operator absolute home path — leaks identity and local layout'                                          no-about
+check BLOCK abs-user-path    '/(Users|home)/(?!runner/)[a-z][a-z0-9._-]+/'    'Operator absolute home path — leaks identity and local layout'
 
 # --- Self-identified internal material ---------------------------------------
 # USE vs MENTION. A body that SAYS "internal-only" is leaking; a body that QUOTES
@@ -129,13 +129,12 @@ check BLOCK abs-user-path    '/(Users|home)/(?!runner/)[a-z][a-z0-9._-]+/'    'O
 # not ("INTERNAL ONLY", "Do Not Share"). Case must not decide whether the gate
 # sees them; the quote lookarounds carry the use-vs-mention distinction either way.
 #
-# `no-about`: the use-vs-mention lookarounds above ARE this rule's false-positive
+# The use-vs-mention lookarounds above ARE this rule's false-positive
 # protection — a discussion of the gate quotes the marker (as the bot-summary
 # incident showed), and a quoted marker passes regardless of what else the line
-# says. So the line-level allowlist adds nothing here except a hole: an unquoted
-# "the internal-only plan is attached" next to "SECURITY.md" is a leak, not a
-# mention, and must still block.
-check BLOCK internal-marker  '(?i)(?<![“"'"'"'`])\b(internal[- ]only|do\s+not\s+(share|publish|distribute)|for\s+internal\s+use)\b(?![”"'"'"'`])' 'Text self-identifies as not-for-public'  no-about
+# says. An unquoted "the internal-only plan is attached" next to a mention of
+# SECURITY.md is a leak, not a mention, and still blocks.
+check BLOCK internal-marker  '(?i)(?<![“"'"'"'`])\b(internal[- ]only|do\s+not\s+(share|publish|distribute)|for\s+internal\s+use)\b(?![”"'"'"'`])' 'Text self-identifies as not-for-public'
 
 # --- Private repo + operational detail (PROXIMITY, not bare name) ------------
 # The BODY profile deliberately DIVERGES from the FILE profile here, and the
@@ -170,14 +169,13 @@ if [[ -n "${GUARD_PRIVATE_REPOS:-}" ]]; then
   if [[ -n "$_ALT" ]]; then
     # Both orders: name-then-detail and detail-then-name.
     #
-    # `no-about`: the motivating leak is precisely a body that DISCUSSES the gate
-    # while repeating the private repo + wiring detail ("the guard blocked <repo>
-    # for naming X_SECRET"). A line-level gate-name exemption would wave that
-    # exact shape through; `guard:allow <reason>` stays as the visible escape hatch.
+    # The motivating leak is precisely a body that DISCUSSES the gate while
+    # repeating the private repo + wiring detail ("the guard blocked <repo> for
+    # naming X_SECRET"), so gate discussion earns no exemption here either;
+    # `guard:allow <reason>` stays as the visible escape hatch.
     check BLOCK private-repo-ops \
       "(?i)\\b(?:${_ALT})\\b[^\\n]{0,140}?\\b${OPS_DETAIL}|${OPS_DETAIL}[^\\n]{0,140}?\\b(?:${_ALT})\\b" \
-      'A private WAVE repo named alongside internal operational detail (credential name, secret binding, or secret count) — the wiring topology is not public' \
-      no-about
+      'A private WAVE repo named alongside internal operational detail (credential name, secret binding, or secret count) — the wiring topology is not public'
   fi
 fi
 
