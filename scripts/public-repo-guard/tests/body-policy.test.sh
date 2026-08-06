@@ -77,6 +77,18 @@ expect 1 'gate discussion that repeats the leak shape still blocks' \
   'public-repo-guard blocked fixture-repo-a for naming SETTLE_SECRET in the diff.'
 expect 1 'internal tailscale IP' \
   'It resolves to 100.71.4.19 from inside the fleet.'
+# Regression: the about-the-control allowlist must not exempt infrastructure
+# identifiers either — naming the gate does not un-publish the address, id, or
+# path sitting on the same line.
+expect 1 'internal IP on a line that also names the gate still blocks' \
+  'public-repo-guard flagged 100.71.4.19 in the run, which is correct.'
+CFID_FIXTURE="0123456789abcdef""0123456789abcdef"
+expect 1 'account id on a line that also names the gate still blocks' \
+  "content-policy blocked account_id = ${CFID_FIXTURE} last week."
+expect 1 'operator path on a line that also names the gate still blocks' \
+  'body-policy flagged /Users/someoperator/notes/ as a path.'  # enforce-ignore (fixture)
+expect 1 'unquoted marker next to a security doc mention still blocks' \
+  'The SECURITY.md note says the internal-only plan is attached.'
 
 # --- must PASS (precision — these keep the gate deployable) -------------------
 expect 0 'bare private-repo cross-reference' \
@@ -110,6 +122,10 @@ expect 0 'marker MENTIONED in smart quotes' \
   'Blocks operator home paths and “internal-only” text.'
 expect 0 'capitalised marker MENTIONED in quotes is still a description' \
   'The gate now also catches "INTERNAL ONLY" and similar capitalised markers.'
+# Regression: internal-marker is now exempt from the about-the-control allowlist,
+# so the QUOTE lookarounds alone must keep gate discussion deployable.
+expect 0 'quoted marker on a line that names the gate still passes' \
+  'public-repo-guard treats "internal-only" as a self-identifying marker.'
 expect 1 'marker USED unquoted still blocks' \
   'Attaching the internal-only rollout plan; do not share outside the team.'
 

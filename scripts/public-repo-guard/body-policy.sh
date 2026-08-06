@@ -99,11 +99,17 @@ check BLOCK aws-akid         'AKIA[0-9A-Z]{16}'                              'AW
 check BLOCK private-key      '-----BEGIN [A-Z ]*PRIVATE KEY-----'            'Embedded private key material'                            no-about
 
 # --- Infrastructure identifiers ----------------------------------------------
+# `no-about` for the same reason as the credential formats above: these are
+# format matches on real infrastructure material (a 32-hex account id, a CGNAT
+# fleet address, an operator's home path), not patterns that fire on ordinary
+# prose. "public-repo-guard flagged 100.71.4.19" republishes the address just as
+# surely as a line that names no gate; the line-level allowlist must not be able
+# to wave it through. `guard:allow <reason>` stays as the visible escape hatch.
 # shellcheck disable=SC2016  # $CLOUDFLARE_ACCOUNT_ID is literal guidance text
-check BLOCK cf-account-id    'account_id\s*[:=]\s*["'"'"']?[0-9a-f]{32}'      'Hardcoded Cloudflare account_id — reference the env var instead'
-check BLOCK internal-ip      '100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}'  'Internal Tailscale-CGNAT IP (100.64.0.0/10) — internal fleet address'
+check BLOCK cf-account-id    'account_id\s*[:=]\s*["'"'"']?[0-9a-f]{32}'      'Hardcoded Cloudflare account_id — reference the env var instead'                                        no-about
+check BLOCK internal-ip      '100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}'  'Internal Tailscale-CGNAT IP (100.64.0.0/10) — internal fleet address'          no-about
 # shellcheck disable=SC2016  # $HOME is literal guidance text
-check BLOCK abs-user-path    '/(Users|home)/(?!runner/)[a-z][a-z0-9._-]+/'    'Operator absolute home path — leaks identity and local layout'
+check BLOCK abs-user-path    '/(Users|home)/(?!runner/)[a-z][a-z0-9._-]+/'    'Operator absolute home path — leaks identity and local layout'                                          no-about
 
 # --- Self-identified internal material ---------------------------------------
 # USE vs MENTION. A body that SAYS "internal-only" is leaking; a body that QUOTES
@@ -122,7 +128,14 @@ check BLOCK abs-user-path    '/(Users|home)/(?!runner/)[a-z][a-z0-9._-]+/'    'O
 # (?i): pasted internal material writes these markers in capitals more often than
 # not ("INTERNAL ONLY", "Do Not Share"). Case must not decide whether the gate
 # sees them; the quote lookarounds carry the use-vs-mention distinction either way.
-check BLOCK internal-marker  '(?i)(?<![“"'"'"'`])\b(internal[- ]only|do\s+not\s+(share|publish|distribute)|for\s+internal\s+use)\b(?![”"'"'"'`])' 'Text self-identifies as not-for-public'
+#
+# `no-about`: the use-vs-mention lookarounds above ARE this rule's false-positive
+# protection — a discussion of the gate quotes the marker (as the bot-summary
+# incident showed), and a quoted marker passes regardless of what else the line
+# says. So the line-level allowlist adds nothing here except a hole: an unquoted
+# "the internal-only plan is attached" next to "SECURITY.md" is a leak, not a
+# mention, and must still block.
+check BLOCK internal-marker  '(?i)(?<![“"'"'"'`])\b(internal[- ]only|do\s+not\s+(share|publish|distribute)|for\s+internal\s+use)\b(?![”"'"'"'`])' 'Text self-identifies as not-for-public'  no-about
 
 # --- Private repo + operational detail (PROXIMITY, not bare name) ------------
 # The BODY profile deliberately DIVERGES from the FILE profile here, and the
