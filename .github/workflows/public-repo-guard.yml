@@ -53,10 +53,19 @@ jobs:
   guard:
     name: Secrets + content policy
     # Skips issue/comment events (the tree scan has nothing to say about a comment,
-    # and the org should not pay for a gitleaks run every time anyone posts one) and
-    # skips `edited` (a title or body edit does not change the tree).
+    # and the org should not pay for a gitleaks run every time anyone posts one).
+    # Those events attach their check runs to the DEFAULT-BRANCH commit, so the
+    # skip is invisible to PR branch protection.
+    #
+    # `edited` deliberately RUNS the tree scan even though a title/body edit cannot
+    # change the tree. A job skipped by `if:` still emits a check run named
+    # "Secrets + content policy" with conclusion `skipped` against the same head
+    # SHA; branch protection treats a skipped required check as satisfied, and the
+    # newest check run wins — so skipping on `edited` would let a body edit
+    # replace a red tree scan with a green rubber stamp. Re-running returns the
+    # same verdict; the redundant run is the price of the check staying honest.
     if: >-
-      (github.event_name == 'pull_request' && github.event.action != 'edited')
+      github.event_name == 'pull_request'
       || github.event_name == 'push'
       || github.event_name == 'workflow_dispatch'
     concurrency:

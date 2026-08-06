@@ -118,7 +118,11 @@ check BLOCK abs-user-path    '/(Users|home)/(?!runner/)[a-z][a-z0-9._-]+/'    'O
 # A quoted marker is also a trivial bypass, and that is an accepted trade. The
 # threat here is the ACCIDENTAL paste; a deliberate evader has easier routes, and
 # `guard:allow <reason>` already exists as the honest, visible one.
-check BLOCK internal-marker  '(?<![“"'"'"'`])\b(internal[- ]only|do\s+not\s+(share|publish|distribute)|for\s+internal\s+use)\b(?![”"'"'"'`])' 'Text self-identifies as not-for-public'
+#
+# (?i): pasted internal material writes these markers in capitals more often than
+# not ("INTERNAL ONLY", "Do Not Share"). Case must not decide whether the gate
+# sees them; the quote lookarounds carry the use-vs-mention distinction either way.
+check BLOCK internal-marker  '(?i)(?<![“"'"'"'`])\b(internal[- ]only|do\s+not\s+(share|publish|distribute)|for\s+internal\s+use)\b(?![”"'"'"'`])' 'Text self-identifies as not-for-public'
 
 # --- Private repo + operational detail (PROXIMITY, not bare name) ------------
 # The BODY profile deliberately DIVERGES from the FILE profile here, and the
@@ -152,9 +156,15 @@ if [[ -n "${GUARD_PRIVATE_REPOS:-}" ]]; then
   done
   if [[ -n "$_ALT" ]]; then
     # Both orders: name-then-detail and detail-then-name.
+    #
+    # `no-about`: the motivating leak is precisely a body that DISCUSSES the gate
+    # while repeating the private repo + wiring detail ("the guard blocked <repo>
+    # for naming X_SECRET"). A line-level gate-name exemption would wave that
+    # exact shape through; `guard:allow <reason>` stays as the visible escape hatch.
     check BLOCK private-repo-ops \
       "(?i)\\b(?:${_ALT})\\b[^\\n]{0,140}?\\b${OPS_DETAIL}|${OPS_DETAIL}[^\\n]{0,140}?\\b(?:${_ALT})\\b" \
-      'A private WAVE repo named alongside internal operational detail (credential name, secret binding, or secret count) — the wiring topology is not public'
+      'A private WAVE repo named alongside internal operational detail (credential name, secret binding, or secret count) — the wiring topology is not public' \
+      no-about
   fi
 fi
 
