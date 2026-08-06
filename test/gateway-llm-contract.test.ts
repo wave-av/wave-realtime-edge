@@ -1,9 +1,9 @@
 // Task #81 — CONTRACT TEST for the voice agent's LLM call against the WAVE gateway's governed Claude proxy,
 // POST /v1/internal/messages. This is the pin the TODO in agent-turn-providers.ts asked for: every assertion
-// below cites the wave-gateway file:line it is derived from, so a gateway-side change to the envelope breaks a
+// below cites the gateway-side file:line it is derived from, so a gateway change to the envelope breaks a
 // test HERE rather than silently breaking a live voice turn.
 //
-// GATEWAY SIDE OF RECORD (read-only): wave-gateway @90fcf01
+// GATEWAY SIDE OF RECORD (read-only): the WAVE gateway service @90fcf01
 //   src/agent-spokes.ts  L94-L112  tryAgentSpokeRoutes  (POST-only; /v1/internal/messages(/) → handleInternalMessages)
 //   src/agent-spokes.ts  L267-L434 handleInternalMessages
 //   src/agent-budget.ts  L35, L98  AGENT_HEADER = "x-wave-agent"; resolveAgentId (slice 0,128)

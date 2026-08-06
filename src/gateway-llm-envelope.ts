@@ -9,7 +9,7 @@
  * file:line below) and locked by test/gateway-llm-contract.test.ts, so a gateway-side change breaks a test here
  * instead of silently breaking a live voice turn (the #81 TODO this file resolves).
  *
- * GATEWAY SIDE OF RECORD: wave-gateway @90fcf01 `src/agent-spokes.ts` — `tryAgentSpokeRoutes` (L94-L112) +
+ * GATEWAY SIDE OF RECORD: the WAVE gateway service @90fcf01, `src/agent-spokes.ts` — `tryAgentSpokeRoutes` (L94-L112) +
  * `handleInternalMessages` (L267-L434). READ-ONLY dependency: nothing here may assume gateway behaviour that
  * isn't in that handler.
  *
@@ -29,7 +29,7 @@ import type { FetchLike } from "./agent-turn-providers.js";
  *  Reversible: set env VOICE_AGENT_LLM_MODEL to pin any model without a redeploy. */
 export const DEFAULT_VOICE_LLM_MODEL = "claude-sonnet-5";
 /**
- * Max request body the gateway's LLM proxy accepts. PINNED to wave-gateway src/agent-spokes.ts:290
+ * Max request body the gateway's LLM proxy accepts. PINNED to the gateway's src/agent-spokes.ts:290
  * (`if (raw.length > 256 * 1024) return json({ ok:false, reason:"body_too_large" }, 413)`). Enforced edge-side
  * so an over-cap turn fails with an ACTIONABLE local error instead of an opaque gateway 413.
  */
@@ -46,7 +46,7 @@ export interface GatewayLlmRequest {
 }
 
 /**
- * Build the `/v1/internal/messages` request — PINNED against wave-gateway @90fcf01 src/agent-spokes.ts
+ * Build the `/v1/internal/messages` request — PINNED against the gateway @90fcf01, src/agent-spokes.ts
  * `handleInternalMessages`. Every requirement of that handler, in its own check order:
  *   • POST only ....................... L100 `if (req.method !== "POST") return null` (else the route never matches)
  *   • Authorization: Bearer <token> ... L273 serviceAuthed (timing-safe vs WAVE_SERVICE_TOKEN) → 401 service_auth_required
