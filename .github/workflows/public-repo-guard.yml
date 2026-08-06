@@ -44,10 +44,13 @@ on:
 permissions:
   contents: read
 
-# Concurrency is per JOB, not per workflow: the two jobs want opposite behaviour.
-# A workflow-level group would force one policy on both, and it showed: rapid body
-# edits cancelled the tree job over and over, and every cancelled check-run stays
-# attached to the commit, so the PR reported UNSTABLE while the live runs were green.
+# Concurrency is per JOB, not per workflow: the two jobs want opposite behaviour,
+# and a workflow-level group would force one policy on both. The tree job CANCELS
+# superseded runs: every run against the same head SHA returns the same verdict,
+# branch protection reads only the newest check run of a given name, and rapid
+# pushes or body edits would otherwise queue redundant multi-minute scans. The
+# body job must NEVER cancel: each edit is different content, so every version
+# needs its own verdict (see body-guard below).
 
 jobs:
   guard:
@@ -128,9 +131,11 @@ jobs:
       # issue events all report the default branch and a ref-keyed group would let
       # two comments cancel each other, leaving one unscanned.
       #
-      # cancel-in-progress is deliberately FALSE. Every version of a body deserves a
-      # verdict, the job is seconds long, and a cancelled check-run lingers on the
-      # commit and makes an otherwise-green PR look broken.
+      # cancel-in-progress is deliberately FALSE. Unlike the tree job, where every
+      # run on the same head SHA is interchangeable, each body edit is DIFFERENT
+      # content: cancelling an in-flight run here would leave a body version
+      # unscanned. The job is seconds long, so there is nothing to save by
+      # cancelling.
       group: public-repo-guard-body-${{ github.event.pull_request.number || github.event.comment.id || github.event.issue.number || github.ref }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
