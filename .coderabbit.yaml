@@ -120,7 +120,10 @@ reviews:
       enabled: true
       packages:
         - "ast-grep-essentials"
-    github_checks:
+    # Same failure mode as `osvScanner` above: the schema key is `github-checks`, hyphenated.
+    # This read `github_checks` (snake_case), so the block — including the 15-minute
+    # timeout_ms — was silently dropped. Verified against the same live v2 schema fetch.
+    github-checks:
       enabled: true
       timeout_ms: 900000
 
