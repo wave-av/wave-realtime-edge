@@ -94,7 +94,17 @@ export class SpeechSession {
         // would deepen sentence by sentence, re-introducing the ~700 ms post-abort tail #34 removed.
         if (this.playoutStartMs === 0) this.playoutStartMs = this.deps.now();
         if (this.opts.ttsLeadMs > 0) {
-          const aheadMs = this.sentMs - (this.deps.now() - this.playoutStartMs);
+          let aheadMs = this.sentMs - (this.deps.now() - this.playoutStartMs);
+          // UNDERRUN RE-ANCHOR (D1): between sentences the loop stalls on the LLM while wall time keeps running,
+          // so `aheadMs` goes negative by the stall length. Left alone, the gate would stay open until `sentMs`
+          // climbed back past elapsed+lead — publishing a `stallMs + ttsLeadMs` BURST whose depth is exactly the
+          // post-abort tail #34 removed (a barge-in during the burst keeps talking for its whole length). A
+          // negative `aheadMs` means the remote playout underran (drained to empty), so treat it as a playout
+          // RESTART: re-anchor the window to `now - sentMs` and measure the lead from the RESUMED playout.
+          if (aheadMs < 0) {
+            this.playoutStartMs = this.deps.now() - this.sentMs;
+            aheadMs = 0;
+          }
           if (aheadMs > this.opts.ttsLeadMs) {
             await delay(aheadMs - this.opts.ttsLeadMs); // let the buffer drain back down to the lead
             if (this.opts.isAborted()) return -1; // barge-in DURING the pacing wait → stop before the next chunk

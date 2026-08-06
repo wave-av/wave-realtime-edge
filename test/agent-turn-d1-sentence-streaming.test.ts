@@ -22,6 +22,7 @@ import {
   type CompletionEvent,
 } from "../src/agent-turn.js";
 import type { AgentMediaDeps, IngestSocket } from "../src/agent-session.js";
+import { SpeechSession, TTS_BYTES_PER_MS } from "../src/agent-turn-speech.js";
 import { encodeIngestFrame } from "../src/agent-ingest-adapter.js";
 import { decodePacket } from "../src/encoders/container-adapter.js";
 
@@ -308,5 +309,58 @@ describe("D1 — failure modes commit exactly what the listener heard", () => {
     expect(r.spoken).toEqual([]);
     expect(r.core.history().map((m) => m.role)).toEqual(["system"]);
     expect(r.logs.some((l) => l.msg === "agent-turn-empty-llm")).toBe(true);
+  });
+});
+
+describe("D1 — pacing across inter-sentence stalls (the #34 lead bound survives per-sentence speak())", () => {
+  it("re-anchors the pacing window after a stall so the next sentence is throttled to the lead, not burst", async () => {
+    const TTS_LEAD_MS = 50;
+    const CHUNK_MS = 50;
+    const chunk = () => new Uint8Array(CHUNK_MS * TTS_BYTES_PER_MS); // 50 ms of PCM, well under MAX_PCM_MESSAGE_BYTES
+    let t = 0;
+    const delays: number[] = [];
+    const sends: { t: number; sentMsAfter: number }[] = [];
+    let sentMs = 0;
+    const sock: IngestSocket = {
+      send: (d) => {
+        sentMs += (d as Uint8Array).length > 0 ? CHUNK_MS : 0;
+        sends.push({ t, sentMsAfter: sentMs });
+      },
+      close: () => {},
+    };
+    const session = new SpeechSession(
+      {
+        synthesize: async function* () {
+          for (let i = 0; i < 4; i++) yield chunk(); // 4 × 50 ms = a 200 ms sentence
+        },
+        ingestSocket: () => sock,
+        now: () => t,
+        delay: async (ms) => {
+          delays.push(ms);
+          t += ms; // a fake sleep ADVANCES the fake clock — real pacing semantics, zero wall time
+        },
+        log: () => {},
+      },
+      { ttsLeadMs: TTS_LEAD_MS, framing: "raw", isAborted: () => false, nextSeq: () => 1, idFields: () => ({}) },
+    );
+
+    await session.speak("Sentence one lands immediately after STT.");
+    // The inter-sentence stall: the LLM takes 500 ms to produce sentence two while playout drains to empty.
+    t += 500;
+    const resumeT = t;
+    const sendsBefore = sends.length;
+    delays.length = 0;
+    await session.speak("Sentence two must still be paced to the lead.");
+
+    // The gate engaged during sentence 2 — without the underrun re-anchor the 500 ms deficit keeps it open and
+    // all four chunks burst out at the same instant (delays stays empty).
+    expect(delays.length).toBeGreaterThan(0);
+    // Every frame of sentence 2 obeys the lead bound measured from the RESUMED playout: published-audio-ahead
+    // never exceeds lead + one chunk, which is exactly the shallow-buffer guarantee #34 established per turn.
+    const s2Sends = sends.slice(sendsBefore);
+    const s2StartMs = s2Sends[0]!.sentMsAfter - CHUNK_MS;
+    for (const s of s2Sends) {
+      expect(s.sentMsAfter - s2StartMs - (s.t - resumeT)).toBeLessThanOrEqual(TTS_LEAD_MS + CHUNK_MS);
+    }
   });
 });
