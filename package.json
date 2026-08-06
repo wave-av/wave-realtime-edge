@@ -6,7 +6,7 @@
   "scripts": {
     "deploy": "wrangler deploy",
     "deploy:dry": "wrangler deploy --dry-run --outdir /tmp/rt-dry",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "egress:kill": "node scripts/kill-egress.mjs on",
