@@ -176,6 +176,19 @@ else
   FAIL=$((FAIL+1)); printf '  FAIL unset GUARD_PRIVATE_REPOS — want exit 0 + ::warning, got exit %s\n%s\n' "$rc" "$out"
 fi
 
+# --- newline-separated GUARD_PRIVATE_REPOS must not truncate -------------------
+# GitHub Actions variables accept multi-line values, so one-name-per-line is a
+# legitimate way to configure the list. Regression: a plain `read -a` consumes a
+# single LINE, silently dropping every name after the first — a body naming a
+# dropped repo alongside wiring detail scanned clean and reported "body policy OK".
+printf '%s\n' 'SETTLE_SECRET is bound on fixture-repo-e now.' > "$TMP/body.txt"
+out="$(GUARD_PRIVATE_REPOS=$'fixture-repo-d\nfixture-repo-e\nfixture-repo-f' bash "$SCRIPT" "$TMP/body.txt" 2>&1)"; rc=$?
+if [[ "$rc" == 1 ]]; then
+  PASS=$((PASS+1)); printf '  ok   newline-separated GUARD_PRIVATE_REPOS scans names after the first line\n'
+else
+  FAIL=$((FAIL+1)); printf '  FAIL newline-separated GUARD_PRIVATE_REPOS — want exit 1, got %s\n%s\n' "$rc" "$out"
+fi
+
 echo "  ---"
 if (( FAIL > 0 )); then
   echo "  $PASS passed, $FAIL FAILED"; exit 1

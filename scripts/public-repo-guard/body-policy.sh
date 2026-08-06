@@ -171,7 +171,13 @@ if [[ -n "${GUARD_PRIVATE_REPOS:-}" ]]; then
   # reference that mentions one into a false block. Only SCREAMING_CASE is a name.
   OPS_DETAIL='(?:(?-i:[A-Z][A-Z0-9]*_(?:SECRET|TOKEN|KEY|PASSWORD))|wrangler\s+secret|secret\s+(?:is\s+)?(?:bound|binding|list)|(?:is\s+)?bound\s+on|service\s+binding|\d{2,}\s+secrets)'
   _ALT=''
-  IFS=', ' read -r -a _PRIV <<< "$GUARD_PRIVATE_REPOS"
+  # NUL-delimited read, with \n in IFS: GitHub Actions variables accept
+  # multi-line values, and a plain `read -a` consumes a single LINE — a list
+  # configured one-name-per-line would silently drop every name after the
+  # first, and with _ALT then non-empty, the loud parsed-to-no-names warning
+  # below would never fire. The one input this script cannot validate must not
+  # also be the one it silently truncates.
+  IFS=$', \t\n' read -r -d '' -a _PRIV < <(printf '%s\0' "$GUARD_PRIVATE_REPOS")
   for _name in "${_PRIV[@]}"; do
     [[ -z "$_name" ]] && continue
     # Regex-escape so metacharacters in a name match literally.
