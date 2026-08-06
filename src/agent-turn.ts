@@ -40,7 +40,10 @@ import {
   type AgentSessionEnv,
 } from "./agent-session.js";
 import { decodePacket } from "./encoders/container-adapter.js";
-import { chunkPcm, encodeIngestFrame, type IngestFraming } from "./agent-ingest-adapter.js";
+import { type IngestFraming } from "./agent-ingest-adapter.js";
+import { SpeechSession, streamSpeakSentences, type StreamSpeakAcc } from "./agent-turn-speech.js";
+import { SentenceChunker } from "./sentence-chunker.js";
+import { logTurnMeter } from "./agent-turn-meter.js";
 import { Vad, vadConfigFromEnv, type VadConfig, type VadEnv } from "./agent-vad.js";
 import {
   ToolAllowlist,
@@ -157,12 +160,6 @@ export const DEFAULT_MAX_TOOL_ITERATIONS = 5;
  */
 export const DEFAULT_TTS_LEAD_MS = 150;
 
-/** pcm_48000 STEREO interleaved (the synthesize() output): 48 kHz · 2 ch · 2 bytes = 192 bytes per millisecond. */
-const TTS_BYTES_PER_MS = (48_000 * 2 * 2) / 1000;
-/** Bytes per RTP 48 kHz timestamp tick: one stereo sample frame = 2 ch · 2 bytes = 4 bytes. The ingest Packet
- *  timestamp is the per-channel 48 kHz sample index, so ticks = byteOffset / 4 (#34 barge-in tail fix). */
-const TTS_BYTES_PER_TS_TICK = 2 * 2;
-
 /** Resolve the TTS pacing lead from env (AGENT_TTS_LEAD_MS), clamped to ≥0; falls back to the default. Pure. */
 export function ttsLeadMsFromEnv(env: { AGENT_TTS_LEAD_MS?: string | number }): number {
   const raw = typeof env.AGENT_TTS_LEAD_MS === "string" ? Number(env.AGENT_TTS_LEAD_MS) : env.AGENT_TTS_LEAD_MS;
@@ -217,6 +214,8 @@ export class TurnTakingCore {
   private readonly maxToolIterations: number;
   /** Step-4 barge-in: TTS send-ahead lead (ms). `speak()` paces to this so playout is interruptible (see speak). */
   private readonly ttsLeadMs: number;
+  /** D1: this turn already spliced its history commit (full OR spoken-prefix). Guarantees at-most-once. */
+  private committed = false;
 
   constructor(
     deps: AgentTurnDeps & AgentMediaDeps,
@@ -309,6 +308,7 @@ export class TurnTakingCore {
   private async runTurn(userText: string): Promise<void> {
     this.turnInFlight = true;
     this.aborted = false;
+    this.committed = false;
     this.framesThisTurn = 0;
     const turnId = `t${this.turnSeq++}`;
     // The user's final utterance was just consumed. MARK the VAD as speaking (NOT reset-to-silence): the audio that
@@ -328,12 +328,53 @@ export class TurnTakingCore {
       const toolDefs = this.tools.definitions();
       let toolsUsed = 0;
 
+      // D1: speak sentences AS THEY ARRIVE (see speakStreaming) instead of after the stream completes — but ONLY
+      // when no tool is advertised, because a tool_use block can arrive AFTER text in the same stream and
+      // `assistantToolUseMessage` carries tool_use blocks only. Speaking a preamble we then cannot commit would
+      // desync history from what the listener actually heard, which is worse than the latency. TODO(#81 D1
+      // follow-up): teach assistantToolUseMessage to carry the leading text block, then drop this condition.
+      const eager = toolDefs.length === 0;
+
       // ── the bounded agentic loop ──────────────────────────────────────────────────────────────────────────
       for (let iter = 0; ; iter++) {
         stage = "llm";
         // Stream this iteration: collect text (only the FINAL no-tool iteration's text is spoken) + tool_use blocks.
         let assistant = "";
         const toolUses: ToolUse[] = [];
+        if (eager) {
+          // ── D1 sentence-streaming path (the ONLY iteration — no tools are advertised, so there is no loop) ──
+          const speech = this.openSpeech();
+          const acc: StreamSpeakAcc = { assistant: "", spoken: "", toolUses: [], aborted: false };
+          const chunker = new SentenceChunker();
+          try {
+            await streamSpeakSentences(this.deps.complete([...working], toolDefs), speech, chunker, acc, () => this.aborted);
+          } catch (e) {
+            // HONEST FAILURE (#344 semantics): the turn FAILED, but audio already on the wire cannot be unheard.
+            // Commit exactly what was spoken so the next turn's history matches what the listener heard, then
+            // rethrow so the outer catch marks the turn failed (agent-turn-error) — never a silent success.
+            this.commitSpoken(working, acc.spoken, "llm-error");
+            throw e;
+          }
+          if (acc.aborted || this.aborted) {
+            this.commitSpoken(working, acc.spoken, "barge-in"); // same rule for barge-in: heard ⇒ remembered
+            return;
+          }
+          const assistant = acc.assistant.trim();
+          if (assistant.length === 0) {
+            this.deps.log("agent-turn-empty-llm", this.idFields());
+            return; // nothing to say + nothing to commit → clean abandon (no dangling user)
+          }
+          working.push({ role: "assistant", content: assistant });
+          // Commit the WHOLE turn atomically at STREAM END (one splice) — exactly as the non-eager path does, and
+          // still BEFORE the final speak() below.
+          this.messages.push(...working.slice(this.messages.length));
+          this.committed = true;
+          stage = "tts";
+          const tail = chunker.flush(); // the trailing partial sentence the boundary policy held back
+          if (tail.length > 0 && (await speech.speak(tail)) < 0) return; // aborted mid-tail: history already valid
+          await this.logMeter(userText, assistant, toolsUsed, speech.pcmBytesOut, startMs, turnId, speech.firstAudioMs);
+          return;
+        }
         for await (const evt of this.deps.complete([...working], toolDefs)) {
           if (this.aborted) break; // step-4 barge-in: cancel the in-flight stream
           if (evt.type === "text") assistant += evt.text;
@@ -351,10 +392,12 @@ export class TurnTakingCore {
           working.push({ role: "assistant", content: assistant });
           // Commit the WHOLE turn atomically (user + every assistant/tool message produced this turn).
           this.messages.push(...working.slice(this.messages.length));
+          this.committed = true;
           stage = "tts";
-          const pcmBytesOut = await this.speak(assistant);
+          const speech = this.openSpeech();
+          const pcmBytesOut = await speech.speak(assistant);
           if (pcmBytesOut < 0) return; // aborted mid-TTS (already committed history is valid + alternating)
-          await this.logMeter(userText, assistant, toolsUsed, pcmBytesOut, startMs, turnId);
+          await this.logMeter(userText, assistant, toolsUsed, pcmBytesOut, startMs, turnId, speech.firstAudioMs);
           return;
         }
 
@@ -418,55 +461,18 @@ export class TurnTakingCore {
   }
 
   /**
-   * Speak the final assistant text via ElevenLabs streaming TTS → ingest socket (the EXACT echoFrame send path).
-   * Returns the PCM bytes published, or -1 if a barge-in aborted mid-stream (the agent went silent). Honors abort.
+   * Open the per-turn SPEECH session (TTS → paced ingest publish). One session per turn; `speak()` on it may be
+   * called once per sentence (D1) and the media clock + pacing window continue across those calls. The publish
+   * loop itself lives in agent-turn-speech.ts (file-size-two-tier-gate: policy here, wire mechanics there).
    */
-  private async speak(text: string): Promise<number> {
-    let pcmBytesOut = 0;
-    const sock = this.deps.ingestSocket();
-    // Observability (#29): the agent has a reply to speak but the SFU never dialed our /ingest endpoint (no live
-    // sink) → every frame below is dropped and the agent track stays silent (0 RTP). Surfaced so a live run sees
-    // THIS rather than only an absent meter. (The fix is the ingest adapter `mode:"buffer"`; this proves the seam.)
-    if (!sock) this.deps.log("agent-speak-no-ingest", { ...this.idFields(), chars: text.length });
-    // Step-4 barge-in keystone — REAL-TIME PACING. We throttle the send to the real playout clock so the SFU
-    // buffer never gets more than `ttsLeadMs` ahead. Without this the whole reply is dumped to the buffer and the
-    // turn completes (turnInFlight=false) BEFORE the listener even hears it → a barge during playout is a no-op
-    // (proven: 0 agent-turn-interrupt; the meter preceded the first agent RTP). With a shallow buffer, turnInFlight
-    // spans the playout (bargeIn fires mid-reply) and on abort only ≤lead drains → the agent falls silent fast.
-    // We sleep ONLY when AHEAD of the clock (never when behind → no underrun risk). lead=0 → legacy bulk send.
-    const delay = this.deps.delay ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-    let playoutStartMs = 0;
-    let sentMs = 0;
-    // #34 barge-in tail: monotonic 48 kHz RTP timestamp (per-channel sample index). The ingest protocol is a
-    // proto3 Packet{seq,ts,payload} — it has NO flush/control field, so the SFU playout buffer cannot be flushed
-    // out-of-band on abort. The keystone is therefore to make the SFU pace by the MEDIA CLOCK: with a real,
-    // monotonic timestamp the SFU buffer-mode pull emits in lockstep with the timeline and never runs ahead, so
-    // when bargeIn() stops the send the SFU has ~one frame buffered (not an undefined backlog). Sending ts=0 on
-    // every frame (the prior placeholder) left the pacing to the SFU's own cadence — the deep buffer that drained
-    // as the ~700 ms post-abort tail. ts is the START-of-chunk sample index (first frame ts=0, then byteOffset/4).
-    let tsTicks = 0;
-    for await (const pcm of this.deps.synthesize(text)) {
-      if (this.aborted) return -1; // barge-in: stop publishing the now-stale reply mid-stream
-      if (!sock || pcm.length === 0) continue;
-      for (const chunk of chunkPcm(pcm)) {
-        if (this.aborted) return -1; // barge-in between chunks → go silent immediately (don't send more)
-        if (playoutStartMs === 0) playoutStartMs = this.deps.now();
-        if (this.ttsLeadMs > 0) {
-          const aheadMs = sentMs - (this.deps.now() - playoutStartMs);
-          if (aheadMs > this.ttsLeadMs) {
-            await delay(aheadMs - this.ttsLeadMs); // let the buffer drain back down to the lead
-            if (this.aborted) return -1; // barge-in DURING the pacing wait → stop before sending the next chunk
-          }
-        }
-        const seq = this.outSeq++;
-        const wire = encodeIngestFrame(chunk, { sequenceNumber: seq, timestamp: tsTicks }, this.framing);
-        sock.send(wire);
-        pcmBytesOut += chunk.length;
-        sentMs += chunk.length / TTS_BYTES_PER_MS;
-        tsTicks += Math.floor(chunk.length / TTS_BYTES_PER_TS_TICK); // advance the media clock by this chunk's samples
-      }
-    }
-    return pcmBytesOut;
+  private openSpeech(): SpeechSession {
+    return new SpeechSession(this.deps, {
+      ttsLeadMs: this.ttsLeadMs,
+      framing: this.framing,
+      isAborted: () => this.aborted,
+      nextSeq: () => this.outSeq++,
+      idFields: () => this.idFields(),
+    });
   }
 
   /**
@@ -482,32 +488,36 @@ export class TurnTakingCore {
     pcmBytesOut: number,
     startMs: number,
     turnId: string,
+    firstAudioMs: number,
   ): Promise<void> {
-    const turnWallMs = this.deps.now() - startMs;
-    this.deps.log("agent-turn-meter", {
-      ...this.idFields(),
+    await logTurnMeter(this.deps, this.idFields(), {
+      org: this.config.org,
+      room: this.config.roomId,
+      agentId: this.config.agentId,
       turnId,
-      userChars: userText.length,
-      assistantChars: assistant.length,
+      userText,
+      assistant,
       toolsUsed,
       pcmBytesOut,
-      turnWallMs,
+      startMs,
+      firstAudioMs,
     });
-    try {
-      await this.deps.emitMeter({
-        org: this.config.org,
-        room: this.config.roomId,
-        agentId: this.config.agentId,
-        turnId,
-        turnWallMs,
-        llmChars: assistant.length,
-        ttsChars: assistant.length,
-        toolsUsed,
-      });
-    } catch (e) {
-      // Fail-open: a metering error must NEVER break the turn (media-safety). Logged, swallowed.
-      this.deps.log("agent-turn-meter-error", { ...this.idFields(), message: (e as Error)?.message ?? "unknown" });
-    }
+  }
+
+  /**
+   * HONEST PARTIAL COMMIT (D1). When a turn dies mid-utterance — a barge-in, or a fail-closed mid-stream LLM
+   * error (#344) — audio already published cannot be unheard. Committing exactly the SPOKEN prefix keeps history
+   * equal to what the listener actually heard, so the next turn doesn't repeat or contradict itself; committing
+   * the model's UNSPOKEN remainder would be a lie in the other direction. One splice, at most once per turn, and
+   * only when something was really spoken (otherwise the turn leaves NO dangling user message, exactly as today).
+   */
+  private commitSpoken(working: LlmMessage[], spoken: string, reason: string): void {
+    const text = spoken.trim();
+    if (this.committed || text.length === 0) return;
+    this.committed = true;
+    working.push({ role: "assistant", content: text });
+    this.messages.push(...working.slice(this.messages.length));
+    this.deps.log("agent-turn-partial-spoken", { ...this.idFields(), reason, spokenChars: text.length });
   }
 
   /**

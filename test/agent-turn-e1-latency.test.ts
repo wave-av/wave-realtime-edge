@@ -239,6 +239,58 @@ describe("E1 — turn-loop orchestration overhead (zero-latency providers, real 
     expect(marks.firstSendMs - marks.endOfSpeechMs).toBeLessThan(100);
   });
 
+  // ── D1 fix, measured on this rig ──────────────────────────────────────────────────────────────────────────
+  // The E1 arithmetic showed TTFA == STT + LLM-stream-COMPLETE: runTurn buffered every delta before speaking, so
+  // a fast first token bought nothing. With sentence-boundary streaming, TTFA is STT + the FIRST SENTENCE.
+  // This test uses a PACED LLM fake (a real per-delta delay, like a real token stream) so the difference is a
+  // measured wall-clock number, not an assertion about code shape.
+  it("D1: first audio goes out DURING the LLM stream — measured TTFA win vs stream-complete", async () => {
+    const DELTA_MS = 40; // per-delta think time; 12 deltas ⇒ a ~480 ms stream
+    const REPLY_DELTAS = [
+      "The capital", " of France", " is Paris", ". ", // ← sentence 1 completes here, at delta 4 of 12
+      "It has", " about two", " million", " people", " living", " there", ". ",
+      "Anything else?",
+    ];
+    // The rig FREEZES its marks at first-send (that is what makes TTFA honest), and with D1 the first send now
+    // happens mid-stream — so stream-completion is timed here, in the fake itself.
+    let llmEndWall = 0;
+    const fakes: AgentTurnDeps = {
+      transcribe: async () => ({ isFinal: true, transcript: "what is the capital of france" }),
+      async *complete() {
+        for (const text of REPLY_DELTAS) {
+          await new Promise((r) => setTimeout(r, DELTA_MS));
+          yield { type: "text", text } as CompletionEvent;
+        }
+        llmEndWall = Date.now();
+      },
+      callTool: async () => "",
+      async *synthesize() {
+        yield new Uint8Array(FRAME_BYTES);
+      },
+      emitMeter: async () => {},
+    };
+    const { deps, marks } = rig(fakes);
+    const core = new TurnTakingCore(deps, CFG, { ttsLeadMs: 0 });
+    await driveTurn(core, [tone(), tone(), tone(), tone(), tone()]);
+
+    const ttfa = marks.firstSendMs - marks.endOfSpeechMs;
+    const legacyTtfa = llmEndWall - marks.endOfSpeechMs; // what TTFA WAS: the whole stream had to land first
+    // eslint-disable-next-line no-console
+    console.log(
+      `\n── D1 sentence-streaming, measured on the paced-LLM rig ──\n` +
+        `  TTFA now (first sentence)          ${ttfa} ms\n` +
+        `  TTFA before (stream complete)      ${legacyTtfa} ms\n` +
+        `  win                                ${legacyTtfa - ttfa} ms\n`,
+    );
+
+    // THE structural assertion: audio was on the wire BEFORE the LLM stream finished. Pre-D1 this was impossible.
+    expect(marks.firstSendMs).toBeGreaterThan(0);
+    expect(marks.firstSendMs).toBeLessThan(llmEndWall);
+    // And the win is real: sentence 1 completes at delta 4 of 12, so TTFA should beat stream-complete by
+    // ~8 deltas. Asserted with slack (CI timer jitter) but tight enough to FAIL if buffering is reintroduced.
+    expect(legacyTtfa - ttfa).toBeGreaterThan(4 * DELTA_MS);
+  });
+
   it("the per-utterance STT call fires EXACTLY once (no per-frame STT poll regression)", async () => {
     let sttCalls = 0;
     const fakes: AgentTurnDeps = {
