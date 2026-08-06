@@ -34,9 +34,14 @@ VIOLATIONS=0
 # from the client-side gate's allowlist, which was built for exactly this.
 ABOUT_THE_CONTROL='(public-repo-guard|body-policy|content-policy|public-github-write-gate|\bNDA\s+(gate|guard|policy|denylist|sweep|scan|hook)\b|\bno\s+NDA\b|responsib\w*\s+disclos|SECURITY\.md)'
 
-# check <BLOCK|WARN> <name> <regex> <why>
+# check <BLOCK|WARN> <name> <regex> <why> [no-about]
+#   Pass "no-about" to skip the ABOUT_THE_CONTROL allowlist for that rule.
+#   Credential FORMATS are never legitimate in prose, and a security discussion is
+#   exactly where someone pastes the offending sample — so a line that both names
+#   the gate and carries a live key must still block. `guard:allow <reason>` stays
+#   as the deliberate, visible-in-the-diff escape hatch for those rules.
 check() {
-  local sev="$1" name="$2" re="$3" why="$4"
+  local sev="$1" name="$2" re="$3" why="$4" mode="${5:-}"
   [[ -z "$re" ]] && { echo "::error::body-policy: internal bug — empty regex for rule '$name'"; exit 2; }
   # rg exit: 0=match, 1=no match, >=2=real error → FAIL CLOSED. A gate that passes
   # because its scanner broke is worse than no gate: it reports success.
@@ -58,10 +63,12 @@ check() {
     echo "::error title=public-repo-guard ($name)::ripgrep failed (exit $frc) applying guard:allow filter for rule '$name' — failing closed."
     exit 2
   fi
-  matches="$(printf '%s' "$matches" | rg -vNiP -- "$ABOUT_THE_CONTROL")"; frc=$?
-  if (( frc >= 2 )); then
-    echo "::error title=public-repo-guard ($name)::ripgrep failed (exit $frc) applying about-the-control allowlist for rule '$name' — failing closed."
-    exit 2
+  if [[ "$mode" != "no-about" ]]; then
+    matches="$(printf '%s' "$matches" | rg -vNiP -- "$ABOUT_THE_CONTROL")"; frc=$?
+    if (( frc >= 2 )); then
+      echo "::error title=public-repo-guard ($name)::ripgrep failed (exit $frc) applying about-the-control allowlist for rule '$name' — failing closed."
+      exit 2
+    fi
   fi
   [[ -z "$matches" ]] && return 0
   local count; count="$(printf '%s\n' "$matches" | grep -c '')"
@@ -79,13 +86,17 @@ check() {
 }
 
 # --- Credential formats — never legitimate in prose --------------------------
-check BLOCK stripe-live-key  '(sk|rk)_live_[A-Za-z0-9]{16,}'                 'Live Stripe secret/restricted key'
-check BLOCK stripe-account   'acct_[A-Za-z0-9]{16,}'                         'Live Stripe account ID — financial infra, never publish'
-check BLOCK anthropic-key    'sk-ant-(api|admin)[0-9]{2}-[A-Za-z0-9_-]{20,}' 'Real Anthropic API/admin key'
-check BLOCK github-pat       'github_pat_[A-Za-z0-9_]{30,}'                  'GitHub fine-grained PAT'
-check BLOCK supabase-pat     'sbp_[a-f0-9]{40}'                              'Supabase personal access token'
-check BLOCK aws-akid         'AKIA[0-9A-Z]{16}'                              'AWS access key ID'
-check BLOCK private-key      '-----BEGIN [A-Z ]*PRIVATE KEY-----'            'Embedded private key material'
+# `no-about`: these are format matches on real credential material, which stays a
+# leak even on a line that discusses the gate. The ABOUT_THE_CONTROL allowlist
+# exists for rules that can fire on ordinary prose; it must not be able to wave
+# through a pasted live key.
+check BLOCK stripe-live-key  '(sk|rk)_live_[A-Za-z0-9]{16,}'                 'Live Stripe secret/restricted key'                        no-about
+check BLOCK stripe-account   'acct_[A-Za-z0-9]{16,}'                         'Live Stripe account ID — financial infra, never publish'  no-about
+check BLOCK anthropic-key    'sk-ant-(api|admin)[0-9]{2}-[A-Za-z0-9_-]{20,}' 'Real Anthropic API/admin key'                             no-about
+check BLOCK github-pat       'github_pat_[A-Za-z0-9_]{30,}'                  'GitHub fine-grained PAT'                                  no-about
+check BLOCK supabase-pat     'sbp_[a-f0-9]{40}'                              'Supabase personal access token'                           no-about
+check BLOCK aws-akid         'AKIA[0-9A-Z]{16}'                              'AWS access key ID'                                        no-about
+check BLOCK private-key      '-----BEGIN [A-Z ]*PRIVATE KEY-----'            'Embedded private key material'                            no-about
 
 # --- Infrastructure identifiers ----------------------------------------------
 # shellcheck disable=SC2016  # $CLOUDFLARE_ACCOUNT_ID is literal guidance text
@@ -125,7 +136,12 @@ check BLOCK internal-marker  '(?<![“"'"'"'`])\b(internal[- ]only|do\s+not\s+(s
 # Names are NOT hardcoded (this file is public); CI injects them via the
 # GUARD_PRIVATE_REPOS variable. Unset locally → this check is skipped.
 if [[ -n "${GUARD_PRIVATE_REPOS:-}" ]]; then
-  OPS_DETAIL='(?:[A-Z][A-Z0-9]*_(?:SECRET|TOKEN|KEY|PASSWORD)|wrangler\s+secret|secret\s+(?:is\s+)?(?:bound|binding|list)|(?:is\s+)?bound\s+on|service\s+binding|\d{2,}\s+secrets)'
+  # The credential-name alternative is wrapped in (?-i:…) because the composed
+  # pattern below is (?i) for the repo names and free-text phrases. Without the
+  # scope fence the case-insensitivity leaks in and everyday prose like "api_key"
+  # or "auth_token" counts as a credential NAME — turning every bare cross-repo
+  # reference that mentions one into a false block. Only SCREAMING_CASE is a name.
+  OPS_DETAIL='(?:(?-i:[A-Z][A-Z0-9]*_(?:SECRET|TOKEN|KEY|PASSWORD))|wrangler\s+secret|secret\s+(?:is\s+)?(?:bound|binding|list)|(?:is\s+)?bound\s+on|service\s+binding|\d{2,}\s+secrets)'
   _ALT=''
   IFS=', ' read -r -a _PRIV <<< "$GUARD_PRIVATE_REPOS"
   for _name in "${_PRIV[@]}"; do
