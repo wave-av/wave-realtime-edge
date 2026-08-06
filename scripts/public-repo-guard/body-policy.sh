@@ -49,12 +49,21 @@ VIOLATIONS=0
 #   quote lookarounds, and `guard:allow <reason>` remains the deliberate,
 #   visible-in-the-diff escape hatch.
 check() {
-  local sev="$1" name="$2" re="$3" why="$4"
+  local sev="$1" name="$2" re="$3" why="$4" scope="${5:-line}"
   [[ -z "$re" ]] && { echo "::error::body-policy: internal bug — empty regex for rule '$name'"; exit 2; }
+  # rg is line-oriented by default, which is right for the format rules (a key is
+  # a key wherever the line breaks). PROXIMITY rules opt into multiline (-U): a
+  # window that cannot cross "\n" misses the commonest body shapes — a repo name
+  # in the TITLE with the wiring detail on the first body line (the materialize
+  # step joins them with a newline), or adjacent markdown bullets. For a match
+  # that spans lines, the guard:allow filter below is per-LINE, so each flagged
+  # line needs its own marker — stricter, and fail-closed in the right direction.
+  local -a rgargs=(-nP --no-filename)
+  [[ "$scope" == "multiline" ]] && rgargs+=(-U)
   # rg exit: 0=match, 1=no match, >=2=real error → FAIL CLOSED. A gate that passes
   # because its scanner broke is worse than no gate: it reports success.
   local raw rc
-  raw="$(rg -nP --no-filename -- "$re" "$FILE" 2>/dev/null)"; rc=$?
+  raw="$(rg "${rgargs[@]}" -- "$re" "$FILE" 2>/dev/null)"; rc=$?
   if (( rc >= 2 )); then
     echo "::error title=public-repo-guard ($name)::ripgrep failed (exit $rc) scanning rule '$name' — failing closed."
     exit 2
@@ -150,7 +159,10 @@ check BLOCK internal-marker  '(?i)(?<![“"'"'"'`])\b(internal[- ]only|do\s+not\
 # of what is wired to what, and it is the shape that actually leaked.
 #
 # Names are NOT hardcoded (this file is public); CI injects them via the
-# GUARD_PRIVATE_REPOS variable. Unset locally → this check is skipped.
+# GUARD_PRIVATE_REPOS variable. Unset → this check is skipped, but LOUDLY (a
+# ::warning annotation, see below): everywhere else this script fails closed on
+# an unscanned input, and a silent skip here would be the one fail-open path —
+# "body policy OK" over a body the highest-signal rule never examined.
 if [[ -n "${GUARD_PRIVATE_REPOS:-}" ]]; then
   # The credential-name alternative is wrapped in (?-i:…) because the composed
   # pattern below is (?i) for the repo names and free-text phrases. Without the
@@ -169,14 +181,27 @@ if [[ -n "${GUARD_PRIVATE_REPOS:-}" ]]; then
   if [[ -n "$_ALT" ]]; then
     # Both orders: name-then-detail and detail-then-name.
     #
+    # The window is (?s:.{0,140}?) and the rule runs in MULTILINE scope: the ~140
+    # characters of proximity may cross line breaks. A line-scoped window missed
+    # exactly the motivating shape — the materialize step joins TITLE and body
+    # with a newline, so a repo name in the title plus a credential name on the
+    # first body line sat one "\n" apart and scanned clean, as did the everyday
+    # markdown shape of adjacent bullets. Same-line hits still match (a
+    # dot-matches-all window is a superset of the line-bound one).
+    #
     # The motivating leak is precisely a body that DISCUSSES the gate while
     # repeating the private repo + wiring detail ("the guard blocked <repo> for
     # naming X_SECRET"), so gate discussion earns no exemption here either;
     # `guard:allow <reason>` stays as the visible escape hatch.
     check BLOCK private-repo-ops \
-      "(?i)\\b(?:${_ALT})\\b[^\\n]{0,140}?\\b${OPS_DETAIL}|${OPS_DETAIL}[^\\n]{0,140}?\\b(?:${_ALT})\\b" \
-      'A private WAVE repo named alongside internal operational detail (credential name, secret binding, or secret count) — the wiring topology is not public'
+      "(?i)\\b(?:${_ALT})\\b(?s:.{0,140}?)\\b${OPS_DETAIL}|${OPS_DETAIL}(?s:.{0,140}?)\\b(?:${_ALT})\\b" \
+      'A private WAVE repo named alongside internal operational detail (credential name, secret binding, or secret count) — the wiring topology is not public' \
+      multiline
+  else
+    echo "::warning title=public-repo-guard (private-repo-ops)::GUARD_PRIVATE_REPOS is set but parsed to no names — the private-repo proximity rule was NOT applied to this body."
   fi
+else
+  echo "::warning title=public-repo-guard (private-repo-ops)::GUARD_PRIVATE_REPOS is not set — the private-repo proximity rule was NOT applied to this body. Configure the repository/organization variable so bodies are scanned for private-repo wiring leaks."
 fi
 
 if (( VIOLATIONS > 0 )); then

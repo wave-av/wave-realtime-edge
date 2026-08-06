@@ -33,7 +33,8 @@ expect() {
     FAIL=$((FAIL+1)); printf '  FAIL %s — want exit %s, got %s\n%s\n' "$name" "$want" "$rc" "$out"
   fi
   # The annotation is world-readable; a hit must never echo the matched text.
-  if [[ "$rc" == 1 ]] && printf '%s' "$out" | grep -qF "$body"; then
+  # (`--` so a body that begins with "-", e.g. a markdown bullet, is a pattern.)
+  if [[ "$rc" == 1 ]] && printf '%s' "$out" | grep -qF -- "$body"; then
     FAIL=$((FAIL+1)); printf '  FAIL %s — LEAKED the matched text into the annotation\n' "$name"
   fi
 }
@@ -49,6 +50,14 @@ expect 1 'private repo + secret count' \
   'fixture-repo-a went from 74 secrets to 75 after this change.'
 expect 1 'private repo + service binding' \
   'This adds a service binding from the worker to fixture-repo-c for settlement.'
+# Regression: the proximity window must CROSS line breaks. The materialize step
+# joins title and body with a newline, so a repo name in the TITLE plus the
+# wiring detail on the first body line is the single commonest leak shape — a
+# line-scoped window scanned it clean.
+expect 1 'private repo in the title + credential name on the next line' \
+  $'fixture-repo-a: wire the settlement flip\nThis adds SETTLE_SECRET to the deploy.'
+expect 1 'adjacent markdown bullets: repo name, then binding detail' \
+  $'- touches fixture-repo-b\n- adds a service binding for settlement'
 expect 1 'operator home path' \
   'Repro: run it from /Users/someoperator/Documents/notes and it fails.'  # enforce-ignore (fixture)
 expect 1 'internal-only marker' \
@@ -104,6 +113,13 @@ expect 0 'lowercase auth_token near a private repo is prose' \
   'See fixture-repo-a; the client now reads the auth_token from a cookie.'
 expect 0 'credential NAME with no private repo nearby' \
   'The handler now reads SOME_API_TOKEN from the environment instead of a literal.'
+# The cross-line window is still a WINDOW: a bare cross-reference in one
+# paragraph and an unrelated credential name well beyond ~140 characters later
+# must stay silent, or every multi-paragraph body with both becomes a false
+# block and the gate gets switched off.
+expect 0 'repo name and credential name far apart across lines stay silent' \
+  "$(printf 'Companion to fixture-repo-a#12; merge that first.\n%s\nSeparately, the handler reads SOME_API_TOKEN from the environment.' \
+     'The rest of this paragraph is ordinary review prose that just keeps going for long enough to put well over one hundred and forty characters between the two mentions above and below it.')"
 expect 0 'public runner path is not an operator path' \
   'CI checks out to /home/runner/work/repo/repo before the scan runs.'  # enforce-ignore (fixture)
 # Gate discussion stays deployable through rule PRECISION, not a prose-level
@@ -146,6 +162,19 @@ for case in "no argument at all::" "nonexistent path::$TMP/does-not-exist.txt"; 
     FAIL=$((FAIL+1)); printf '  FAIL %s — want exit 2, got %s\n' "$name" "$rc"
   fi
 done
+
+# --- unset GUARD_PRIVATE_REPOS is a LOUD skip, never a silent pass ------------
+# The proximity rule cannot run without the injected names, and that is
+# tolerated (local runs, repos without the variable) — but it must announce
+# itself with a ::warning annotation. A silent skip would be the one fail-open
+# path in a script that otherwise fails closed on every unscanned input.
+printf '%s\n' 'WAVE_VIEWPORT_LEASE_SECRET is bound on fixture-repo-a now.' > "$TMP/body.txt"
+out="$(env -u GUARD_PRIVATE_REPOS bash "$SCRIPT" "$TMP/body.txt" 2>&1)"; rc=$?
+if [[ "$rc" == 0 && "$out" == *'::warning'* && "$out" == *'GUARD_PRIVATE_REPOS is not set'* ]]; then
+  PASS=$((PASS+1)); printf '  ok   unset GUARD_PRIVATE_REPOS → exit 0 with a ::warning (loud skip)\n'
+else
+  FAIL=$((FAIL+1)); printf '  FAIL unset GUARD_PRIVATE_REPOS — want exit 0 + ::warning, got exit %s\n%s\n' "$rc" "$out"
+fi
 
 echo "  ---"
 if (( FAIL > 0 )); then
