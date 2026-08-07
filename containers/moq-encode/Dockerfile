@@ -9,7 +9,7 @@
 # --enable-libsrt build, which packages don't cover). Mirrors containers/moq/Dockerfile (pure-Node control
 # plane + vendored strand) and containers/srt/egress/Dockerfile (apt-installed media tool, non-root runtime,
 # EXPOSE 8080, ENTRYPOINT node server.mjs) for idioms.
-FROM node:24-bookworm-slim
+FROM node:26-bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*

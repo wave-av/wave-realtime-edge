@@ -84,7 +84,7 @@ RUN cd /build/ffmpeg \
         --extra-ldflags="-L/usr/local/lib" \
     && make -j$(nproc) && make install
 
-FROM node:22-bookworm-slim
+FROM node:26-bookworm-slim
 
 # Runtime shared libs matching the builder's --enable-lib* set + TLS/CA — no ffmpeg-dev/build toolchain here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
