@@ -6,13 +6,14 @@ info:
     Edge WebRTC SFU for browser-first, bidirectional interactive media — rooms,
     voice agents, and calls. Layer 1 (Edge) of the WAVE Protocol Plane.
 
-    **Status: scaffold / alpha.** The Worker currently implements `/health` only.
-    All protocol routes (`/whip`, `/whep`, and WebSocket connect) return
-    `501 REALTIME_NOT_IMPLEMENTED` pending the substrate decision
-    (custom SFU on Durable Objects vs. LiveKit).  Endpoints for those routes are
-    documented below based on `capabilities.json` intent; each carries an
-    `x-lifecycle: planned` extension and a `501` response to reflect the current
-    state.
+    **Status: live.** The substrate decision is made and shipped: Cloudflare Realtime
+    (Calls) SFU + per-room Durable Object (`RoomDO`). Interactive rooms
+    (`/v1/realtime/rooms/{room}/{intent}`), WHIP ingest (`/v1/whip/publish`), WHEP egress
+    (`/v1/whep/subscribe`), the CF Stream bridge, voice agents, and the managed PULL
+    recording webhook (`/rtk/recording-webhook`, `RT_RECORD=1` + `RT_ENCODER=managed`) are
+    armed live; surfaces gated off in `wrangler.toml` (e.g. the presence WebSocket) carry
+    `x-lifecycle: inert` below. The 501 catch-all is the honest fall-through for any
+    un-gated route.
 
     ### Authentication
     Requests carry a `wave-token-v1` Bearer token.  Auth and entitlement
@@ -40,10 +41,24 @@ servers:
 tags:
   - name: observability
     description: Health and liveness checks
+  - name: realtimekit
+    description: RealtimeKit meeting join + TURN/ICE credential mint
+  - name: rooms
+    description: Interactive room signaling (RoomDO control plane)
   - name: ingest
     description: WebRTC WHIP — publish a media track
   - name: egress
     description: WebRTC WHEP — subscribe to a media track
+  - name: bridge
+    description: CF Stream → SFU bridge
+  - name: agents
+    description: Voice-agent dispatch
+  - name: ingress
+    description: Routed ingest router
+  - name: presence
+    description: Room presence WebSocket (inert — `PRESENCE_ENABLED` off)
+  - name: recording
+    description: Managed PULL recording (RealtimeKit webhook)
 
 paths:
   /health:
@@ -52,7 +67,6 @@ paths:
       summary: Health check
       description: |
         Returns liveness state for the worker.  No auth required.
-        This is the **only endpoint currently implemented** (all others return 501).
       tags: [observability]
       security: []
       responses:
@@ -75,21 +89,226 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  /whip/{streamKey}:
+  /rtk/recording-webhook:
+    post:
+      operationId: rtkRecordingWebhook
+      summary: Recording status webhook (managed PULL puller)
+      description: |
+        RealtimeKit `recording.statusUpdate` webhook.  Public by design — RTK calls
+        it directly, so it is intentionally NOT behind the gateway seal; it
+        self-authenticates via the `rtk-signature` header (RSA-SHA256 over the raw
+        body, verified against CF's published key).  **Live** when `RT_RECORD=1` +
+        `RT_ENCODER=managed`: an UPLOADED event pulls the finished recording into
+        WAVE's R2 at an org-rooted key.
+      tags: [recording]
+      x-lifecycle: alpha
+      security: []
+      parameters:
+        - name: rtk-signature
+          in: header
+          required: true
+          description: RSA-SHA256 signature over the raw request body
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: RealtimeKit `recording.statusUpdate` event payload
+      responses:
+        "200":
+          description: Event verified and acknowledged
+        "401":
+          description: Missing or invalid `rtk-signature`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /rtk/join:
+    post:
+      operationId: rtkJoin
+      summary: RealtimeKit meeting join (create meeting + mint participant token)
+      description: |
+        Creates (or opens) a RealtimeKit meeting and mints a per-participant join
+        token.  Gateway-sealed: when `WAVE_INTERNAL_SECRET` is set, only requests
+        carrying the gateway's `x-wave-internal` header pass.  When managed PULL
+        recording is armed (`RT_RECORD=1` + `RT_ENCODER=managed`), a recording is
+        started for the meeting best-effort; opt out per call with
+        `{"record": false}`. **Live.**
+      tags: [realtimekit]
+      x-lifecycle: alpha
+      security:
+        - waveTokenV1: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  description: Participant display name
+                title:
+                  type: string
+                  description: Meeting title (optional)
+                preset_name:
+                  type: string
+                  description: RealtimeKit participant preset (optional)
+                custom_participant_id:
+                  type: string
+                  description: Caller-supplied participant id (optional)
+                record:
+                  type: boolean
+                  description: Set `false` to opt out of managed recording
+      responses:
+        "200":
+          description: Meeting created/opened and participant token minted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [meetingId, token, appId]
+                properties:
+                  meetingId:
+                    type: string
+                    description: RealtimeKit meeting id
+                  token:
+                    type: string
+                    description: Per-participant join token
+                  appId:
+                    type: string
+                    description: RealtimeKit app id
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Worker not configured (`REALTIME_NOT_CONFIGURED`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /rtk/turn:
+    post:
+      operationId: rtkTurn
+      summary: Mint short-lived TURN/ICE credentials
+      description: |
+        Mints ephemeral TURN/ICE credentials for raw WebRTC / WHIP-WHEP NAT
+        traversal.  Gateway-sealed (same `x-wave-internal` chokepoint as
+        `/rtk/join`).  Returns W3C `RTCIceServer[]` — drop-in for
+        `new RTCPeerConnection({ iceServers })`. **Live.**
+      tags: [realtimekit]
+      x-lifecycle: alpha
+      security:
+        - waveTokenV1: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ttl:
+                  type: integer
+                  description: Requested credential lifetime in seconds (clamped server-side)
+      responses:
+        "200":
+          description: Ephemeral ICE servers minted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [iceServers, ttl]
+                properties:
+                  iceServers:
+                    type: array
+                    description: W3C `RTCIceServer[]`
+                    items:
+                      type: object
+                      required: [urls, username, credential]
+                      properties:
+                        urls:
+                          type: array
+                          items:
+                            type: string
+                        username:
+                          type: string
+                        credential:
+                          type: string
+                  ttl:
+                    type: integer
+                    description: Credential lifetime in seconds
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: TURN key not configured (`REALTIME_NOT_CONFIGURED`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/realtime/rooms/{room}/{intent}:
+    post:
+      operationId: roomIntent
+      summary: Room signaling (join/publish/subscribe/renegotiate/leave)
+      description: |
+        CF Realtime (Calls) SFU control plane, routed through the per-room Durable
+        Object (`RoomDO`, keyed `org:room`). `intent` is one of `join`, `publish`,
+        `subscribe`, `renegotiate`, `leave`. Gateway-fronted: org context comes from
+        the gateway-stamped `x-wave-org` header. **Live.**
+      tags: [rooms]
+      x-lifecycle: alpha
+      parameters:
+        - $ref: "#/components/parameters/Room"
+        - name: intent
+          in: path
+          required: true
+          description: Signaling intent
+          schema:
+            type: string
+            enum: [join, publish, subscribe, renegotiate, leave]
+      security:
+        - waveTokenV1: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: >-
+                Intent payload (participantId, SDP, track descriptors) — validated
+                by the RoomDO signaling layer.
+      responses:
+        "200":
+          description: Intent result from the RoomDO (e.g. SFU session/answer payload)
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: Missing or malformed org context / intent payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/whip/publish:
     post:
       operationId: whipPublish
       summary: Publish a WebRTC track (WHIP)
       description: |
-        WebRTC-HTTP Ingestion Protocol (WHIP, draft-ietf-wish-whip) endpoint.
-        The client POSTs an SDP offer; the server responds with an SDP answer and
-        creates a Cloudflare Realtime session.
-
-        **Not yet implemented — returns 501.**  The endpoint and auth model are
-        captured here from `capabilities.json`.
+        IETF WHIP v1 (WebRTC-HTTP Ingestion Protocol) endpoint.  The client POSTs
+        an SDP offer; the server responds with an SDP answer and creates a
+        Cloudflare Realtime session.  **Live** — armed via `WHIP_INGEST_ENABLED`
+        (2026-06-24).
       tags: [ingest]
-      x-lifecycle: planned
-      parameters:
-        - $ref: "#/components/parameters/StreamKey"
+      x-lifecycle: alpha
       security:
         - waveTokenV1: []
         - x402Payment: []
@@ -110,7 +329,9 @@ paths:
                 description: SDP answer
           headers:
             Location:
-              description: Resource URL for the established WHIP session
+              description: >-
+                Resource URL for the established WHIP session
+                (`/v1/whip/resource/{id}`)
               schema:
                 type: string
                 format: uri
@@ -118,23 +339,68 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "402":
           $ref: "#/components/responses/PaymentRequired"
-        "501":
-          $ref: "#/components/responses/NotImplemented"
 
-  /whep/{slug}:
+  /v1/whip/resource/{id}:
+    patch:
+      operationId: whipResourcePatch
+      summary: WHIP trickle-ICE candidate update
+      description: Trickle-ICE update for an established WHIP session. **Live.**
+      tags: [ingest]
+      x-lifecycle: alpha
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      security:
+        - waveTokenV1: []
+      requestBody:
+        required: true
+        content:
+          application/trickle-ice-sdpfrag:
+            schema:
+              type: string
+              description: SDP fragment carrying new ICE candidates
+      responses:
+        "204":
+          description: Candidates applied
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    delete:
+      operationId: whipResourceDelete
+      summary: WHIP teardown
+      description: Tears down the WHIP session and stops the ingest meter. **Live.**
+      tags: [ingest]
+      x-lifecycle: alpha
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      security:
+        - waveTokenV1: []
+      responses:
+        "204":
+          description: Session torn down
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/whep/subscribe:
     post:
       operationId: whepSubscribe
       summary: Subscribe to a WebRTC track (WHEP)
       description: |
-        WebRTC-HTTP Egress Protocol (WHEP, draft-ietf-wish-whep) endpoint.
-        The client POSTs an SDP offer for a named media resource identified by
-        `slug`; the server responds with an SDP answer.
-
-        **Not yet implemented — returns 501.**
+        IETF WHEP v1 (WebRTC-HTTP Egress Protocol) endpoint.  The client POSTs an
+        SDP offer; the server responds with an SDP answer.  Requires a
+        `?resource={liveInputUid}` query parameter naming the source to play
+        (rejected with 400 `WHEP_BAD_REQUEST` when absent or invalid).
+        **Live** — armed via `WHEP_EGRESS_ENABLED` (2026-07-01).
       tags: [egress]
-      x-lifecycle: planned
+      x-lifecycle: alpha
       parameters:
-        - $ref: "#/components/parameters/Slug"
+        - name: resource
+          in: query
+          required: true
+          description: >-
+            CF Stream live-input uid of the source to subscribe to (the `uid`
+            returned by `POST /v1/whep/sources`)
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{32}$"
       security:
         - waveTokenV1: []
         - x402Payment: []
@@ -155,33 +421,392 @@ paths:
                 description: SDP answer
           headers:
             Location:
-              description: Resource URL for the established WHEP session
+              description: >-
+                Resource URL for the established WHEP session
+                (`/v1/whep/resource/{id}`)
               schema:
                 type: string
                 format: uri
+        "400":
+          description: >-
+            Missing or invalid `?resource={liveInputUid}` query parameter
+            (`WHEP_BAD_REQUEST`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "402":
           $ref: "#/components/responses/PaymentRequired"
+
+  /v1/whep/resource/{id}:
+    patch:
+      operationId: whepResourcePatch
+      summary: WHEP trickle-ICE candidate update
+      description: Trickle-ICE update for an established WHEP session. **Live.**
+      tags: [egress]
+      x-lifecycle: alpha
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      security:
+        - waveTokenV1: []
+      requestBody:
+        required: true
+        content:
+          application/trickle-ice-sdpfrag:
+            schema:
+              type: string
+              description: SDP fragment carrying new ICE candidates
+      responses:
+        "204":
+          description: Candidates applied
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    delete:
+      operationId: whepResourceDelete
+      summary: WHEP teardown
+      description: Tears down the WHEP session and stops the egress meter. **Live.**
+      tags: [egress]
+      x-lifecycle: alpha
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      security:
+        - waveTokenV1: []
+      responses:
+        "204":
+          description: Session torn down
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/whep/sources:
+    post:
+      operationId: whepSourceProvision
+      summary: Provision a WHEP live source
+      description: |
+        Provisions a CF Stream Live source for the caller's org.  The returned
+        `uid` is the WHEP `?resource=` key; `endpoints` carries the RTMPS/SRT
+        push targets.  Gateway-sealed; org context from the gateway-stamped
+        `x-wave-org` header. **Live** — armed via `INGRESS_ROUTER_ENABLED`
+        (2026-07-15).
+      tags: [egress]
+      x-lifecycle: alpha
+      security:
+        - waveTokenV1: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sourceKind, room]
+              properties:
+                sourceKind:
+                  type: string
+                  description: Ingest source kind (routed; only CF Stream Live kinds provision here)
+                room:
+                  type: string
+                  description: Target room (safe segment)
+                sourceUrl:
+                  type: string
+                  description: Source URL for pull-based kinds (optional)
+                maxCostRank:
+                  type: number
+                  description: Routing cost ceiling (optional)
+      responses:
+        "201":
+          description: Source provisioned
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [uid, endpoints]
+                properties:
+                  uid:
+                    type: string
+                    description: CF Stream live-input uid (the WHEP `?resource=` key)
+                  endpoints:
+                    type: object
+                    description: RTMPS/SRT push targets
+        "400":
+          description: Malformed body or unroutable source kind (`WHEP_BAD_REQUEST`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: >-
+            Source kind routes to another ingest plane (`WHEP_WRONG_PLANE`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: CF Stream credentials/KV binding not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    get:
+      operationId: whepSourceList
+      summary: List the caller org's live sources
+      description: |
+        Lists the caller org's provisioned live sources from the org-scoped
+        reverse index (tenant-isolated — never another org's sources).
+        Gateway-sealed. **Live** — armed via `INGRESS_ROUTER_ENABLED`.
+      tags: [egress]
+      x-lifecycle: alpha
+      security:
+        - waveTokenV1: []
+      responses:
+        "200":
+          description: The org's live sources
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sources]
+                properties:
+                  sources:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        uid:
+                          type: string
+                        room:
+                          type: string
+                        createdAt:
+                          type: number
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/whep/sources/{uid}:
+    delete:
+      operationId: whepSourceTeardown
+      summary: Tear down a WHEP live source
+      description: |
+        Ownership-checked teardown of a provisioned live source.  Idempotent —
+        an already-gone uid still answers `200 {ok:true}` so webhook/job retries
+        never fail.  Gateway-sealed. **Live** — armed via
+        `INGRESS_ROUTER_ENABLED`.
+      tags: [egress]
+      x-lifecycle: alpha
+      parameters:
+        - name: uid
+          in: path
+          required: true
+          description: CF Stream live-input uid (32-char lowercase hex)
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{32}$"
+      security:
+        - waveTokenV1: []
+      responses:
+        "200":
+          description: Source torn down (or already gone — idempotent)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, uid]
+                properties:
+                  ok:
+                    type: boolean
+                  uid:
+                    type: string
+        "400":
+          description: Malformed uid (`WHEP_BAD_REQUEST`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Source belongs to a different org (`WHEP_SOURCE_FORBIDDEN`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/stream/bridge/webhook:
+    post:
+      operationId: streamBridgeWebhook
+      summary: CF Stream → SFU bridge receiver
+      description: |
+        Control-plane webhook the CF Stream Live subscription delivers to.
+        Self-authenticating: the payload is HMAC-verified against the webhook
+        signing secret (no Bearer token). **Live** — armed via
+        `STREAM_BRIDGE_ENABLED` (2026-06-26).
+      tags: [bridge]
+      x-lifecycle: alpha
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: CF Stream webhook payload (HMAC-signed)
+      responses:
+        "200":
+          description: Event verified and acknowledged
+        "401":
+          description: HMAC signature verification failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/realtime/agents/{intent}:
+    post:
+      operationId: agentDispatch
+      summary: Voice-agent dispatch (bind/info)
+      description: |
+        Binds or inspects an `AgentSessionDO` for a room.  `intent` is `bind` or
+        `info`. **Live** — armed via `VOICE_AGENT_PROVIDER=wave` (2026-06-25).
+      tags: [agents]
+      x-lifecycle: alpha
+      parameters:
+        - name: intent
+          in: path
+          required: true
+          description: Dispatch intent
+          schema:
+            type: string
+            enum: [bind, info]
+      security:
+        - waveTokenV1: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: "`{ config: { roomId, agentId, ... } }` (bind requires both ids)"
+      responses:
+        "200":
+          description: Dispatch result from the AgentSessionDO
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: Missing or malformed org context / config
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/realtime/ingress/{protocol}/{intent}:
+    post:
+      operationId: ingressIntent
+      summary: Routed ingest create/delete
+      description: |
+        WAVE-native ingress listeners.  `whip` is **live** (WebRTC-over-HTTP,
+        forwarded into the room's `RoomDO` join path); `rtmp`, `srt`, and `url`
+        return an honest 501 (`ingress_protocol_requires_vm_listener`) — a raw
+        TCP/UDP listener cannot run on a Worker.
+      tags: [ingress]
+      x-lifecycle: alpha
+      parameters:
+        - name: protocol
+          in: path
+          required: true
+          description: Ingest protocol (`whip` live; `rtmp`/`srt`/`url` → 501)
+          schema:
+            type: string
+            enum: [whip, rtmp, srt, url]
+        - name: intent
+          in: path
+          required: true
+          description: Ingest intent
+          schema:
+            type: string
+            enum: [create, delete]
+      security:
+        - waveTokenV1: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: >-
+                For `whip create`: the SDP offer plus a room/streamKey and
+                participant context.
+      responses:
+        "200":
+          description: Ingest created (SFU answer) or delete acknowledged
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: Missing org context or room/streamKey
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "501":
+          description: >-
+            Protocol requires an out-of-Worker VM listener
+            (`ingress_protocol_requires_vm_listener`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/realtime/rooms/{room}/presence:
+    get:
+      operationId: roomPresence
+      summary: Room presence WebSocket (inert)
+      description: |
+        WebSocket upgrade for room presence/state-sync, forwarded to the room's
+        `RoomDO` (which owns the hibernatable socket).  **Inert** — gated behind
+        `PRESENCE_ENABLED` (off in `wrangler.toml`); until armed, requests fall
+        through to the 501 catch-all.
+      tags: [presence]
+      x-lifecycle: inert
+      parameters:
+        - $ref: "#/components/parameters/Room"
+      security:
+        - waveTokenV1: []
+      responses:
+        "101":
+          description: WebSocket upgrade accepted (when armed)
+        "426":
+          description: Request did not carry a WebSocket upgrade (when armed)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "501":
           $ref: "#/components/responses/NotImplemented"
 
 components:
   parameters:
-    StreamKey:
-      name: streamKey
+    Room:
+      name: room
       in: path
       required: true
-      description: Opaque publish key identifying the stream slot
+      description: Room identifier (the RoomDO is keyed `org:room`)
       schema:
         type: string
         minLength: 1
 
-    Slug:
-      name: slug
+    ResourceId:
+      name: id
       in: path
       required: true
-      description: Opaque slug identifying the media resource to subscribe to
+      description: Opaque session resource id returned in the `Location` header
       schema:
         type: string
         minLength: 1
@@ -219,14 +844,14 @@ components:
             $ref: "#/components/schemas/PaymentChallenge"
 
     NotImplemented:
-      description: Endpoint not yet implemented (scaffold stage)
+      description: Route not armed — the honest 501 catch-all for any un-gated route
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
           example:
             error: REALTIME_NOT_IMPLEMENTED
-            path: /whip/my-key
+            path: /v1/realtime/rooms/my-room/presence
 
   schemas:
     HealthResponse:
