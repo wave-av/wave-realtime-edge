@@ -38,18 +38,18 @@ https://rt.wave.online
 |--------|------|------|--------|---------|
 | `GET`  | `/health` | None | **Live** | Liveness check |
 | `GET`  | `/` | None | **Live** | Branded landing page |
-| `POST` | `/rtk/join` | Bearer | **Live** | RealtimeKit meeting create + participant token mint |
-| `POST` | `/rtk/turn` | Bearer | **Live** | TURN/ICE credential mint (NAT traversal) |
+| `POST` | `/rtk/join` | Bearer (gateway-sealed) | **Live** | RealtimeKit meeting create + participant token mint |
+| `POST` | `/rtk/turn` | Bearer (gateway-sealed) | **Live** | TURN/ICE credential mint (NAT traversal) |
 | `POST` | `/rtk/recording-webhook` | RSA signature (`rtk-signature`) | **Live** | Recording status update (managed PULL puller); public by design — self-authenticates via `rtk-signature` (RSA-SHA256 over the raw body), not `gatewayGate` |
-| `POST` | `/v1/realtime/rooms/{room}/{intent}` | Bearer | **Live** | Room signaling: join/publish/subscribe/renegotiate/leave (RoomDO) |
-| `POST` | `/v1/whip/publish` | Bearer | **Live** | Publish a WebRTC track (WHIP ingest) |
-| `PATCH` / `DELETE` | `/v1/whip/resource/{id}` | Bearer | **Live** | WHIP trickle-ICE update / teardown |
-| `POST` | `/v1/whep/subscribe` | Bearer | **Live** | Subscribe to a WebRTC track (WHEP egress) |
-| `PATCH` / `DELETE` | `/v1/whep/resource/{id}` | Bearer | **Live** | WHEP trickle-ICE update / teardown |
+| `POST` | `/v1/realtime/rooms/{room}/{intent}` | Bearer (gateway-sealed) | **Live** | Room signaling: join/publish/subscribe/renegotiate/leave (RoomDO) |
+| `POST` | `/v1/whip/publish` | Bearer (gateway-sealed) | **Live** | Publish a WebRTC track (WHIP ingest) |
+| `PATCH` / `DELETE` | `/v1/whip/resource/{id}` | Bearer (gateway-sealed) | **Live** | WHIP trickle-ICE update / teardown |
+| `POST` | `/v1/whep/subscribe` | Bearer (gateway-sealed) | **Live** | Subscribe to a WebRTC track (WHEP egress) |
+| `PATCH` / `DELETE` | `/v1/whep/resource/{id}` | Bearer (gateway-sealed) | **Live** | WHEP trickle-ICE update / teardown |
 | `POST` | `/v1/stream/bridge/webhook` | HMAC | **Live** | CF Stream → SFU bridge receiver |
-| `POST` | `/v1/realtime/agents/{intent}` | Bearer | **Live** | Voice agent bind/info (`VOICE_AGENT_PROVIDER=wave`) |
-| `POST` | `/v1/realtime/ingress/{protocol}/{intent}` | Bearer | **Live** (`whip` only) | Routed ingest create/delete — `whip` is live; `rtmp`/`srt`/`url` return an honest 501 (need an out-of-Worker VM listener) |
-| `GET`  | `/v1/realtime/rooms/{room}/presence` | Bearer | **Inert** | Room presence WebSocket (`PRESENCE_ENABLED` off) |
+| `POST` | `/v1/realtime/agents/{intent}` | Bearer (gateway-sealed) | **Live** | Voice agent bind/info (`VOICE_AGENT_PROVIDER=wave`) |
+| `POST` | `/v1/realtime/ingress/{protocol}/{intent}` | Bearer (gateway-sealed) | **Live** (`whip` only) | Routed ingest create/delete — `whip` is live; `rtmp`/`srt`/`url` return an honest 501 (need an out-of-Worker VM listener) |
+| `GET`  | `/v1/realtime/rooms/{room}/presence` | Bearer (gateway-sealed) | **Inert** | Room presence WebSocket (`PRESENCE_ENABLED` off) |
 
 > Route-to-flag provenance: statuses here trace to `wrangler.toml` gates (`WHIP_INGEST_ENABLED`,
 > `WHEP_EGRESS_ENABLED`, `STREAM_BRIDGE_ENABLED`, `VOICE_AGENT_PROVIDER`, `PRESENCE_ENABLED`) and the
@@ -70,6 +70,18 @@ Authorization: Bearer <wave-token-v1>
 
 Tokens are issued by the WAVE gateway. The edge worker forwards this header and
 never reads or validates it.
+
+**Gateway seal (`x-wave-internal`).** The Bearer token is validated upstream, not
+by this worker. Every route marked *Bearer (gateway-sealed)* above is enforced by
+`gatewayGate` (`src/dispatch-helpers.ts`): when the `WAVE_INTERNAL_SECRET` wrangler
+secret is set (every deployed env), the request must also carry the matching
+`x-wave-internal` header — stamped by the gateway after auth, entitlement, and
+charging — or the worker returns 401. Callers therefore reach these routes via
+`api.wave.online`, never by hitting `rt.wave.online` directly; org context arrives
+on the gateway-stamped `x-wave-org` header. In local/test envs where the secret is
+unset, the gate is a no-op and no header is required. The two self-authenticating
+webhooks (`/rtk/recording-webhook` via `rtk-signature`, `/v1/stream/bridge/webhook`
+via HMAC) are deliberately outside this gate.
 
 ---
 
