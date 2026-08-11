@@ -9,9 +9,11 @@ info:
     **Status: live.** The substrate decision is made and shipped: Cloudflare Realtime
     (Calls) SFU + per-room Durable Object (`RoomDO`). Interactive rooms
     (`/v1/realtime/rooms/{room}/{intent}`), WHIP ingest (`/v1/whip/publish`), WHEP egress
-    (`/v1/whep/subscribe`), the CF Stream bridge, and voice agents are armed live; surfaces
-    gated off in `wrangler.toml` (e.g. the presence WebSocket) carry `x-lifecycle: inert`
-    below. The 501 catch-all is the honest fall-through for any un-gated route.
+    (`/v1/whep/subscribe`), the CF Stream bridge, voice agents, and the managed PULL
+    recording webhook (`/rtk/recording-webhook`, `RT_RECORD=1` + `RT_ENCODER=managed`) are
+    armed live; surfaces gated off in `wrangler.toml` (e.g. the presence WebSocket) carry
+    `x-lifecycle: inert` below. The 501 catch-all is the honest fall-through for any
+    un-gated route.
 
     ### Authentication
     Requests carry a `wave-token-v1` Bearer token.  Auth and entitlement
@@ -53,6 +55,8 @@ tags:
     description: Routed ingest router
   - name: presence
     description: Room presence WebSocket (inert — `PRESENCE_ENABLED` off)
+  - name: recording
+    description: Managed PULL recording (RealtimeKit webhook)
 
 paths:
   /health:
@@ -78,6 +82,44 @@ paths:
                 version: dev
         "429":
           description: Rate limited by Cloudflare or the upstream gateway
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /rtk/recording-webhook:
+    post:
+      operationId: rtkRecordingWebhook
+      summary: Recording status webhook (managed PULL puller)
+      description: |
+        RealtimeKit `recording.statusUpdate` webhook.  Public by design — RTK calls
+        it directly, so it is intentionally NOT behind the gateway seal; it
+        self-authenticates via the `rtk-signature` header (RSA-SHA256 over the raw
+        body, verified against CF's published key).  **Live** when `RT_RECORD=1` +
+        `RT_ENCODER=managed`: an UPLOADED event pulls the finished recording into
+        WAVE's R2 at an org-rooted key.
+      tags: [recording]
+      x-lifecycle: alpha
+      security: []
+      parameters:
+        - name: rtk-signature
+          in: header
+          required: true
+          description: RSA-SHA256 signature over the raw request body
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: RealtimeKit `recording.statusUpdate` event payload
+      responses:
+        "200":
+          description: Event verified and acknowledged
+        "401":
+          description: Missing or invalid `rtk-signature`
           content:
             application/json:
               schema:

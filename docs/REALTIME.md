@@ -40,7 +40,7 @@ https://rt.wave.online
 | `GET`  | `/` | None | **Live** | Branded landing page |
 | `POST` | `/rtk/join` | Bearer (gateway-sealed) | **Live** | RealtimeKit meeting create + participant token mint |
 | `POST` | `/rtk/turn` | Bearer (gateway-sealed) | **Live** | TURN/ICE credential mint (NAT traversal) |
-| `POST` | `/rtk/recording-webhook` | RSA signature (`rtk-signature`) | **Live** | Recording status update (managed PULL puller); public by design — self-authenticates via `rtk-signature` (RSA-SHA256 over the raw body), not `gatewayGate` |
+| `POST` | `/rtk/recording-webhook` | RSA signature (`rtk-signature`) | **Live** (`RT_RECORD=1`, `RT_ENCODER=managed`) | Recording status update (managed PULL puller); public by design — self-authenticates via `rtk-signature` (RSA-SHA256 over the raw body), not `gatewayGate` |
 | `POST` | `/v1/realtime/rooms/{room}/{intent}` | Bearer (gateway-sealed) | **Live** | Room signaling: join/publish/subscribe/renegotiate/leave (RoomDO) |
 | `POST` | `/v1/whip/publish` | Bearer (gateway-sealed) | **Live** | Publish a WebRTC track (WHIP ingest) |
 | `PATCH` / `DELETE` | `/v1/whip/resource/{id}` | Bearer (gateway-sealed) | **Live** | WHIP trickle-ICE update / teardown |
@@ -52,8 +52,8 @@ https://rt.wave.online
 | `GET`  | `/v1/realtime/rooms/{room}/presence` | Bearer (gateway-sealed) | **Inert** | Room presence WebSocket (`PRESENCE_ENABLED` off) |
 
 > Route-to-flag provenance: statuses here trace to `wrangler.toml` gates (`WHIP_INGEST_ENABLED`,
-> `WHEP_EGRESS_ENABLED`, `STREAM_BRIDGE_ENABLED`, `VOICE_AGENT_PROVIDER`, `PRESENCE_ENABLED`) and the
-> dispatch table in `src/route-dispatch.ts`. The `/v1/realtime/ingress/*` route is not flag-gated
+> `WHEP_EGRESS_ENABLED`, `STREAM_BRIDGE_ENABLED`, `VOICE_AGENT_PROVIDER`, `PRESENCE_ENABLED`,
+> `RT_RECORD` + `RT_ENCODER` for recording) and the dispatch table in `src/route-dispatch.ts`. The `/v1/realtime/ingress/*` route is not flag-gated
 > (`whip` live, `rtmp`/`srt`/`url` honest 501); `INGRESS_ROUTER_ENABLED` (armed 2026-07-15) arms only
 > `/v1/whep/sources` (`src/whep-sources.ts`), not this route. The 501 catch-all is the honest
 > fall-through for any un-gated route.

@@ -40,7 +40,7 @@ npm run deploy        # wrangler deploy
 | WHEP v1 egress (subscribe WebRTC) | `/v1/whep/subscribe` · `/v1/whep/resource/{id}` | **Live** (armed 2026-07-01) |
 | CF Stream → SFU bridge | `/v1/stream/bridge/webhook` | **Live** (armed 2026-06-26) |
 | Voice agents | `/v1/realtime/agents/*` | **Live** (`VOICE_AGENT_PROVIDER=wave`, armed 2026-06-25) |
-| Recording (managed PULL) | `/rtk/recording-webhook` | **Live** (`RT_RECORD=1`) |
+| Recording (managed PULL) | `/rtk/recording-webhook` | **Live** (`RT_RECORD=1`, `RT_ENCODER=managed`) |
 | Routed ingest router | `/v1/realtime/ingress/{protocol}/{intent}` | **Live** — `whip` only; `rtmp`/`srt`/`url` return 501 (need a VM listener) |
 | Routed egress router (wave-render/RunPod/Stream) | `EGRESS_ROUTER_ENABLED` | **Inert** — backends built, not armed |
 | Room presence WebSocket | `/v1/realtime/rooms/{room}/presence` | **Inert** — `PRESENCE_ENABLED` off |
