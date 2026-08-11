@@ -10,8 +10,9 @@ info:
     (Calls) SFU + per-room Durable Object (`RoomDO`). Interactive rooms
     (`/v1/realtime/rooms/{room}/{intent}`), WHIP ingest (`/v1/whip/publish`), WHEP egress
     (`/v1/whep/subscribe`), the CF Stream bridge, and voice agents are armed live; surfaces
-    gated off in `wrangler.toml` (e.g. the presence WebSocket) carry `x-lifecycle: inert`
-    below. The 501 catch-all is the honest fall-through for any un-gated route.
+    gated off in `wrangler.toml` (presence WebSocket, routed egress router) carry
+    `x-lifecycle: planned`/`x-lifecycle: inert` below. The 501 catch-all is the honest
+    fall-through for any un-gated route.
 
     ### Authentication
     Requests carry a `wave-token-v1` Bearer token.  Auth and entitlement
@@ -39,20 +40,10 @@ servers:
 tags:
   - name: observability
     description: Health and liveness checks
-  - name: rooms
-    description: Interactive room signaling (RoomDO control plane)
   - name: ingest
     description: WebRTC WHIP — publish a media track
   - name: egress
     description: WebRTC WHEP — subscribe to a media track
-  - name: bridge
-    description: CF Stream → SFU bridge
-  - name: agents
-    description: Voice-agent dispatch
-  - name: ingress
-    description: Routed ingest router
-  - name: presence
-    description: Room presence WebSocket (inert — `PRESENCE_ENABLED` off)
 
 paths:
   /health:
@@ -60,7 +51,8 @@ paths:
       operationId: getHealth
       summary: Health check
       description: |
-        Returns liveness state for the worker.  No auth required.
+        Returns liveness state for the worker. No auth required. Other live
+        protocol surfaces are documented below.
       tags: [observability]
       security: []
       responses:
@@ -83,64 +75,13 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
-  /v1/realtime/rooms/{room}/{intent}:
-    post:
-      operationId: roomIntent
-      summary: Room signaling (join/publish/subscribe/renegotiate/leave)
-      description: |
-        CF Realtime (Calls) SFU control plane, routed through the per-room Durable
-        Object (`RoomDO`, keyed `org:room`). `intent` is one of `join`, `publish`,
-        `subscribe`, `renegotiate`, `leave`. Gateway-fronted: org context comes from
-        the gateway-stamped `x-wave-org` header. **Live.**
-      tags: [rooms]
-      x-lifecycle: alpha
-      parameters:
-        - $ref: "#/components/parameters/Room"
-        - name: intent
-          in: path
-          required: true
-          description: Signaling intent
-          schema:
-            type: string
-            enum: [join, publish, subscribe, renegotiate, leave]
-      security:
-        - waveTokenV1: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              description: >-
-                Intent payload (participantId, SDP, track descriptors) — validated
-                by the RoomDO signaling layer.
-      responses:
-        "200":
-          description: Intent result from the RoomDO (e.g. SFU session/answer payload)
-          content:
-            application/json:
-              schema:
-                type: object
-        "400":
-          description: Missing or malformed org context / intent payload
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-
   /v1/whip/publish:
     post:
       operationId: whipPublish
       summary: Publish a WebRTC track (WHIP)
-      description: |
-        IETF WHIP v1 (WebRTC-HTTP Ingestion Protocol) endpoint.  The client POSTs
-        an SDP offer; the server responds with an SDP answer and creates a
-        Cloudflare Realtime session.  **Live** — armed via `WHIP_INGEST_ENABLED`
-        (2026-06-24).
+      description: Accepts an SDP offer and creates a Cloudflare Realtime session.
       tags: [ingest]
-      x-lifecycle: alpha
+      x-lifecycle: live
       security:
         - waveTokenV1: []
         - x402Payment: []
@@ -148,324 +89,114 @@ paths:
         required: true
         content:
           application/sdp:
-            schema:
-              type: string
-              description: SDP offer body
+            schema: { type: string, description: SDP offer body }
       responses:
         "201":
-          description: SDP answer; ICE candidates follow via Link header
+          description: SDP answer and established resource
           content:
-            application/sdp:
-              schema:
-                type: string
-                description: SDP answer
-          headers:
-            Location:
-              description: >-
-                Resource URL for the established WHIP session
-                (`/v1/whip/resource/{id}`)
-              schema:
-                type: string
-                format: uri
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "402":
-          $ref: "#/components/responses/PaymentRequired"
+            application/sdp: { schema: { type: string } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "402": { $ref: "#/components/responses/PaymentRequired" }
 
   /v1/whip/resource/{id}:
     patch:
       operationId: whipResourcePatch
-      summary: WHIP trickle-ICE candidate update
-      description: Trickle-ICE update for an established WHIP session. **Live.**
+      summary: Update a WHIP resource (trickle ICE)
       tags: [ingest]
-      x-lifecycle: alpha
+      x-lifecycle: live
       parameters:
         - $ref: "#/components/parameters/ResourceId"
-      security:
-        - waveTokenV1: []
-      requestBody:
-        required: true
-        content:
-          application/trickle-ice-sdpfrag:
-            schema:
-              type: string
-              description: SDP fragment carrying new ICE candidates
-      responses:
-        "204":
-          description: Candidates applied
-        "401":
-          $ref: "#/components/responses/Unauthorized"
+      security: [{ waveTokenV1: [] }]
+      responses: { "204": { description: Resource updated } }
     delete:
       operationId: whipResourceDelete
-      summary: WHIP teardown
-      description: Tears down the WHIP session and stops the ingest meter. **Live.**
+      summary: Delete a WHIP resource
       tags: [ingest]
-      x-lifecycle: alpha
-      parameters:
-        - $ref: "#/components/parameters/ResourceId"
-      security:
-        - waveTokenV1: []
-      responses:
-        "200":
-          description: Session torn down
-        "401":
-          $ref: "#/components/responses/Unauthorized"
+      x-lifecycle: live
+      parameters: [{ $ref: "#/components/parameters/ResourceId" }]
+      security: [{ waveTokenV1: [] }]
+      responses: { "204": { description: Resource deleted } }
 
   /v1/whep/subscribe:
     post:
       operationId: whepSubscribe
       summary: Subscribe to a WebRTC track (WHEP)
-      description: |
-        IETF WHEP v1 (WebRTC-HTTP Egress Protocol) endpoint.  The client POSTs an
-        SDP offer; the server responds with an SDP answer.  **Live** — armed via
-        `WHEP_EGRESS_ENABLED` (2026-07-01).
+      description: Accepts an SDP offer and creates a Cloudflare Realtime egress session.
       tags: [egress]
-      x-lifecycle: alpha
+      x-lifecycle: live
       security:
         - waveTokenV1: []
         - x402Payment: []
       requestBody:
         required: true
         content:
-          application/sdp:
-            schema:
-              type: string
-              description: SDP offer body
+          application/sdp: { schema: { type: string } }
       responses:
-        "201":
-          description: SDP answer
-          content:
-            application/sdp:
-              schema:
-                type: string
-                description: SDP answer
-          headers:
-            Location:
-              description: >-
-                Resource URL for the established WHEP session
-                (`/v1/whep/resource/{id}`)
-              schema:
-                type: string
-                format: uri
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "402":
-          $ref: "#/components/responses/PaymentRequired"
+        "201": { description: SDP answer and established resource }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "402": { $ref: "#/components/responses/PaymentRequired" }
 
   /v1/whep/resource/{id}:
     patch:
       operationId: whepResourcePatch
-      summary: WHEP trickle-ICE candidate update
-      description: Trickle-ICE update for an established WHEP session. **Live.**
+      summary: Update a WHEP resource (trickle ICE)
       tags: [egress]
-      x-lifecycle: alpha
-      parameters:
-        - $ref: "#/components/parameters/ResourceId"
-      security:
-        - waveTokenV1: []
-      requestBody:
-        required: true
-        content:
-          application/trickle-ice-sdpfrag:
-            schema:
-              type: string
-              description: SDP fragment carrying new ICE candidates
-      responses:
-        "204":
-          description: Candidates applied
-        "401":
-          $ref: "#/components/responses/Unauthorized"
+      x-lifecycle: live
+      parameters: [{ $ref: "#/components/parameters/ResourceId" }]
+      security: [{ waveTokenV1: [] }]
+      responses: { "204": { description: Resource updated } }
     delete:
       operationId: whepResourceDelete
-      summary: WHEP teardown
-      description: Tears down the WHEP session and stops the egress meter. **Live.**
+      summary: Delete a WHEP resource
       tags: [egress]
-      x-lifecycle: alpha
-      parameters:
-        - $ref: "#/components/parameters/ResourceId"
-      security:
-        - waveTokenV1: []
-      responses:
-        "200":
-          description: Session torn down
-        "401":
-          $ref: "#/components/responses/Unauthorized"
+      x-lifecycle: live
+      parameters: [{ $ref: "#/components/parameters/ResourceId" }]
+      security: [{ waveTokenV1: [] }]
+      responses: { "204": { description: Resource deleted } }
 
-  /v1/stream/bridge/webhook:
+  /v1/realtime/rooms/{room}/{intent}:
     post:
-      operationId: streamBridgeWebhook
-      summary: CF Stream → SFU bridge receiver
-      description: |
-        Control-plane webhook the CF Stream Live subscription delivers to.
-        Self-authenticating: the payload is HMAC-verified against the webhook
-        signing secret (no Bearer token). **Live** — armed via
-        `STREAM_BRIDGE_ENABLED` (2026-06-26).
-      tags: [bridge]
-      x-lifecycle: alpha
-      security: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              description: CF Stream webhook payload (HMAC-signed)
-      responses:
-        "200":
-          description: Event verified and acknowledged
-        "401":
-          description: HMAC signature verification failed
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /v1/realtime/agents/{intent}:
-    post:
-      operationId: agentDispatch
-      summary: Voice-agent dispatch (bind/info)
-      description: |
-        Binds or inspects an `AgentSessionDO` for a room.  `intent` is `bind` or
-        `info`. **Live** — armed via `VOICE_AGENT_PROVIDER=wave` (2026-06-25).
-      tags: [agents]
-      x-lifecycle: alpha
+      operationId: realtimeRoomIntent
+      summary: Execute a realtime room intent
+      description: Room signaling for join, publish, subscribe, renegotiate, and leave.
+      x-lifecycle: live
       parameters:
+        - name: room
+          in: path
+          required: true
+          schema: { type: string }
         - name: intent
           in: path
           required: true
-          description: Dispatch intent
-          schema:
-            type: string
-            enum: [bind, info]
-      security:
-        - waveTokenV1: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              description: "`{ config: { roomId, agentId, ... } }` (bind requires both ids)"
-      responses:
-        "200":
-          description: Dispatch result from the AgentSessionDO
-          content:
-            application/json:
-              schema:
-                type: object
-        "400":
-          description: Missing or malformed org context / config
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-
-  /v1/realtime/ingress/{protocol}/{intent}:
-    post:
-      operationId: ingressIntent
-      summary: Routed ingest create/delete
-      description: |
-        WAVE-native ingress listeners.  `whip` is **live** (WebRTC-over-HTTP,
-        forwarded into the room's `RoomDO` join path); `rtmp`, `srt`, and `url`
-        return an honest 501 (`ingress_protocol_requires_vm_listener`) — a raw
-        TCP/UDP listener cannot run on a Worker.
-      tags: [ingress]
-      x-lifecycle: alpha
-      parameters:
-        - name: protocol
-          in: path
-          required: true
-          description: Ingest protocol (`whip` live; `rtmp`/`srt`/`url` → 501)
-          schema:
-            type: string
-            enum: [whip, rtmp, srt, url]
-        - name: intent
-          in: path
-          required: true
-          description: Ingest intent
-          schema:
-            type: string
-            enum: [create, delete]
-      security:
-        - waveTokenV1: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              description: >-
-                For `whip create`: the SDP offer plus a room/streamKey and
-                participant context.
-      responses:
-        "200":
-          description: Ingest created (SFU answer) or delete acknowledged
-          content:
-            application/json:
-              schema:
-                type: object
-        "400":
-          description: Missing org context or room/streamKey
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "501":
-          description: >-
-            Protocol requires an out-of-Worker VM listener
-            (`ingress_protocol_requires_vm_listener`)
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-
-  /v1/realtime/rooms/{room}/presence:
-    get:
-      operationId: roomPresence
-      summary: Room presence WebSocket (inert)
-      description: |
-        WebSocket upgrade for room presence/state-sync, forwarded to the room's
-        `RoomDO` (which owns the hibernatable socket).  **Inert** — gated behind
-        `PRESENCE_ENABLED` (off in `wrangler.toml`); until armed, requests fall
-        through to the 501 catch-all.
-      tags: [presence]
-      x-lifecycle: inert
-      parameters:
-        - $ref: "#/components/parameters/Room"
-      security:
-        - waveTokenV1: []
-      responses:
-        "101":
-          description: WebSocket upgrade accepted (when armed)
-        "426":
-          description: Request did not carry a WebSocket upgrade (when armed)
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "501":
-          $ref: "#/components/responses/NotImplemented"
+          schema: { type: string }
+      security: [{ waveTokenV1: [] }]
+      responses: { "200": { description: Intent result } }
 
 components:
   parameters:
-    Room:
-      name: room
-      in: path
-      required: true
-      description: Room identifier (the RoomDO is keyed `org:room`)
-      schema:
-        type: string
-        minLength: 1
-
     ResourceId:
       name: id
       in: path
       required: true
-      description: Opaque session resource id returned in the `Location` header
+      description: Resource identifier returned when the session is created
+      schema:
+        type: string
+        minLength: 1
+
+    StreamKey:
+      name: streamKey
+      in: path
+      required: true
+      description: Opaque publish key identifying the stream slot
+      schema:
+        type: string
+        minLength: 1
+
+    Slug:
+      name: slug
+      in: path
+      required: true
+      description: Opaque slug identifying the media resource to subscribe to
       schema:
         type: string
         minLength: 1
@@ -503,14 +234,14 @@ components:
             $ref: "#/components/schemas/PaymentChallenge"
 
     NotImplemented:
-      description: Route not armed — the honest 501 catch-all for any un-gated route
+      description: Endpoint not yet implemented (scaffold stage)
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
           example:
             error: REALTIME_NOT_IMPLEMENTED
-            path: /v1/realtime/rooms/my-room/presence
+            path: /whip/my-key
 
   schemas:
     HealthResponse:
