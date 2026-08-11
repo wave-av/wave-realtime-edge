@@ -41,6 +41,8 @@ servers:
 tags:
   - name: observability
     description: Health and liveness checks
+  - name: realtimekit
+    description: RealtimeKit meeting join + TURN/ICE credential mint
   - name: rooms
     description: Interactive room signaling (RoomDO control plane)
   - name: ingest
@@ -120,6 +122,130 @@ paths:
           description: Event verified and acknowledged
         "401":
           description: Missing or invalid `rtk-signature`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /rtk/join:
+    post:
+      operationId: rtkJoin
+      summary: RealtimeKit meeting join (create meeting + mint participant token)
+      description: |
+        Creates (or opens) a RealtimeKit meeting and mints a per-participant join
+        token.  Gateway-sealed: when `WAVE_INTERNAL_SECRET` is set, only requests
+        carrying the gateway's `x-wave-internal` header pass.  When managed PULL
+        recording is armed (`RT_RECORD=1` + `RT_ENCODER=managed`), a recording is
+        started for the meeting best-effort; opt out per call with
+        `{"record": false}`. **Live.**
+      tags: [realtimekit]
+      x-lifecycle: alpha
+      security:
+        - waveTokenV1: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  description: Participant display name
+                title:
+                  type: string
+                  description: Meeting title (optional)
+                preset_name:
+                  type: string
+                  description: RealtimeKit participant preset (optional)
+                custom_participant_id:
+                  type: string
+                  description: Caller-supplied participant id (optional)
+                record:
+                  type: boolean
+                  description: Set `false` to opt out of managed recording
+      responses:
+        "200":
+          description: Meeting created/opened and participant token minted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [meetingId, token, appId]
+                properties:
+                  meetingId:
+                    type: string
+                    description: RealtimeKit meeting id
+                  token:
+                    type: string
+                    description: Per-participant join token
+                  appId:
+                    type: string
+                    description: RealtimeKit app id
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Worker not configured (`REALTIME_NOT_CONFIGURED`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /rtk/turn:
+    post:
+      operationId: rtkTurn
+      summary: Mint short-lived TURN/ICE credentials
+      description: |
+        Mints ephemeral TURN/ICE credentials for raw WebRTC / WHIP-WHEP NAT
+        traversal.  Gateway-sealed (same `x-wave-internal` chokepoint as
+        `/rtk/join`).  Returns W3C `RTCIceServer[]` — drop-in for
+        `new RTCPeerConnection({ iceServers })`. **Live.**
+      tags: [realtimekit]
+      x-lifecycle: alpha
+      security:
+        - waveTokenV1: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ttl:
+                  type: integer
+                  description: Requested credential lifetime in seconds (clamped server-side)
+      responses:
+        "200":
+          description: Ephemeral ICE servers minted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [iceServers, ttl]
+                properties:
+                  iceServers:
+                    type: array
+                    description: W3C `RTCIceServer[]`
+                    items:
+                      type: object
+                      required: [urls, username, credential]
+                      properties:
+                        urls:
+                          type: array
+                          items:
+                            type: string
+                        username:
+                          type: string
+                        credential:
+                          type: string
+                  ttl:
+                    type: integer
+                    description: Credential lifetime in seconds
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: TURN key not configured (`REALTIME_NOT_CONFIGURED`)
           content:
             application/json:
               schema:
@@ -248,7 +374,7 @@ paths:
       security:
         - waveTokenV1: []
       responses:
-        "200":
+        "204":
           description: Session torn down
         "401":
           $ref: "#/components/responses/Unauthorized"
@@ -259,10 +385,22 @@ paths:
       summary: Subscribe to a WebRTC track (WHEP)
       description: |
         IETF WHEP v1 (WebRTC-HTTP Egress Protocol) endpoint.  The client POSTs an
-        SDP offer; the server responds with an SDP answer.  **Live** — armed via
-        `WHEP_EGRESS_ENABLED` (2026-07-01).
+        SDP offer; the server responds with an SDP answer.  Requires a
+        `?resource={liveInputUid}` query parameter naming the source to play
+        (rejected with 400 `WHEP_BAD_REQUEST` when absent or invalid).
+        **Live** — armed via `WHEP_EGRESS_ENABLED` (2026-07-01).
       tags: [egress]
       x-lifecycle: alpha
+      parameters:
+        - name: resource
+          in: query
+          required: true
+          description: >-
+            CF Stream live-input uid of the source to subscribe to (the `uid`
+            returned by `POST /v1/whep/sources`)
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{32}$"
       security:
         - waveTokenV1: []
         - x402Payment: []
@@ -289,6 +427,14 @@ paths:
               schema:
                 type: string
                 format: uri
+        "400":
+          description: >-
+            Missing or invalid `?resource={liveInputUid}` query parameter
+            (`WHEP_BAD_REQUEST`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "402":
@@ -328,10 +474,163 @@ paths:
       security:
         - waveTokenV1: []
       responses:
-        "200":
+        "204":
           description: Session torn down
         "401":
           $ref: "#/components/responses/Unauthorized"
+
+  /v1/whep/sources:
+    post:
+      operationId: whepSourceProvision
+      summary: Provision a WHEP live source
+      description: |
+        Provisions a CF Stream Live source for the caller's org.  The returned
+        `uid` is the WHEP `?resource=` key; `endpoints` carries the RTMPS/SRT
+        push targets.  Gateway-sealed; org context from the gateway-stamped
+        `x-wave-org` header. **Live** — armed via `INGRESS_ROUTER_ENABLED`
+        (2026-07-15).
+      tags: [egress]
+      x-lifecycle: alpha
+      security:
+        - waveTokenV1: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sourceKind, room]
+              properties:
+                sourceKind:
+                  type: string
+                  description: Ingest source kind (routed; only CF Stream Live kinds provision here)
+                room:
+                  type: string
+                  description: Target room (safe segment)
+                sourceUrl:
+                  type: string
+                  description: Source URL for pull-based kinds (optional)
+                maxCostRank:
+                  type: number
+                  description: Routing cost ceiling (optional)
+      responses:
+        "201":
+          description: Source provisioned
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [uid, endpoints]
+                properties:
+                  uid:
+                    type: string
+                    description: CF Stream live-input uid (the WHEP `?resource=` key)
+                  endpoints:
+                    type: object
+                    description: RTMPS/SRT push targets
+        "400":
+          description: Malformed body or unroutable source kind (`WHEP_BAD_REQUEST`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: >-
+            Source kind routes to another ingest plane (`WHEP_WRONG_PLANE`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: CF Stream credentials/KV binding not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    get:
+      operationId: whepSourceList
+      summary: List the caller org's live sources
+      description: |
+        Lists the caller org's provisioned live sources from the org-scoped
+        reverse index (tenant-isolated — never another org's sources).
+        Gateway-sealed. **Live** — armed via `INGRESS_ROUTER_ENABLED`.
+      tags: [egress]
+      x-lifecycle: alpha
+      security:
+        - waveTokenV1: []
+      responses:
+        "200":
+          description: The org's live sources
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sources]
+                properties:
+                  sources:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        uid:
+                          type: string
+                        room:
+                          type: string
+                        createdAt:
+                          type: number
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/whep/sources/{uid}:
+    delete:
+      operationId: whepSourceTeardown
+      summary: Tear down a WHEP live source
+      description: |
+        Ownership-checked teardown of a provisioned live source.  Idempotent —
+        an already-gone uid still answers `200 {ok:true}` so webhook/job retries
+        never fail.  Gateway-sealed. **Live** — armed via
+        `INGRESS_ROUTER_ENABLED`.
+      tags: [egress]
+      x-lifecycle: alpha
+      parameters:
+        - name: uid
+          in: path
+          required: true
+          description: CF Stream live-input uid (32-char lowercase hex)
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{32}$"
+      security:
+        - waveTokenV1: []
+      responses:
+        "200":
+          description: Source torn down (or already gone — idempotent)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, uid]
+                properties:
+                  ok:
+                    type: boolean
+                  uid:
+                    type: string
+        "400":
+          description: Malformed uid (`WHEP_BAD_REQUEST`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Source belongs to a different org (`WHEP_SOURCE_FORBIDDEN`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /v1/stream/bridge/webhook:
     post:

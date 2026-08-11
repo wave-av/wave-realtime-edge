@@ -145,11 +145,15 @@ resource URL for teardown (`DELETE /v1/whip/resource/{id}`).
 ## WHEP — Subscribe to a stream (live)
 
 ```bash
-curl -X POST https://rt.wave.online/v1/whep/subscribe \
+# resource = the CF Stream live-input uid of the source to play
+# (the `uid` returned by POST /v1/whep/sources)
+curl -X POST "https://rt.wave.online/v1/whep/subscribe?resource=<liveInputUid>" \
   -H "Authorization: Bearer <wave-token-v1>" \
   -H "Content-Type: application/sdp" \
   --data-binary @offer.sdp
 ```
+
+Omitting `?resource={liveInputUid}` is rejected with `400 WHEP_BAD_REQUEST`.
 
 On success (`201 Created`) the response body is an SDP answer. The `Location` header
 holds the session resource URL for teardown (`DELETE /v1/whep/resource/{id}`).
