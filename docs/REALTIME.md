@@ -2,9 +2,10 @@
 
 Edge WebRTC SFU for browser-first, bidirectional media — rooms, voice agents, calls.
 
-**Status: scaffold / alpha.** Only `/health` is implemented. All protocol routes
-return `501 REALTIME_NOT_IMPLEMENTED` pending the substrate decision (custom SFU on
-Durable Objects vs. LiveKit). This document describes the intended API surface.
+**Status: live.** The substrate decision is made and shipped: **Cloudflare Realtime (Calls) SFU +
+per-room Durable Object** (`SfuClient` in `src/sfu.ts` = media plane; `RoomDO` in `src/room.ts` =
+control plane). Rooms, WHIP ingest, WHEP egress, the CF Stream bridge, and voice agents are armed
+live; the surfaces listed as *inert* below are built but gated off in `wrangler.toml`.
 
 ---
 
@@ -36,8 +37,24 @@ https://rt.wave.online
 | Method | Path | Auth | Status | Purpose |
 |--------|------|------|--------|---------|
 | `GET`  | `/health` | None | **Live** | Liveness check |
-| `POST` | `/whip/{streamKey}` | Bearer | Planned | Publish a WebRTC track (WHIP ingest) |
-| `POST` | `/whep/{slug}` | Bearer | Planned | Subscribe to a WebRTC track (WHEP egress) |
+| `GET`  | `/` | None | **Live** | Branded landing page |
+| `POST` | `/rtk/join` | Bearer | **Live** | RealtimeKit meeting create + participant token mint |
+| `POST` | `/rtk/turn` | Bearer | **Live** | TURN/ICE credential mint (NAT traversal) |
+| `POST` | `/rtk/recording-webhook` | Bearer | **Live** | Recording status update (managed PULL puller) |
+| `POST` | `/v1/realtime/rooms/{room}/{intent}` | Bearer | **Live** | Room signaling: join/publish/subscribe/renegotiate/leave (RoomDO) |
+| `POST` | `/v1/whip/publish` | Bearer | **Live** | Publish a WebRTC track (WHIP ingest) |
+| `PATCH` / `DELETE` | `/v1/whip/resource/{id}` | Bearer | **Live** | WHIP trickle-ICE update / teardown |
+| `POST` | `/v1/whep/subscribe` | Bearer | **Live** | Subscribe to a WebRTC track (WHEP egress) |
+| `PATCH` / `DELETE` | `/v1/whep/resource/{id}` | Bearer | **Live** | WHEP trickle-ICE update / teardown |
+| `POST` | `/v1/stream/bridge/webhook` | HMAC | **Live** | CF Stream → SFU bridge receiver |
+| `POST` | `/v1/realtime/agents/{intent}` | Bearer | **Live** | Voice agent bind/info (`VOICE_AGENT_PROVIDER=wave`) |
+| `POST` | `/v1/realtime/ingress/{protocol}/{intent}` | Bearer | **Live** | Routed ingest create/delete (armed 2026-07-15) |
+| `GET`  | `/v1/realtime/rooms/{room}/presence` | Bearer | **Inert** | Room presence WebSocket (`PRESENCE_ENABLED` off) |
+
+> Route-to-flag provenance: statuses here trace to `wrangler.toml` gates (`WHIP_INGEST_ENABLED`,
+> `WHEP_EGRESS_ENABLED`, `STREAM_BRIDGE_ENABLED`, `VOICE_AGENT_PROVIDER`, `INGRESS_ROUTER_ENABLED`,
+> `PRESENCE_ENABLED`) and the dispatch table in `src/route-dispatch.ts`. The 501 catch-all is the
+> honest fall-through for any un-gated route.
 
 ---
 
@@ -95,11 +112,11 @@ curl https://rt.wave.online/health
 
 ---
 
-## WHIP — Publish a stream (planned)
+## WHIP — Publish a stream (live)
 
 ```bash
 # SDP offer from your WebRTC client
-curl -X POST https://rt.wave.online/whip/<stream-key> \
+curl -X POST https://rt.wave.online/v1/whip/publish \
   -H "Authorization: Bearer <wave-token-v1>" \
   -H "Content-Type: application/sdp" \
   --data-binary @offer.sdp
@@ -107,20 +124,21 @@ curl -X POST https://rt.wave.online/whip/<stream-key> \
 
 On success (`201 Created`) the response body is an SDP answer. ICE candidates are
 signalled via `Link` header (trickle ICE). The `Location` header holds the session
-resource URL for teardown.
+resource URL for teardown (`DELETE /v1/whip/resource/{id}`).
 
 ---
 
-## WHEP — Subscribe to a stream (planned)
+## WHEP — Subscribe to a stream (live)
 
 ```bash
-curl -X POST https://rt.wave.online/whep/<slug> \
+curl -X POST https://rt.wave.online/v1/whep/subscribe \
   -H "Authorization: Bearer <wave-token-v1>" \
   -H "Content-Type: application/sdp" \
   --data-binary @offer.sdp
 ```
 
-On success (`201 Created`) the response body is an SDP answer.
+On success (`201 Created`) the response body is an SDP answer. The `Location` header
+holds the session resource URL for teardown (`DELETE /v1/whep/resource/{id}`).
 
 ---
 

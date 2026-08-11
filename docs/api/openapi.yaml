@@ -6,13 +6,13 @@ info:
     Edge WebRTC SFU for browser-first, bidirectional interactive media — rooms,
     voice agents, and calls. Layer 1 (Edge) of the WAVE Protocol Plane.
 
-    **Status: scaffold / alpha.** The Worker currently implements `/health` only.
-    All protocol routes (`/whip`, `/whep`, and WebSocket connect) return
-    `501 REALTIME_NOT_IMPLEMENTED` pending the substrate decision
-    (custom SFU on Durable Objects vs. LiveKit).  Endpoints for those routes are
-    documented below based on `capabilities.json` intent; each carries an
-    `x-lifecycle: planned` extension and a `501` response to reflect the current
-    state.
+    **Status: live.** The substrate decision is made and shipped: Cloudflare Realtime
+    (Calls) SFU + per-room Durable Object (`RoomDO`). Interactive rooms
+    (`/v1/realtime/rooms/{room}/{intent}`), WHIP ingest (`/v1/whip/publish`), WHEP egress
+    (`/v1/whep/subscribe`), the CF Stream bridge, and voice agents are armed live; surfaces
+    gated off in `wrangler.toml` (presence WebSocket, routed egress router) carry
+    `x-lifecycle: planned`/`x-lifecycle: inert` below. The 501 catch-all is the honest
+    fall-through for any un-gated route.
 
     ### Authentication
     Requests carry a `wave-token-v1` Bearer token.  Auth and entitlement
