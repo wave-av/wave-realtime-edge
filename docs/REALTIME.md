@@ -40,7 +40,7 @@ https://rt.wave.online
 | `GET`  | `/` | None | **Live** | Branded landing page |
 | `POST` | `/rtk/join` | Bearer | **Live** | RealtimeKit meeting create + participant token mint |
 | `POST` | `/rtk/turn` | Bearer | **Live** | TURN/ICE credential mint (NAT traversal) |
-| `POST` | `/rtk/recording-webhook` | Bearer | **Live** | Recording status update (managed PULL puller) |
+| `POST` | `/rtk/recording-webhook` | RSA signature (`rtk-signature`) | **Live** | Recording status update (managed PULL puller); public by design — self-authenticates via `rtk-signature` (RSA-SHA256 over the raw body), not `gatewayGate` |
 | `POST` | `/v1/realtime/rooms/{room}/{intent}` | Bearer | **Live** | Room signaling: join/publish/subscribe/renegotiate/leave (RoomDO) |
 | `POST` | `/v1/whip/publish` | Bearer | **Live** | Publish a WebRTC track (WHIP ingest) |
 | `PATCH` / `DELETE` | `/v1/whip/resource/{id}` | Bearer | **Live** | WHIP trickle-ICE update / teardown |
@@ -48,13 +48,15 @@ https://rt.wave.online
 | `PATCH` / `DELETE` | `/v1/whep/resource/{id}` | Bearer | **Live** | WHEP trickle-ICE update / teardown |
 | `POST` | `/v1/stream/bridge/webhook` | HMAC | **Live** | CF Stream → SFU bridge receiver |
 | `POST` | `/v1/realtime/agents/{intent}` | Bearer | **Live** | Voice agent bind/info (`VOICE_AGENT_PROVIDER=wave`) |
-| `POST` | `/v1/realtime/ingress/{protocol}/{intent}` | Bearer | **Live** | Routed ingest create/delete (armed 2026-07-15) |
+| `POST` | `/v1/realtime/ingress/{protocol}/{intent}` | Bearer | **Live** (`whip` only) | Routed ingest create/delete — `whip` is live; `rtmp`/`srt`/`url` return an honest 501 (need an out-of-Worker VM listener) |
 | `GET`  | `/v1/realtime/rooms/{room}/presence` | Bearer | **Inert** | Room presence WebSocket (`PRESENCE_ENABLED` off) |
 
 > Route-to-flag provenance: statuses here trace to `wrangler.toml` gates (`WHIP_INGEST_ENABLED`,
-> `WHEP_EGRESS_ENABLED`, `STREAM_BRIDGE_ENABLED`, `VOICE_AGENT_PROVIDER`, `INGRESS_ROUTER_ENABLED`,
-> `PRESENCE_ENABLED`) and the dispatch table in `src/route-dispatch.ts`. The 501 catch-all is the
-> honest fall-through for any un-gated route.
+> `WHEP_EGRESS_ENABLED`, `STREAM_BRIDGE_ENABLED`, `VOICE_AGENT_PROVIDER`, `PRESENCE_ENABLED`) and the
+> dispatch table in `src/route-dispatch.ts`. The `/v1/realtime/ingress/*` route is not flag-gated
+> (`whip` live, `rtmp`/`srt`/`url` honest 501); `INGRESS_ROUTER_ENABLED` (armed 2026-07-15) arms only
+> `/v1/whep/sources` (`src/whep-sources.ts`), not this route. The 501 catch-all is the honest
+> fall-through for any un-gated route.
 
 ---
 

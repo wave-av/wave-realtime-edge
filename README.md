@@ -41,7 +41,7 @@ npm run deploy        # wrangler deploy
 | CF Stream → SFU bridge | `/v1/stream/bridge/webhook` | **Live** (armed 2026-06-26) |
 | Voice agents | `/v1/realtime/agents/*` | **Live** (`VOICE_AGENT_PROVIDER=wave`, armed 2026-06-25) |
 | Recording (managed PULL) | `/rtk/recording-webhook` | **Live** (`RT_RECORD=1`) |
-| Routed ingest router | `/v1/realtime/ingress/{protocol}/{intent}` | **Live** (armed 2026-07-15) |
+| Routed ingest router | `/v1/realtime/ingress/{protocol}/{intent}` | **Live** — `whip` only; `rtmp`/`srt`/`url` return 501 (need a VM listener) |
 | Routed egress router (wave-render/RunPod/Stream) | `EGRESS_ROUTER_ENABLED` | **Inert** — backends built, not armed |
 | Room presence WebSocket | `/v1/realtime/rooms/{room}/presence` | **Inert** — `PRESENCE_ENABLED` off |
 | Multi-region cascade | `RT_CASCADE` | **Inert** — single-region today |
@@ -99,7 +99,7 @@ threat-model.md, SECURITY.md, CONTRIBUTING.md
 | `GET` | `/` | Branded landing page |
 | `POST` | `/rtk/join` | RealtimeKit meeting create + participant token mint |
 | `POST` | `/rtk/turn` | TURN/ICE credential mint (WebRTC NAT traversal) |
-| `POST` | `/rtk/recording-webhook` | Recording status update (managed PULL puller) |
+| `POST` | `/rtk/recording-webhook` | Recording status update (managed PULL puller) — public by design; self-authenticates via the `rtk-signature` header (RSA-SHA256), no bearer |
 | `POST` | `/v1/realtime/rooms/{room}/{intent}` | Room signaling: join/publish/subscribe/renegotiate/leave (RoomDO) |
 | `POST` | `/v1/whip/publish` | WHIP ingest offer handshake -&gt; 201 + SDP answer |
 | `PATCH` | `/v1/whip/resource/{id}` | WHIP trickle-ICE candidate update |
@@ -109,7 +109,7 @@ threat-model.md, SECURITY.md, CONTRIBUTING.md
 | `DELETE` | `/v1/whep/resource/{id}` | WHEP teardown, stops the egress meter |
 | `POST` | `/v1/stream/bridge/webhook` | CF Stream → SFU bridge receiver (HMAC-verified) |
 | `POST` | `/v1/realtime/agents/{intent}` | Voice agent bind/info (VOICE_AGENT_PROVIDER=wave) |
-| `POST` | `/v1/realtime/ingress/{protocol}/{intent}` | Routed ingest create/delete (armed 2026-07-15) |
+| `POST` | `/v1/realtime/ingress/{protocol}/{intent}` | Routed ingest create/delete (`whip` live; `rtmp`/`srt`/`url` return 501) |
 | `GET` | `/v1/realtime/rooms/{room}/presence` | WebSocket upgrade for room presence/state-sync (PRESENCE_ENABLED gated, inert) |
 
 ## Transports
