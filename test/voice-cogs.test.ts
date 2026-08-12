@@ -11,7 +11,7 @@ import {
  * These tests assert the PROPERTIES this module exists to guarantee, not examples of them.
  *
  * That distinction is not stylistic here — it is the lesson this epic paid for three times in one session
- * (wave-gateway#910): a sanitizer test asserted `evil:1234 -> evil_1234` (the MAPPING) and passed against an
+ * (a prior incident in an internal repo): a sanitizer test asserted `evil:1234 -> evil_1234` (the MAPPING) and passed against an
  * implementation that collapsed two distinct orgs onto one key, which was the exact collision the sanitizer
  * existed to prevent. An example-shaped test on a property-shaped contract is worse than no test, because it
  * buys confidence. So: "absence never reads as zero", "wastage is never negative", "provenance can never be
