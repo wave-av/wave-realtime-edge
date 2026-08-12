@@ -20,9 +20,9 @@
  *  dropped gateway-side, never a silent no-op here." The first half was true and the second half was
  *  FALSE, and nothing here could tell the difference: the gateway's ingest door is deliberately fail-open,
  *  so it acked `200 {ok:true, recorded:0}` on every dropped turn while this emitter checked only `res.ok`.
- *  It WAS a silent no-op, at both ends, from 2026-06-25. The gateway now carries the dimension
- *  (wave-gateway src/usage-voice-dim.ts) and emitVoiceTurnUsage below now reads `recorded`, not just the
- *  status — so the claim this comment makes is finally mechanically true rather than merely intended. */
+ *  It WAS a silent no-op, at both ends, from 2026-06-25. The gateway-side billing registry now carries
+ *  the dimension, and emitVoiceTurnUsage below now reads `recorded`, not just the status — so the claim
+ *  this comment makes is finally mechanically true rather than merely intended. */
 export const METER_VOICE_AGENT_MINUTES = "voice_agent_minutes";
 
 /** The subset of env the voice meter reads. Both optional → INERT until an operator provisions both. */
