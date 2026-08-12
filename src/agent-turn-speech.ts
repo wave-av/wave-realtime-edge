@@ -56,6 +56,27 @@ export class SpeechSession {
   pcmBytesOut = 0;
   /** Wall-clock ms at which the FIRST audio frame of this turn hit the wire — the TTFA receipt. -1 = none yet. */
   firstAudioMs = -1;
+  /**
+   * E0-P2 — TTS characters SUBMITTED to the vendor this turn, counted at the `synthesize()` call rather than
+   * at playout. That is where the money leaves: vendors bill submitted characters, and a barge-in only stops us
+   * CONSUMING the response stream — the request was already issued and is already paid for. This counter is the
+   * first half of the epic's barge-in wastage term; `StreamSpeakAcc.spoken` is the second (what was heard).
+   * Nothing counted this before, which is exactly why the term was invisible.
+   */
+  ttsCharsSubmitted = 0;
+  /** E0-P2 — how many `speak()` calls this turn a barge-in cut short (each one submitted, partly-or-never heard). */
+  abortedSpeaks = 0;
+
+  /** Audio ms actually published this turn — the "heard" side, in the same unit the vendor's audio is billed in. */
+  get audioMsPublished(): number {
+    return this.pcmBytesOut / TTS_BYTES_PER_MS;
+  }
+
+  /** Record a barge-in exit. One place, so a new abort site cannot silently skip the count. */
+  private abortSpeak(): number {
+    this.abortedSpeaks++;
+    return -1;
+  }
 
   constructor(
     private readonly deps: SpeechSessionDeps,
@@ -84,11 +105,14 @@ export class SpeechSession {
     // spans the playout (bargeIn fires mid-reply) and on abort only ≤lead drains → the agent falls silent fast.
     // We sleep ONLY when AHEAD of the clock (never when behind → no underrun risk). lead=0 → legacy bulk send.
     const delay = this.deps.delay ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    // E0-P2: count the submit BEFORE the call. The vendor bills this text whether or not a barge-in lands
+    // one chunk later, so counting at completion would under-report exactly the turns that waste the most.
+    this.ttsCharsSubmitted += text.length;
     for await (const pcm of this.deps.synthesize(text)) {
-      if (this.opts.isAborted()) return -1; // barge-in: stop publishing the now-stale reply mid-stream
+      if (this.opts.isAborted()) return this.abortSpeak(); // barge-in: stop publishing the now-stale reply mid-stream
       if (!sock || pcm.length === 0) continue;
       for (const chunk of chunkPcm(pcm)) {
-        if (this.opts.isAborted()) return -1; // barge-in between chunks → go silent immediately (don't send more)
+        if (this.opts.isAborted()) return this.abortSpeak(); // barge-in between chunks → go silent immediately (don't send more)
         // playoutStartMs anchors the pacing window to the FIRST frame of the TURN, not of this sentence — with a
         // per-sentence anchor every sentence would be allowed a fresh `ttsLeadMs` of run-ahead and the buffer
         // would deepen sentence by sentence, re-introducing the ~700 ms post-abort tail #34 removed.
@@ -107,7 +131,7 @@ export class SpeechSession {
           }
           if (aheadMs > this.opts.ttsLeadMs) {
             await delay(aheadMs - this.opts.ttsLeadMs); // let the buffer drain back down to the lead
-            if (this.opts.isAborted()) return -1; // barge-in DURING the pacing wait → stop before the next chunk
+            if (this.opts.isAborted()) return this.abortSpeak(); // barge-in DURING the pacing wait → stop before the next chunk
           }
         }
         const seq = this.opts.nextSeq();
