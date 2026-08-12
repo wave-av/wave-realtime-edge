@@ -95,6 +95,8 @@ export function isVoiceMeterProvisioned(env: VoiceMeterEnv): boolean {
  * Flush one turn's voice-agent usage to the gateway. Fire-and-forget friendly; NEVER throws and NEVER breaks
  * the turn (design media-safety). No-op (no network) when unprovisioned or nothing billable. Failures are
  * logged loud (config-no-silent-noop) but swallowed (fail-open) — a metering error must not affect the agent.
+ * The returned promise settles after the FIRST attempt; a 429's single retry is detached and never extends
+ * the caller's await (the caller holds `turnInFlight`, so an awaited wait here would stall the next turn).
  */
 export async function emitVoiceTurnUsage(
   env: VoiceMeterEnv,
@@ -111,42 +113,61 @@ export async function emitVoiceTurnUsage(
   for (const usage of lines) {
     const body: UsageEnvelope = { org: u.org, usage };
     try {
-      let res = await postUsage(fetchFn, base, token, body);
+      const res = await postUsage(fetchFn, base, token, body);
       // ONE retry on 429, and only on 429. The gateway's ingest limiter is per-ORG (its buckets are
       // minute-scoped), so a 429 is a transient fairness signal rather than a defect — but a dropped
       // usage line is unrecoverable revenue, so it is worth exactly one cheap retry. `retry-after` is
-      // clamped: an upstream must not be able to park a turn's metering task for an arbitrary time.
+      // clamped: an upstream must not be able to park the metering task for an arbitrary time.
+      //
+      // The retry is DETACHED, never awaited. This emit is awaited at the end of every turn while
+      // `turnInFlight` blocks the next one (TurnTakingCore.runTurn → logMeter → emitMeter), so an inline
+      // sleep here — the first shape of this fix — stalled the live conversation for up to 2s whenever
+      // ingest rate-limited. The retry re-sends the IDENTICAL body (event_id dedup ⇒ it can never
+      // double-bill), settles its own receipt, and swallows its own errors (fail-open); losing it on
+      // teardown is acceptable — it was best-effort recovery of an already-429'd line.
       if (res.status === 429) {
         const after = Number(res.headers.get("retry-after"));
-        const waitMs = Math.min(Number.isFinite(after) && after > 0 ? after * 1000 : 1000, 2000);
-        await new Promise((r) => setTimeout(r, waitMs));
-        res = await postUsage(fetchFn, base, token, body);
-      }
-      if (!res.ok) {
-        // Loud, but never blocking — observability only, no secret/PII in the line.
-        console.warn(`voice-meter emit failed meter=${usage.meter} status=${res.status} org=${u.org}`);
+        // `after >= 0`: a `retry-after: 0` means "retry now" and must not fall through to the 1s default.
+        const waitMs = Math.min(Number.isFinite(after) && after >= 0 ? after * 1000 : 1000, 2000);
+        setTimeout(() => {
+          postUsage(fetchFn, base, token, body)
+            .then((retryRes) => settleReceipt(retryRes, usage.meter, u.org))
+            .catch((e) =>
+              console.warn(`voice-meter emit error meter=${usage.meter} org=${u.org}: ${(e as Error)?.message ?? e}`),
+            );
+        }, waitMs);
         continue;
       }
-      // A 200 IS NOT AN ACK. handleUsageIngest is deliberately fail-open — it answers
-      // `{ok:true, recorded:N}` even when the record failed, and signals that with `recorded:0`. So a
-      // meter the gateway does not carry produced 200/recorded:0 and this emitter, which only checked
-      // `res.ok`, read it as SUCCESS. That is exactly how voice_agent_minutes was dropped on every turn
-      // from 2026-06-25 while both ends logged success. `recorded` is the real receipt; read it.
-      const { recorded, deduped } = await ingestReceipt(res);
-      // `deduped` excluded deliberately: an idempotent re-emit legitimately records 0 dimensions and is
-      // HEALTHY. Warning on it would fire on every retry and train the reader to ignore the one warning
-      // that means lost revenue.
-      if (recorded === 0 && !deduped) {
-        console.warn(
-          `voice-meter DROPPED meter=${usage.meter} org=${u.org}: gateway acked 200 but recorded:0 — the ` +
-            `meter is not registered in the gateway billing registry, or every dimension zeroed. This usage ` +
-            `is NOT billed and is NOT recoverable. Register the meter gateway-side; do not ignore this line.`,
-        );
-      }
+      await settleReceipt(res, usage.meter, u.org);
     } catch (e) {
       // Fail-open: a usage emit must NEVER affect the live voice-agent turn (media-safety).
       console.warn(`voice-meter emit error meter=${usage.meter} org=${u.org}: ${(e as Error)?.message ?? e}`);
     }
+  }
+}
+
+/** Judge one ingest response — shared by the inline path and the detached 429 retry. Warns, never throws. */
+async function settleReceipt(res: Response, meter: string, org: string): Promise<void> {
+  if (!res.ok) {
+    // Loud, but never blocking — observability only, no secret/PII in the line.
+    console.warn(`voice-meter emit failed meter=${meter} status=${res.status} org=${org}`);
+    return;
+  }
+  // A 200 IS NOT AN ACK. handleUsageIngest is deliberately fail-open — it answers
+  // `{ok:true, recorded:N}` even when the record failed, and signals that with `recorded:0`. So a
+  // meter the gateway does not carry produced 200/recorded:0 and this emitter, which only checked
+  // `res.ok`, read it as SUCCESS. That is exactly how voice_agent_minutes was dropped on every turn
+  // from 2026-06-25 while both ends logged success. `recorded` is the real receipt; read it.
+  const { recorded, deduped } = await ingestReceipt(res);
+  // `deduped` excluded deliberately: an idempotent re-emit legitimately records 0 dimensions and is
+  // HEALTHY. Warning on it would fire on every retry and train the reader to ignore the one warning
+  // that means lost revenue.
+  if (recorded === 0 && !deduped) {
+    console.warn(
+      `voice-meter DROPPED meter=${meter} org=${org}: gateway acked 200 but recorded:0 — the ` +
+        `meter is not registered in the gateway billing registry, or every dimension zeroed. This usage ` +
+        `is NOT billed and is NOT recoverable. Register the meter gateway-side; do not ignore this line.`,
+    );
   }
 }
 
