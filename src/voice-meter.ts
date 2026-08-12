@@ -133,11 +133,19 @@ export async function emitVoiceTurnUsage(
         // `after >= 0`: an explicit `retry-after: 0` means "retry now" and must not fall through to the 1s default.
         const waitMs = Math.min(Number.isFinite(after) && after >= 0 ? after * 1000 : 1000, 2000);
         setTimeout(() => {
-          postUsage(fetchFn, base, token, body)
-            .then((retryRes) => settleReceipt(retryRes, usage.meter, u.org))
-            .catch((e) =>
-              console.warn(`voice-meter emit error meter=${usage.meter} org=${u.org}: ${(e as Error)?.message ?? e}`),
-            );
+          // The try/catch is NOT redundant with the .catch: a fetch impl can throw SYNCHRONOUSLY (e.g.
+          // Workers' "Cannot perform I/O on behalf of a different request" once the originating request
+          // context is gone), and a sync throw from a timer callback creates no promise for .catch to
+          // guard — it would escape as an uncaught background error. Fail-open applies here too.
+          try {
+            postUsage(fetchFn, base, token, body)
+              .then((retryRes) => settleReceipt(retryRes, usage.meter, u.org))
+              .catch((e) =>
+                console.warn(`voice-meter emit error meter=${usage.meter} org=${u.org}: ${(e as Error)?.message ?? e}`),
+              );
+          } catch (e) {
+            console.warn(`voice-meter emit error meter=${usage.meter} org=${u.org}: ${(e as Error)?.message ?? e}`);
+          }
         }, waitMs);
         continue;
       }

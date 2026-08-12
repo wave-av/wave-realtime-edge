@@ -129,6 +129,24 @@ describe("429 gets exactly one idempotent retry — DETACHED from the awaited em
     expect(immediate).toHaveBeenCalledTimes(2);
   });
 
+  it("swallows a SYNCHRONOUSLY throwing fetch on the detached retry — never an uncaught background error (devin on #356)", async () => {
+    // A sync throw from a timer callback creates no promise, so the .catch chain alone cannot guard it
+    // (Workers' "Cannot perform I/O on behalf of a different request" throws exactly like this once the
+    // originating request context is gone). It must be warned and swallowed, like every other emit failure.
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let calls = 0;
+    const fetchFn = vi.fn((): Promise<Response> => {
+      calls += 1;
+      if (calls === 1) return Promise.resolve(jsonRes({ ok: false }, { status: 429, headers: { "retry-after": "0" } }));
+      throw new Error("Cannot perform I/O on behalf of a different request");
+    });
+    await emit(fetchFn);
+    await vi.advanceTimersByTimeAsync(0); // fire the detached retry — its sync throw must not escape
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls.flat().join(" ")).toContain("emit error");
+  });
+
   it("defaults a MISSING retry-after to 1s — never an instant re-send into the same limiter (devin on #356)", async () => {
     // `Number(null)` and `Number("")` are both 0, so a missing/blank header must not read as "retry now":
     // an instant re-send into the same minute-scoped limiter would almost always 429 again and lose the line.
