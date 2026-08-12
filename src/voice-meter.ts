@@ -126,8 +126,11 @@ export async function emitVoiceTurnUsage(
       // double-bill), settles its own receipt, and swallows its own errors (fail-open); losing it on
       // teardown is acceptable — it was best-effort recovery of an already-429'd line.
       if (res.status === 429) {
-        const after = Number(res.headers.get("retry-after"));
-        // `after >= 0`: a `retry-after: 0` means "retry now" and must not fall through to the 1s default.
+        // A missing/blank header must take the 1s default: `Number(null)` and `Number("")` are BOTH 0,
+        // and an instant re-send into the same minute-scoped limiter would almost always 429 again.
+        const raw = res.headers.get("retry-after");
+        const after = raw === null || raw.trim() === "" ? NaN : Number(raw);
+        // `after >= 0`: an explicit `retry-after: 0` means "retry now" and must not fall through to the 1s default.
         const waitMs = Math.min(Number.isFinite(after) && after >= 0 ? after * 1000 : 1000, 2000);
         setTimeout(() => {
           postUsage(fetchFn, base, token, body)

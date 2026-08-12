@@ -128,4 +128,17 @@ describe("429 gets exactly one idempotent retry — DETACHED from the awaited em
     await vi.advanceTimersByTimeAsync(0);
     expect(immediate).toHaveBeenCalledTimes(2);
   });
+
+  it("defaults a MISSING retry-after to 1s — never an instant re-send into the same limiter (devin on #356)", async () => {
+    // `Number(null)` and `Number("")` are both 0, so a missing/blank header must not read as "retry now":
+    // an instant re-send into the same minute-scoped limiter would almost always 429 again and lose the line.
+    vi.useFakeTimers();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetchFn = vi.fn(async () => jsonRes({ ok: false }, { status: 429 })); // no retry-after header
+    await emit(fetchFn);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fetchFn).toHaveBeenCalledTimes(1); // not yet — the 1s default applies
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchFn).toHaveBeenCalledTimes(2); // fired at the 1s default
+  });
 });
