@@ -35,6 +35,8 @@ export class TurnCogsLedger {
   private lastAccountedMs: number;
   private sttAudioMs = 0;
   private sttCalls = 0;
+  /** Set by `closeSession` — the terminal slice is emitted at most once, however many teardown paths fire. */
+  private sessionClosed = false;
 
   constructor(private readonly now: () => number) {
     this.bornMs = now();
@@ -83,5 +85,31 @@ export class TurnCogsLedger {
     this.sttAudioMs = 0;
     this.sttCalls = 0;
     return terms;
+  }
+
+  /**
+   * Close the SESSION: the terminal slice between the last closed turn and teardown. Sessions usually end idle,
+   * so without this the final idle window — often the largest single DO interval — would silently vanish and the
+   * "per-turn slices sum to session duration" invariant would hold only until the last turn, not until room-end.
+   * Any STT recorded after the last turn (an utterance that never became a turn) rides on this slice too.
+   *
+   * Idempotent, and reported with the SAME field names as `closeTurn`, so a downstream reader sums
+   * `doWallMsAttributed` across per-turn rows plus this terminal row and lands exactly on `doAliveMsCumulative`.
+   * Returns null on any call after the first — a double teardown must not re-charge the tail.
+   */
+  closeSession(): Pick<VoiceTurnCogsTerms, "doWallMsAttributed" | "doAliveMsCumulative" | "sttAudioMsSubmitted" | "sttCalls"> | null {
+    if (this.sessionClosed) return null;
+    this.sessionClosed = true;
+    const at = this.now();
+    const terminal = {
+      doWallMsAttributed: Math.max(0, at - this.lastAccountedMs),
+      doAliveMsCumulative: Math.max(0, at - this.bornMs),
+      sttAudioMsSubmitted: this.sttAudioMs,
+      sttCalls: this.sttCalls,
+    };
+    this.lastAccountedMs = at;
+    this.sttAudioMs = 0;
+    this.sttCalls = 0;
+    return terminal;
   }
 }

@@ -26,8 +26,14 @@ export interface TurnMeterInput {
   assistant: string;
   toolsUsed: number;
   pcmBytesOut: number;
-  /** Turn start (deps.now() at the top of runTurn). */
+  /** Turn start (deps.now() at the top of runTurn). Kept for `ttfaMs`; NOT re-read against the clock here. */
   startMs: number;
+  /**
+   * Turn wall-time, computed ONCE by the caller from a single `deps.now()` read — the same value handed to
+   * `TurnCogsLedger.closeTurn`. Recomputing it here would put the billable minutes and the ledger's
+   * `idleAmplification` denominator on two different clock reads.
+   */
+  turnWallMs: number;
   /** deps.now() when the FIRST audio frame hit the wire, or -1 if nothing was published. */
   firstAudioMs: number;
   /** E0-P2 — this turn's measured COGS quantities (from `TurnCogsLedger.closeTurn`). */
@@ -46,7 +52,7 @@ export interface TurnMeterInput {
  * -1 means nothing was published (no ingest socket, or the turn died before any audio).
  */
 export async function logTurnMeter(deps: TurnMeterDeps, ids: Record<string, unknown>, m: TurnMeterInput): Promise<void> {
-  const turnWallMs = deps.now() - m.startMs;
+  const turnWallMs = m.turnWallMs;
   deps.log("agent-turn-meter", {
     ...ids,
     turnId: m.turnId,
@@ -133,6 +139,7 @@ export async function meterFinishedTurn(
     toolsUsed: t.toolsUsed,
     pcmBytesOut: t.speech.pcmBytesOut,
     startMs: t.startMs,
+    turnWallMs,
     firstAudioMs: t.speech.firstAudioMs,
     cogs: who.ledger.closeTurn({ turnWallMs, speech: t.speech }),
     cogsRates: who.rates,
@@ -157,4 +164,22 @@ export function meterAbandonedTurn(
   const terms = who.ledger.closeTurn({ turnWallMs, speech: t.speech });
   const cogs = voiceTurnCogs(terms, who.rates);
   deps.log("agent-turn-cogs", { ...ids, turnId: t.turnId, turnCompleted: false, ...terms, ...cogs });
+}
+
+/**
+ * Account for the SESSION's terminal slice at teardown: the DO wall-clock since the last closed turn, plus any
+ * STT that never became a turn. Sessions usually END idle, so skipping this would drop the final idle window —
+ * the exact cost shape this epic opened on — and the ledger's slices would sum to session duration only up to
+ * the last turn. Quantities only, on their own event: this is a remainder receipt, not a turn, so it carries no
+ * TTS terms and no pricing (fabricating a zeroed turn row here would violate "never zero what was not measured").
+ * Idempotent (the ledger closes once); synchronous and log-only, so it is safe from any teardown path.
+ */
+export function meterSessionClose(
+  deps: Pick<TurnMeterDeps, "log">,
+  ids: Record<string, unknown>,
+  who: Pick<TurnMeterWho, "ledger">,
+): void {
+  const terminal = who.ledger.closeSession();
+  if (!terminal) return; // already closed — a double teardown must not re-charge the tail
+  deps.log("agent-session-cogs", { ...ids, ...terminal });
 }

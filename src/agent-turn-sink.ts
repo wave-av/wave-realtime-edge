@@ -136,6 +136,13 @@ export function buildRoomTurnLoopDriver(inputs: RoomTurnLoopInputs): TurnLoopDri
     onFrame: (pcm) => core.onFrame(pcm),
     close: () => {
       try {
+        // E0-P2: flush the FINAL idle DO slice (last turn → room-end) before releasing the socket. Sessions
+        // usually END idle, so without this the tail — often the largest single idle window — never gets a row.
+        core.closeSession();
+      } catch {
+        /* best-effort — teardown never throws */
+      }
+      try {
         inputs.media.ingestSocket()?.close?.();
       } catch {
         /* best-effort — teardown never throws */

@@ -151,6 +151,43 @@ describe("TurnCogsLedger — the Durable Object term", () => {
   });
 });
 
+describe("TurnCogsLedger — session close (the terminal slice)", () => {
+  const clockAt = (ref: { t: number }) => () => ref.t;
+
+  it("captures the FINAL idle window between the last closed turn and teardown", () => {
+    // Sessions usually END idle. Without a terminal slice, the "slices sum to session duration" invariant holds
+    // only up to the LAST turn — the trailing idle window, often the largest single DO interval, vanishes.
+    const ref = { t: 0 };
+    const ledger = new TurnCogsLedger(clockAt(ref));
+    ref.t = 5_000;
+    const turn = ledger.closeTurn({ turnWallMs: 1_000 });
+    ref.t = 65_000; // a minute of trailing idle before room-end
+    const terminal = ledger.closeSession();
+    expect(terminal?.doWallMsAttributed).toBe(60_000);
+    expect(terminal?.doAliveMsCumulative).toBe(65_000);
+    // Per-turn slices + the terminal slice == the session's whole life, exactly once.
+    expect(turn.doWallMsAttributed + (terminal?.doWallMsAttributed ?? 0)).toBe(ref.t);
+  });
+
+  it("is idempotent — a double teardown cannot re-charge the tail", () => {
+    const ref = { t: 0 };
+    const ledger = new TurnCogsLedger(clockAt(ref));
+    ref.t = 10_000;
+    expect(ledger.closeSession()?.doWallMsAttributed).toBe(10_000);
+    ref.t = 20_000;
+    expect(ledger.closeSession()).toBeNull();
+  });
+
+  it("carries STT that never became a turn, so an abandoned last utterance is not lost", () => {
+    const ref = { t: 0 };
+    const ledger = new TurnCogsLedger(clockAt(ref));
+    ledger.recordStt(PCM_BYTES_PER_MS * 1_500); // submitted, but no turn ever closed for it
+    const terminal = ledger.closeSession();
+    expect(terminal?.sttAudioMsSubmitted).toBe(1_500);
+    expect(terminal?.sttCalls).toBe(1);
+  });
+});
+
 describe("TurnCogsLedger — the STT term", () => {
   it("counts SUBMITTED audio ms, converted from the exact buffer POSTed", () => {
     const ledger = new TurnCogsLedger(() => 0);

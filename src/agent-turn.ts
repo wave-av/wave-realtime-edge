@@ -43,7 +43,7 @@ import { decodePacket } from "./encoders/container-adapter.js";
 import { type IngestFraming } from "./agent-ingest-adapter.js";
 import { SpeechSession, streamSpeakSentences, type StreamSpeakAcc } from "./agent-turn-speech.js";
 import { SentenceChunker } from "./sentence-chunker.js";
-import { meterFinishedTurn, meterAbandonedTurn } from "./agent-turn-meter.js";
+import { meterFinishedTurn, meterAbandonedTurn, meterSessionClose } from "./agent-turn-meter.js";
 import { TurnCogsLedger } from "./voice-cogs-ledger.js";
 import type { VoiceCogsRates } from "./voice-cogs.js";
 import { Vad, vadConfigFromEnv, type VadConfig, type VadEnv } from "./agent-vad.js";
@@ -526,6 +526,15 @@ export class TurnTakingCore {
     const { org, roomId: room, agentId } = this.config;
     const who = { org, room, agentId, ledger: this.cogs, rates: this.cogsRates };
     await meterFinishedTurn(this.deps, this.idFields(), who, { userText, assistant, toolsUsed, turnId, startMs, speech });
+  }
+
+  /**
+   * E0-P2 — session-end receipt: flush the FINAL idle DO slice (last closed turn → teardown, plus any STT that
+   * never became a turn) as one `agent-session-cogs` line. Idempotent and log-only (agent-turn-meter.ts), so it
+   * is safe to call from any teardown path, any number of times.
+   */
+  closeSession(): void {
+    meterSessionClose(this.deps, this.idFields(), { ledger: this.cogs });
   }
 
   /**
