@@ -43,13 +43,17 @@ export interface VoiceTurnCogsTerms {
    */
   ttsCharsSubmitted: number;
   /**
-   * TTS characters the listener actually HEARD (the sentences with audio on the wire). The gap to
-   * `ttsCharsSubmitted` IS the barge-in wastage term — invisible today because nothing counted the first
-   * number. Slightly CONSERVATIVE by construction: a sentence cut halfway counts as fully heard, so real
-   * wastage is >= what this reports. Erring toward under-reporting our own cost is deliberate: it cannot
-   * manufacture a margin problem that is not there.
+   * TTS characters the listener actually HEARD — pieces with audio on the wire, using the codebase's own rule
+   * (any audio published ⇒ heard, because a listener cannot un-hear a half-sentence). The gap to
+   * `ttsCharsSubmitted` is the DEFINITE barge-in wastage: text paid for and never rendered at all.
    */
   ttsCharsHeard: number;
+  /**
+   * Characters of pieces cut AFTER some audio was published. Counted as fully heard above, so they contribute
+   * ZERO to definite wastage while genuinely being partly wasted. Kept as its own quantity so the wastage term
+   * is a stated LOWER BOUND with a named remainder, rather than a number that quietly understates.
+   */
+  ttsCharsCutMidPiece: number;
   /** Audio milliseconds actually published to the wire (`pcmBytesOut / PCM_BYTES_PER_MS`). */
   ttsAudioMsPublished: number;
   /** How many `speak()` calls this turn were cut by a barge-in (each one submitted, partly-or-never heard). */
@@ -102,8 +106,14 @@ export interface VoiceTurnCogs {
    * the price. Absent when the turn billed nothing (a zero-length turn has no unit to divide by).
    */
   unitCostUsd?: number;
-  /** TTS characters paid for and never heard — the barge-in wastage term, in its natural unit. */
+  /**
+   * TTS characters paid for and never rendered at all — the barge-in wastage term, and a LOWER BOUND on true
+   * wastage: pieces cut mid-render count as heard, so their unrendered remainder is not in this number. See
+   * `bargeInCutMidPieceChars` for the size of that unresolved remainder.
+   */
   bargeInWastageChars: number;
+  /** Characters cut mid-render — partly wasted by an amount this instrument cannot resolve at character level. */
+  bargeInCutMidPieceChars: number;
   /** Wastage as a fraction of submitted characters (0 when nothing was submitted). */
   bargeInWastageFraction: number;
   /**
@@ -129,6 +139,7 @@ export function voiceTurnCogs(terms: VoiceTurnCogsTerms, rates?: VoiceCogsRates)
     "turnWallMs",
     "ttsCharsSubmitted",
     "ttsCharsHeard",
+    "ttsCharsCutMidPiece",
     "ttsAudioMsPublished",
     "ttsAbortedSpeaks",
     "sttAudioMsSubmitted",
@@ -142,6 +153,7 @@ export function voiceTurnCogs(terms: VoiceTurnCogsTerms, rates?: VoiceCogsRates)
       provenance: "invalid",
       reason: `unmeasured term(s): ${bad.join(",")}`,
       bargeInWastageChars: 0,
+      bargeInCutMidPieceChars: 0,
       bargeInWastageFraction: 0,
     };
   }
@@ -158,6 +170,7 @@ export function voiceTurnCogs(terms: VoiceTurnCogsTerms, rates?: VoiceCogsRates)
   const quantities: VoiceTurnCogs = {
     provenance: "unpriced",
     bargeInWastageChars: wastageChars,
+    bargeInCutMidPieceChars: terms.ttsCharsCutMidPiece,
     bargeInWastageFraction: wastageFraction,
     idleAmplification,
   };

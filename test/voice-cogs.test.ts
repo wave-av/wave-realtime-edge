@@ -22,6 +22,7 @@ const TERMS: VoiceTurnCogsTerms = {
   turnWallMs: 6_000,
   ttsCharsSubmitted: 400,
   ttsCharsHeard: 400,
+  ttsCharsCutMidPiece: 0,
   ttsAudioMsPublished: 4_000,
   ttsAbortedSpeaks: 0,
   sttAudioMsSubmitted: 3_000,

@@ -60,20 +60,47 @@ export class SpeechSession {
    * E0-P2 — TTS characters SUBMITTED to the vendor this turn, counted at the `synthesize()` call rather than
    * at playout. That is where the money leaves: vendors bill submitted characters, and a barge-in only stops us
    * CONSUMING the response stream — the request was already issued and is already paid for. This counter is the
-   * first half of the epic's barge-in wastage term; `StreamSpeakAcc.spoken` is the second (what was heard).
+   * first half of the epic's barge-in wastage term; `ttsCharsHeard` below is the second.
    * Nothing counted this before, which is exactly why the term was invisible.
    */
   ttsCharsSubmitted = 0;
   /** E0-P2 — how many `speak()` calls this turn a barge-in cut short (each one submitted, partly-or-never heard). */
   abortedSpeaks = 0;
+  /**
+   * E0-P2 — TTS characters the listener actually HEARD. Counted HERE rather than derived from
+   * `StreamSpeakAcc.spoken` because that string is built for HISTORY, not for accounting, and mis-measures in
+   * both directions: it joins sentences with a space that was never submitted (over-count), and the flushed
+   * trailing partial is spoken without ever being appended to it (under-count). Counting at the same place the
+   * submission is counted keeps the two halves of the wastage term symmetrical by construction.
+   *
+   * Uses the codebase's own definition of heard, verbatim from `streamSpeakSentences`: a piece counts as heard
+   * if ANY of its audio reached the wire — the listener cannot un-hear a half-sentence.
+   */
+  ttsCharsHeard = 0;
+  /**
+   * E0-P2 — characters of pieces a barge-in cut AFTER some audio had already reached the wire.
+   *
+   * These are the honest grey zone of the wastage term. `ttsCharsHeard` counts such a piece as fully heard (the
+   * codebase's rule, and the right one for history), so `submitted - heard` reports ZERO wastage for it — while
+   * the vendor was in fact paid for a sentence the listener only partly received. Rather than leave that as a
+   * comment about being "conservative", the quantity is counted, so the wastage term can state a definite LOWER
+   * BOUND and name the unresolved remainder instead of quietly absorbing it.
+   */
+  ttsCharsCutMidPiece = 0;
 
   /** Audio ms actually published this turn — the "heard" side, in the same unit the vendor's audio is billed in. */
   get audioMsPublished(): number {
     return this.pcmBytesOut / TTS_BYTES_PER_MS;
   }
 
-  /** Record a barge-in exit. One place, so a new abort site cannot silently skip the count. */
-  private abortSpeak(): number {
+  /**
+   * Close out one `speak()` — the ONE exit point, so a new abort site cannot silently skip the accounting.
+   * Returns exactly what `speak()` has always returned: bytes published, or -1 when a barge-in cut it short.
+   */
+  private endSpeak(text: string, publishedThisPiece: number, aborted: boolean): number {
+    if (publishedThisPiece > 0) this.ttsCharsHeard += text.length;
+    if (!aborted) return publishedThisPiece;
+    if (publishedThisPiece > 0) this.ttsCharsCutMidPiece += text.length;
     this.abortedSpeaks++;
     return -1;
   }
@@ -109,10 +136,10 @@ export class SpeechSession {
     // one chunk later, so counting at completion would under-report exactly the turns that waste the most.
     this.ttsCharsSubmitted += text.length;
     for await (const pcm of this.deps.synthesize(text)) {
-      if (this.opts.isAborted()) return this.abortSpeak(); // barge-in: stop publishing the now-stale reply mid-stream
+      if (this.opts.isAborted()) return this.endSpeak(text, pcmBytesOut, true); // barge-in: stop publishing the now-stale reply mid-stream
       if (!sock || pcm.length === 0) continue;
       for (const chunk of chunkPcm(pcm)) {
-        if (this.opts.isAborted()) return this.abortSpeak(); // barge-in between chunks → go silent immediately (don't send more)
+        if (this.opts.isAborted()) return this.endSpeak(text, pcmBytesOut, true); // barge-in between chunks → go silent immediately (don't send more)
         // playoutStartMs anchors the pacing window to the FIRST frame of the TURN, not of this sentence — with a
         // per-sentence anchor every sentence would be allowed a fresh `ttsLeadMs` of run-ahead and the buffer
         // would deepen sentence by sentence, re-introducing the ~700 ms post-abort tail #34 removed.
@@ -131,7 +158,7 @@ export class SpeechSession {
           }
           if (aheadMs > this.opts.ttsLeadMs) {
             await delay(aheadMs - this.opts.ttsLeadMs); // let the buffer drain back down to the lead
-            if (this.opts.isAborted()) return this.abortSpeak(); // barge-in DURING the pacing wait → stop before the next chunk
+            if (this.opts.isAborted()) return this.endSpeak(text, pcmBytesOut, true); // barge-in DURING the pacing wait → stop before the next chunk
           }
         }
         const seq = this.opts.nextSeq();
@@ -150,7 +177,7 @@ export class SpeechSession {
         this.tsTicks += Math.floor(chunk.length / TTS_BYTES_PER_TS_TICK); // advance the clock by this chunk's samples
       }
     }
-    return pcmBytesOut;
+    return this.endSpeak(text, pcmBytesOut, false);
   }
 }
 

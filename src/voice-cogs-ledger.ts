@@ -18,9 +18,7 @@ export interface TurnCogsClose {
   /** Turn wall-time (ms) — the billable quantity. */
   turnWallMs: number;
   /** The turn's speech session (TTS submitted/published counters). Absent when the turn never spoke. */
-  speech?: Pick<SpeechSession, "ttsCharsSubmitted" | "abortedSpeaks" | "pcmBytesOut" | "audioMsPublished">;
-  /** Characters the listener actually HEARD — `acc.spoken.length`, or the full reply on the non-streamed path. */
-  ttsCharsHeard: number;
+  speech?: Pick<SpeechSession, "ttsCharsSubmitted" | "ttsCharsHeard" | "ttsCharsCutMidPiece" | "abortedSpeaks" | "pcmBytesOut" | "audioMsPublished">;
 }
 
 /**
@@ -70,8 +68,9 @@ export class TurnCogsLedger {
     const terms: VoiceTurnCogsTerms = {
       turnWallMs: Math.max(0, c.turnWallMs),
       ttsCharsSubmitted: c.speech?.ttsCharsSubmitted ?? 0,
-      ttsCharsHeard: Math.max(0, c.ttsCharsHeard),
+      ttsCharsHeard: c.speech?.ttsCharsHeard ?? 0,
       ttsAudioMsPublished: c.speech?.audioMsPublished ?? 0,
+      ttsCharsCutMidPiece: c.speech?.ttsCharsCutMidPiece ?? 0,
       ttsAbortedSpeaks: c.speech?.abortedSpeaks ?? 0,
       sttAudioMsSubmitted: this.sttAudioMs,
       sttCalls: this.sttCalls,

@@ -64,28 +64,36 @@ describe("SpeechSession — the submitted-vs-heard seam", () => {
     const terms = new TurnCogsLedger(() => 1_000).closeTurn({
       turnWallMs: 1_000,
       speech: session,
-      ttsCharsHeard: text.length,
     });
     expect(voiceTurnCogs(terms).bargeInWastageChars).toBe(0);
   });
 
-  it("a barge-in makes submitted EXCEED heard — the wastage term becomes visible", async () => {
+  it("a barge-in BEFORE any audio is DEFINITE wastage — submitted, never rendered", async () => {
     // The end-to-end property: real SpeechSession + real ledger + real cost model, and the gap appears without
     // anything in the test computing it. Before P2 there was no counter that could show this at all.
-    const { session } = speechFixture({ abortAfterChunks: 1 });
-    await session.speak("A long sentence that gets cut off part way through by the user.");
-    const terms = new TurnCogsLedger(() => 1_000).closeTurn({
-      turnWallMs: 1_000,
-      speech: session,
-      ttsCharsHeard: 0, // the abort landed before the sentence counted as heard
-    });
-    const cogs = voiceTurnCogs(terms);
-    expect(terms.ttsCharsSubmitted).toBeGreaterThan(terms.ttsCharsHeard);
-    expect(cogs.bargeInWastageChars).toBe(terms.ttsCharsSubmitted);
+    const { session } = speechFixture({ abortAfterChunks: 0 });
+    const text = "A whole sentence the user talks over before a single frame ships.";
+    await session.speak(text);
+    const cogs = voiceTurnCogs(new TurnCogsLedger(() => 1_000).closeTurn({ turnWallMs: 1_000, speech: session }));
+    expect(cogs.bargeInWastageChars).toBe(text.length);
     expect(cogs.bargeInWastageFraction).toBe(1);
-    // Audio DID reach the wire before the abort, so "heard nothing" and "published nothing" are different facts
-    // and the instrument keeps both rather than collapsing them.
-    expect(terms.ttsAudioMsPublished).toBeGreaterThan(0);
+    expect(cogs.bargeInCutMidPieceChars).toBe(0); // nothing was rendered, so nothing is ambiguous
+  });
+
+  it("a barge-in MID-render is counted separately, not folded into definite wastage", async () => {
+    // The honest grey zone. The listener heard part of the sentence, so the codebase counts it heard and
+    // definite wastage is 0 — but the vendor was paid for the whole thing. Reporting 0 and stopping there would
+    // understate silently, so the ambiguous quantity is carried as its own number and the wastage term is a
+    // stated LOWER BOUND. This test exists to stop a later refactor from collapsing the two.
+    const { session } = speechFixture({ abortAfterChunks: 1 });
+    const text = "A long sentence that gets cut off part way through by the user.";
+    await session.speak(text);
+    const terms = new TurnCogsLedger(() => 1_000).closeTurn({ turnWallMs: 1_000, speech: session });
+    const cogs = voiceTurnCogs(terms);
+    expect(terms.ttsAudioMsPublished).toBeGreaterThan(0); // audio really did reach the wire
+    expect(cogs.bargeInWastageChars).toBe(0); // definite wastage: none — it was partly rendered
+    expect(cogs.bargeInCutMidPieceChars).toBe(text.length); // ...but the ambiguity is RECORDED, not dropped
+    expect(terms.ttsAbortedSpeaks).toBe(1);
   });
 
   it("accumulates submitted chars across sentences — D1 calls speak() once per sentence", async () => {
@@ -109,7 +117,7 @@ describe("TurnCogsLedger — the Durable Object term", () => {
     const slices: number[] = [];
     for (const gap of [5_000, 30_000, 1_000]) {
       ref.t += gap;
-      slices.push(ledger.closeTurn({ turnWallMs: 100, ttsCharsHeard: 0 }).doWallMsAttributed);
+      slices.push(ledger.closeTurn({ turnWallMs: 100 }).doWallMsAttributed);
     }
     expect(slices).toEqual([5_000, 30_000, 1_000]);
     expect(slices.reduce((a, b) => a + b, 0)).toBe(ref.t); // == the session's whole life, exactly once
@@ -119,7 +127,7 @@ describe("TurnCogsLedger — the Durable Object term", () => {
     const ref = { t: 0 };
     const ledger = new TurnCogsLedger(clockAt(ref));
     ref.t = 60_000; // a minute of DO life, of which only 4s was a turn
-    const cogs = voiceTurnCogs(ledger.closeTurn({ turnWallMs: 4_000, ttsCharsHeard: 0 }));
+    const cogs = voiceTurnCogs(ledger.closeTurn({ turnWallMs: 4_000 }));
     expect(cogs.idleAmplification).toBe(15); // 15 DO seconds billed per second metered
   });
 
@@ -127,8 +135,8 @@ describe("TurnCogsLedger — the Durable Object term", () => {
     const ref = { t: 0 };
     const ledger = new TurnCogsLedger(clockAt(ref));
     ref.t = 10_000;
-    expect(ledger.closeTurn({ turnWallMs: 1, ttsCharsHeard: 0 }).doWallMsAttributed).toBe(10_000);
-    expect(ledger.closeTurn({ turnWallMs: 1, ttsCharsHeard: 0 }).doWallMsAttributed).toBe(0);
+    expect(ledger.closeTurn({ turnWallMs: 1 }).doWallMsAttributed).toBe(10_000);
+    expect(ledger.closeTurn({ turnWallMs: 1 }).doWallMsAttributed).toBe(0);
   });
 
   it("cumulative age is reported alongside the slice, and only ever grows", async () => {
@@ -137,7 +145,7 @@ describe("TurnCogsLedger — the Durable Object term", () => {
     const seen: number[] = [];
     for (const gap of [1_000, 1_000, 1_000]) {
       ref.t += gap;
-      seen.push(ledger.closeTurn({ turnWallMs: 1, ttsCharsHeard: 0 }).doAliveMsCumulative);
+      seen.push(ledger.closeTurn({ turnWallMs: 1 }).doAliveMsCumulative);
     }
     expect(seen).toEqual([1_000, 2_000, 3_000]);
   });
@@ -147,7 +155,7 @@ describe("TurnCogsLedger — the STT term", () => {
   it("counts SUBMITTED audio ms, converted from the exact buffer POSTed", () => {
     const ledger = new TurnCogsLedger(() => 0);
     ledger.recordStt(PCM_BYTES_PER_MS * 2_500); // 2.5 s of audio
-    const terms = ledger.closeTurn({ turnWallMs: 1, ttsCharsHeard: 0 });
+    const terms = ledger.closeTurn({ turnWallMs: 1 });
     expect(terms.sttAudioMsSubmitted).toBe(2_500);
     expect(terms.sttCalls).toBe(1);
   });
@@ -157,16 +165,16 @@ describe("TurnCogsLedger — the STT term", () => {
     // with conversation length, which is the shape most likely to be mistaken for a real cost trend.
     const ledger = new TurnCogsLedger(() => 0);
     ledger.recordStt(PCM_BYTES_PER_MS * 1_000);
-    ledger.closeTurn({ turnWallMs: 1, ttsCharsHeard: 0 });
+    ledger.closeTurn({ turnWallMs: 1 });
     ledger.recordStt(PCM_BYTES_PER_MS * 500);
-    expect(ledger.closeTurn({ turnWallMs: 1, ttsCharsHeard: 0 }).sttAudioMsSubmitted).toBe(500);
+    expect(ledger.closeTurn({ turnWallMs: 1 }).sttAudioMsSubmitted).toBe(500);
   });
 
   it("ignores a non-positive buffer rather than recording a phantom call", () => {
     const ledger = new TurnCogsLedger(() => 0);
     ledger.recordStt(0);
     ledger.recordStt(-1);
-    const terms = ledger.closeTurn({ turnWallMs: 1, ttsCharsHeard: 0 });
+    const terms = ledger.closeTurn({ turnWallMs: 1 });
     expect(terms.sttCalls).toBe(0);
     expect(terms.sttAudioMsSubmitted).toBe(0);
   });
@@ -176,7 +184,7 @@ describe("TurnCogsLedger — the STT term", () => {
     // silent turn would look like an instrument failure — and instrument failures that are indistinguishable
     // from real data are how the original dead meter survived seven weeks.
     const ledger = new TurnCogsLedger(() => 0);
-    const cogs = voiceTurnCogs(ledger.closeTurn({ turnWallMs: 500, ttsCharsHeard: 0 }));
+    const cogs = voiceTurnCogs(ledger.closeTurn({ turnWallMs: 500 }));
     expect(cogs.provenance).toBe("unpriced"); // quantities fine; only the RATES are missing
     expect(cogs.provenance).not.toBe("invalid");
   });

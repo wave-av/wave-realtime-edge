@@ -98,7 +98,7 @@ export interface TurnMeterWho {
 }
 
 /** The per-turn facts the caller holds. `speech` carries both the TTS counters and the TTFA receipt. */
-export interface TurnMeterFacts extends Pick<TurnCogsClose, "ttsCharsHeard"> {
+export interface TurnMeterFacts {
   userText: string;
   assistant: string;
   toolsUsed: number;
@@ -134,7 +134,7 @@ export async function meterFinishedTurn(
     pcmBytesOut: t.speech.pcmBytesOut,
     startMs: t.startMs,
     firstAudioMs: t.speech.firstAudioMs,
-    cogs: who.ledger.closeTurn({ turnWallMs, speech: t.speech, ttsCharsHeard: t.ttsCharsHeard }),
+    cogs: who.ledger.closeTurn({ turnWallMs, speech: t.speech }),
     cogsRates: who.rates,
   });
 }

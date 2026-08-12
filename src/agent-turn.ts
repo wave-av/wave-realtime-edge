@@ -395,7 +395,7 @@ export class TurnTakingCore {
           stage = "tts";
           const tail = chunker.flush(); // the trailing partial sentence the boundary policy held back
           if (tail.length > 0 && (await speech.speak(tail)) < 0) return; // aborted mid-tail: history already valid
-          await this.logMeter(userText, assistant, toolsUsed, turnId, startMs, speech, acc.spoken.length);
+          await this.logMeter(userText, assistant, toolsUsed, turnId, startMs, speech);
           return;
         }
         for await (const evt of this.deps.complete([...working], toolDefs)) {
@@ -420,7 +420,7 @@ export class TurnTakingCore {
           const speech = this.openSpeech();
           const pcmBytesOut = await speech.speak(assistant);
           if (pcmBytesOut < 0) return; // aborted mid-TTS (already committed history is valid + alternating)
-          await this.logMeter(userText, assistant, toolsUsed, turnId, startMs, speech, assistant.length);
+          await this.logMeter(userText, assistant, toolsUsed, turnId, startMs, speech);
           return;
         }
 
@@ -506,11 +506,10 @@ export class TurnTakingCore {
     turnId: string,
     startMs: number,
     speech: SpeechSession,
-    ttsCharsHeard: number,
   ): Promise<void> {
     const { org, roomId: room, agentId } = this.config;
     const who = { org, room, agentId, ledger: this.cogs, rates: this.cogsRates };
-    await meterFinishedTurn(this.deps, this.idFields(), who, { userText, assistant, toolsUsed, turnId, startMs, speech, ttsCharsHeard });
+    await meterFinishedTurn(this.deps, this.idFields(), who, { userText, assistant, toolsUsed, turnId, startMs, speech });
   }
 
   /**
