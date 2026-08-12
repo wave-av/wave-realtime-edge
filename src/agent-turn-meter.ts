@@ -66,7 +66,7 @@ export async function logTurnMeter(deps: TurnMeterDeps, ids: Record<string, unkn
   // it. `unitCostUsd` is present only when rates were provisioned WITH a source; otherwise `provenance` says
   // `unpriced` and the quantities stand alone, which is an honest half-answer rather than a fabricated whole one.
   const cogs = voiceTurnCogs(m.cogs, m.cogsRates);
-  deps.log("agent-turn-cogs", { ...ids, turnId: m.turnId, ...m.cogs, ...cogs });
+  deps.log("agent-turn-cogs", { ...ids, turnId: m.turnId, turnCompleted: true, ...m.cogs, ...cogs });
   try {
     await deps.emitMeter({
       org: m.org,
@@ -137,4 +137,24 @@ export async function meterFinishedTurn(
     cogs: who.ledger.closeTurn({ turnWallMs, speech: t.speech }),
     cogsRates: who.rates,
   });
+}
+
+/**
+ * Account for a turn that DIED before the clean-completion meter: a barge-in, a mid-stream LLM/TTS error, an
+ * empty reply, the tool cap, or an unexpected tool_use. No billable usage is emitted (an abandoned turn is not
+ * billed today, and a COST instrument must not change billing), but the COGS receipt still lands: the TTS
+ * characters were SUBMITTED, and paid for, whether or not the listener heard them. Skipping these rows would
+ * structurally zero `ttsAbortedSpeaks` and the barge-in wastage term in production, which is precisely the
+ * quantity this epic exists to measure. Synchronous and log-only, so it is safe from a `finally`.
+ */
+export function meterAbandonedTurn(
+  deps: Pick<TurnMeterDeps, "log" | "now">,
+  ids: Record<string, unknown>,
+  who: TurnMeterWho,
+  t: { turnId: string; startMs: number; speech?: TurnCogsClose["speech"] },
+): void {
+  const turnWallMs = deps.now() - t.startMs;
+  const terms = who.ledger.closeTurn({ turnWallMs, speech: t.speech });
+  const cogs = voiceTurnCogs(terms, who.rates);
+  deps.log("agent-turn-cogs", { ...ids, turnId: t.turnId, turnCompleted: false, ...terms, ...cogs });
 }

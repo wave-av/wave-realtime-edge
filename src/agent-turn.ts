@@ -43,7 +43,7 @@ import { decodePacket } from "./encoders/container-adapter.js";
 import { type IngestFraming } from "./agent-ingest-adapter.js";
 import { SpeechSession, streamSpeakSentences, type StreamSpeakAcc } from "./agent-turn-speech.js";
 import { SentenceChunker } from "./sentence-chunker.js";
-import { meterFinishedTurn } from "./agent-turn-meter.js";
+import { meterFinishedTurn, meterAbandonedTurn } from "./agent-turn-meter.js";
 import { TurnCogsLedger } from "./voice-cogs-ledger.js";
 import type { VoiceCogsRates } from "./voice-cogs.js";
 import { Vad, vadConfigFromEnv, type VadConfig, type VadEnv } from "./agent-vad.js";
@@ -331,6 +331,11 @@ export class TurnTakingCore {
     this.vad.markSpeaking();
     const startMs = this.deps.now();
     let stage = "llm";
+    // E0-P2: the turn's speech session, hoisted so the `finally` COGS emit below can read its counters on EVERY
+    // exit. The abandoned exits (barge-in, mid-stream error, empty reply, tool cap, unexpected tool_use) are
+    // exactly the turns that WASTE, so a receipt skipped there would structurally zero the wastage term.
+    let turnSpeech: SpeechSession | undefined;
+    let metered = false;
     try {
       const userMsg: LlmMessage = { role: "user", content: userText };
       // The working history for THIS turn (committed state + this turn's user/assistant/tool messages). Nothing is
@@ -354,7 +359,7 @@ export class TurnTakingCore {
         const toolUses: ToolUse[] = [];
         if (eager) {
           // ── D1 sentence-streaming path (the ONLY iteration — no tools are advertised, so there is no loop) ──
-          const speech = this.openSpeech();
+          const speech = (turnSpeech = this.openSpeech());
           const acc: StreamSpeakAcc = { assistant: "", spoken: "", toolUses: [], aborted: false };
           const chunker = new SentenceChunker();
           try {
@@ -395,6 +400,7 @@ export class TurnTakingCore {
           stage = "tts";
           const tail = chunker.flush(); // the trailing partial sentence the boundary policy held back
           if (tail.length > 0 && (await speech.speak(tail)) < 0) return; // aborted mid-tail: history already valid
+          metered = true;
           await this.logMeter(userText, assistant, toolsUsed, turnId, startMs, speech);
           return;
         }
@@ -417,9 +423,10 @@ export class TurnTakingCore {
           this.messages.push(...working.slice(this.messages.length));
           this.committed = true;
           stage = "tts";
-          const speech = this.openSpeech();
+          const speech = (turnSpeech = this.openSpeech());
           const pcmBytesOut = await speech.speak(assistant);
           if (pcmBytesOut < 0) return; // aborted mid-TTS (already committed history is valid + alternating)
+          metered = true;
           await this.logMeter(userText, assistant, toolsUsed, turnId, startMs, speech);
           return;
         }
@@ -444,6 +451,15 @@ export class TurnTakingCore {
       this.deps.log("agent-turn-error", { stage, ...this.idFields(), message: (e as Error)?.message ?? "unknown" });
     } finally {
       this.turnInFlight = false;
+      // E0-P2: EVERY turn closes the ledger exactly once. A turn that died before the clean-completion meter
+      // still SUBMITTED characters the vendor bills, so it still gets a COGS receipt (log-only, never a billable
+      // emit). Without this, no emitted row could ever carry abortedSpeaks > 0 and the barge-in wastage term
+      // would be structurally ~0 in production: the aborted turns are exactly the ones that waste.
+      if (!metered) {
+        const { org, roomId: room, agentId } = this.config;
+        const who = { org, room, agentId, ledger: this.cogs, rates: this.cogsRates };
+        meterAbandonedTurn(this.deps, this.idFields(), who, { turnId, startMs, speech: turnSpeech });
+      }
     }
   }
 

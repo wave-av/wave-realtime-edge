@@ -271,6 +271,17 @@ describe("D1 — the turn loop speaks sentences DURING the LLM stream", () => {
     // The fake clock ticks once per now() call, so ttfaMs < turnWallMs proves first audio preceded turn end.
     expect(meter.fields.ttfaMs as number).toBeLessThan(meter.fields.turnWallMs as number);
   });
+
+  it("emits EXACTLY ONE agent-turn-cogs receipt per turn, marked turnCompleted, with zero wastage on a clean turn", async () => {
+    const r = rig({ deltas: REPLY });
+    await drive(r.core);
+    const rows = r.logs.filter((l) => l.msg === "agent-turn-cogs");
+    expect(rows).toHaveLength(1); // the ledger closes once per turn, never twice (no double-charged DO ms)
+    expect(rows[0]!.fields.turnCompleted).toBe(true);
+    expect(rows[0]!.fields.ttsAbortedSpeaks).toBe(0);
+    expect(rows[0]!.fields.bargeInWastageChars).toBe(0);
+    expect(rows[0]!.fields.ttsCharsHeard).toBe(rows[0]!.fields.ttsCharsSubmitted);
+  });
 });
 
 describe("D1 — failure modes commit exactly what the listener heard", () => {
@@ -297,6 +308,14 @@ describe("D1 — failure modes commit exactly what the listener heard", () => {
     const partial = r.logs.find((l) => l.msg === "agent-turn-partial-spoken")!;
     expect(partial.fields.reason).toBe("barge-in");
     expect(r.logs.some((l) => l.msg === "agent-turn-meter")).toBe(false); // an aborted turn is not a metered turn
+    // E0-P2: NOT billed, but still COSTED. The barged-in turn is exactly the turn that wastes, so its COGS
+    // receipt must land anyway: sentence 2 was SUBMITTED to the vendor (paid) and never rendered at all.
+    const rows = r.logs.filter((l) => l.msg === "agent-turn-cogs");
+    expect(rows).toHaveLength(1); // once, from the abandoned-turn path only
+    const cogs = rows[0]!;
+    expect(cogs.fields.turnCompleted).toBe(false);
+    expect(cogs.fields.ttsAbortedSpeaks).toBe(1);
+    expect(cogs.fields.bargeInWastageChars).toBe("It is home to about two million people.".length);
   });
 
   it("mid-stream LLM error AFTER audio went out: turn marked FAILED, spoken audio acknowledged in history", async () => {
