@@ -11,7 +11,7 @@ cd harness && npm install
 ```
 
 Creds come from Doppler (`wave/prd`), referenced via env, never logged:
-`CF_CALLS_APP_ID`, `CF_CALLS_APP_SECRET`, `WAVE_REALTIME_INTERNAL_SECRET` (bind seal), and for Leg 3's STT gold layer `WAVE_GATEWAY_URL` + `WAVE_GATEWAY_API_KEY` (a real **customer** key — never the internal service token; no customer-key bypass).
+`CF_CALLS_APP_ID`, `CF_CALLS_APP_SECRET`, `WAVE_INTERNAL_SECRET` (bind seal — the name the deployed worker validates; `WAVE_REALTIME_INTERNAL_SECRET` also exists in Doppler and is NOT the one to use), and for Leg 3's STT gold layer `WAVE_GATEWAY_URL` + `WAVE_GATEWAY_API_KEY` (a real **customer** key — never the internal service token; no customer-key bypass).
 
 ## Legs
 
