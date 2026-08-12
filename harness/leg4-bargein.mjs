@@ -30,16 +30,11 @@ const SFU_BASE = process.env.SFU_API_BASE ?? "https://rtc.live.cloudflare.com/v1
 const EDGE_BASE = process.env.EDGE_BASE ?? "https://rt.wave.online";
 const APP_ID = process.env.CF_CALLS_APP_ID ?? "";
 const APP_SECRET = process.env.CF_CALLS_APP_SECRET ?? "";
-// The bind seal MUST be the secret the DEPLOYED WORKER validates, which is `WAVE_INTERNAL_SECRET`
-// (`src/agent-session.ts:403`, `src/dispatch-helpers.ts` — the gate on `/v1/realtime/*`). This harness read
-// `WAVE_REALTIME_INTERNAL_SECRET` instead, and BOTH names exist in Doppler `wave/prd`, so the value resolved
-// fine and the seal was simply signed with a secret the worker never checks against → `bind failed: 401`.
-// That is why the first-ever CI run (wave-foundation `voice-floor-benchmark`, 2026-08-12) reached
-// `pub-rtp sent:100` — the CF SFU creds were always correct — and then died at the bind.
+// The bind seal MUST be WAVE_INTERNAL_SECRET, the secret the deployed worker validates (src/agent-session.ts,
+// src/dispatch-helpers.ts). No fallback to the legacy WAVE_REALTIME_INTERNAL_SECRET (also present in Doppler):
+// signing with it 401s, so if only the old name is set we stop loud and name the mismatch. Full history in
+// CHANGELOG.md and PR #359.
 const SEAL = process.env.WAVE_INTERNAL_SECRET ?? "";
-// Deliberately NOT a fallback to the old name. Falling back would re-sign with the wrong secret and 401 again,
-// which is the failure mode this fix exists to remove — a silent degrade to a value that cannot work is worse
-// than a loud stop naming the mismatch.
 if (!SEAL && process.env.WAVE_REALTIME_INTERNAL_SECRET) {
   console.log(JSON.stringify({
     t: new Date().toISOString(),
