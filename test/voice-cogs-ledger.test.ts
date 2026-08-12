@@ -96,6 +96,34 @@ describe("SpeechSession — the submitted-vs-heard seam", () => {
     expect(terms.ttsAbortedSpeaks).toBe(1);
   });
 
+  it("a synthesize/send THROW mid-piece still credits audio already on the wire as HEARD", async () => {
+    // The throw path is the THIRD exit from speak(). streamSpeakSentences treats a piece whose bytes advanced
+    // before the failure as heard and commits it to history; if the ledger skipped the same accounting, those
+    // characters would read as definite wastage and the cost row would disagree with the history beside it.
+    const sent: unknown[] = [];
+    const sock: IngestSocket = { send: (d: unknown) => sent.push(d), close: () => {} } as unknown as IngestSocket;
+    const session = new SpeechSession(
+      {
+        synthesize: async function* () {
+          yield CHUNK();
+          throw new Error("tts died mid-stream");
+        },
+        ingestSocket: () => sock,
+        now: () => 0,
+        delay: async () => {},
+        log: () => {},
+      },
+      { ttsLeadMs: 0, framing: "raw", isAborted: () => false, nextSeq: () => 1, idFields: () => ({}) },
+    );
+    const text = "A sentence the listener partly heard before TTS died.";
+    await expect(session.speak(text)).rejects.toThrow("tts died mid-stream");
+    expect(sent.length).toBeGreaterThan(0); // audio really did reach the wire before the throw
+    expect(session.ttsCharsHeard).toBe(text.length); // heard, by the codebase's own rule
+    expect(session.abortedSpeaks).toBe(0); // an error is NOT a barge-in
+    const cogs = voiceTurnCogs(new TurnCogsLedger(() => 1_000).closeTurn({ turnWallMs: 1_000, speech: session }));
+    expect(cogs.bargeInWastageChars).toBe(0); // partly delivered ≠ definite wastage
+  });
+
   it("accumulates submitted chars across sentences — D1 calls speak() once per sentence", async () => {
     const { session } = speechFixture();
     await session.speak("One.");

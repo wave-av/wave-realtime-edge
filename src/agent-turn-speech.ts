@@ -135,47 +135,58 @@ export class SpeechSession {
     // E0-P2: count the submit BEFORE the call. The vendor bills this text whether or not a barge-in lands
     // one chunk later, so counting at completion would under-report exactly the turns that waste the most.
     this.ttsCharsSubmitted += text.length;
-    for await (const pcm of this.deps.synthesize(text)) {
-      if (this.opts.isAborted()) return this.endSpeak(text, pcmBytesOut, true); // barge-in: stop publishing the now-stale reply mid-stream
-      if (!sock || pcm.length === 0) continue;
-      for (const chunk of chunkPcm(pcm)) {
-        if (this.opts.isAborted()) return this.endSpeak(text, pcmBytesOut, true); // barge-in between chunks → go silent immediately (don't send more)
-        // playoutStartMs anchors the pacing window to the FIRST frame of the TURN, not of this sentence — with a
-        // per-sentence anchor every sentence would be allowed a fresh `ttsLeadMs` of run-ahead and the buffer
-        // would deepen sentence by sentence, re-introducing the ~700 ms post-abort tail #34 removed.
-        if (this.playoutStartMs === 0) this.playoutStartMs = this.deps.now();
-        if (this.opts.ttsLeadMs > 0) {
-          let aheadMs = this.sentMs - (this.deps.now() - this.playoutStartMs);
-          // UNDERRUN RE-ANCHOR (D1): between sentences the loop stalls on the LLM while wall time keeps running,
-          // so `aheadMs` goes negative by the stall length. Left alone, the gate would stay open until `sentMs`
-          // climbed back past elapsed+lead — publishing a `stallMs + ttsLeadMs` BURST whose depth is exactly the
-          // post-abort tail #34 removed (a barge-in during the burst keeps talking for its whole length). A
-          // negative `aheadMs` means the remote playout underran (drained to empty), so treat it as a playout
-          // RESTART: re-anchor the window to `now - sentMs` and measure the lead from the RESUMED playout.
-          if (aheadMs < 0) {
-            this.playoutStartMs = this.deps.now() - this.sentMs;
-            aheadMs = 0;
+    try {
+      for await (const pcm of this.deps.synthesize(text)) {
+        if (this.opts.isAborted()) return this.endSpeak(text, pcmBytesOut, true); // barge-in: stop publishing the now-stale reply mid-stream
+        if (!sock || pcm.length === 0) continue;
+        for (const chunk of chunkPcm(pcm)) {
+          if (this.opts.isAborted()) return this.endSpeak(text, pcmBytesOut, true); // barge-in between chunks → go silent immediately (don't send more)
+          // playoutStartMs anchors the pacing window to the FIRST frame of the TURN, not of this sentence — with a
+          // per-sentence anchor every sentence would be allowed a fresh `ttsLeadMs` of run-ahead and the buffer
+          // would deepen sentence by sentence, re-introducing the ~700 ms post-abort tail #34 removed.
+          if (this.playoutStartMs === 0) this.playoutStartMs = this.deps.now();
+          if (this.opts.ttsLeadMs > 0) {
+            let aheadMs = this.sentMs - (this.deps.now() - this.playoutStartMs);
+            // UNDERRUN RE-ANCHOR (D1): between sentences the loop stalls on the LLM while wall time keeps running,
+            // so `aheadMs` goes negative by the stall length. Left alone, the gate would stay open until `sentMs`
+            // climbed back past elapsed+lead — publishing a `stallMs + ttsLeadMs` BURST whose depth is exactly the
+            // post-abort tail #34 removed (a barge-in during the burst keeps talking for its whole length). A
+            // negative `aheadMs` means the remote playout underran (drained to empty), so treat it as a playout
+            // RESTART: re-anchor the window to `now - sentMs` and measure the lead from the RESUMED playout.
+            if (aheadMs < 0) {
+              this.playoutStartMs = this.deps.now() - this.sentMs;
+              aheadMs = 0;
+            }
+            if (aheadMs > this.opts.ttsLeadMs) {
+              await delay(aheadMs - this.opts.ttsLeadMs); // let the buffer drain back down to the lead
+              if (this.opts.isAborted()) return this.endSpeak(text, pcmBytesOut, true); // barge-in DURING the pacing wait → stop before the next chunk
+            }
           }
-          if (aheadMs > this.opts.ttsLeadMs) {
-            await delay(aheadMs - this.opts.ttsLeadMs); // let the buffer drain back down to the lead
-            if (this.opts.isAborted()) return this.endSpeak(text, pcmBytesOut, true); // barge-in DURING the pacing wait → stop before the next chunk
-          }
+          const seq = this.opts.nextSeq();
+          // #34 barge-in tail: monotonic 48 kHz RTP timestamp (per-channel sample index). The ingest protocol is a
+          // proto3 Packet{seq,ts,payload} — it has NO flush/control field, so the SFU playout buffer cannot be
+          // flushed out-of-band on abort. The keystone is to make the SFU pace by the MEDIA CLOCK: with a real,
+          // monotonic timestamp the SFU buffer-mode pull emits in lockstep with the timeline and never runs ahead,
+          // so when bargeIn() stops the send the SFU has ~one frame buffered (not an undefined backlog). ts is the
+          // START-of-chunk sample index and CONTINUES ACROSS SENTENCES (D1) — one utterance, one timeline.
+          const wire = encodeIngestFrame(chunk, { sequenceNumber: seq, timestamp: this.tsTicks }, this.opts.framing);
+          sock.send(wire);
+          if (this.firstAudioMs < 0) this.firstAudioMs = this.deps.now(); // TTFA receipt: first frame ON THE WIRE
+          pcmBytesOut += chunk.length;
+          this.pcmBytesOut += chunk.length;
+          this.sentMs += chunk.length / TTS_BYTES_PER_MS;
+          this.tsTicks += Math.floor(chunk.length / TTS_BYTES_PER_TS_TICK); // advance the clock by this chunk's samples
         }
-        const seq = this.opts.nextSeq();
-        // #34 barge-in tail: monotonic 48 kHz RTP timestamp (per-channel sample index). The ingest protocol is a
-        // proto3 Packet{seq,ts,payload} — it has NO flush/control field, so the SFU playout buffer cannot be
-        // flushed out-of-band on abort. The keystone is to make the SFU pace by the MEDIA CLOCK: with a real,
-        // monotonic timestamp the SFU buffer-mode pull emits in lockstep with the timeline and never runs ahead,
-        // so when bargeIn() stops the send the SFU has ~one frame buffered (not an undefined backlog). ts is the
-        // START-of-chunk sample index and CONTINUES ACROSS SENTENCES (D1) — one utterance, one timeline.
-        const wire = encodeIngestFrame(chunk, { sequenceNumber: seq, timestamp: this.tsTicks }, this.opts.framing);
-        sock.send(wire);
-        if (this.firstAudioMs < 0) this.firstAudioMs = this.deps.now(); // TTFA receipt: first frame ON THE WIRE
-        pcmBytesOut += chunk.length;
-        this.pcmBytesOut += chunk.length;
-        this.sentMs += chunk.length / TTS_BYTES_PER_MS;
-        this.tsTicks += Math.floor(chunk.length / TTS_BYTES_PER_TS_TICK); // advance the clock by this chunk's samples
       }
+    } catch (e) {
+      // The THROW exit. A synthesize()/send() failure mid-piece must route through the SAME accounting as the
+      // other two exits: audio already on the wire was HEARD — the exact rule `streamSpeakSentences` applies to
+      // history on this same error path — so skipping `endSpeak` here would report a partly-delivered piece as
+      // definite wastage and put the ledger in disagreement with the history it sits beside. NOT a barge-in:
+      // `abortedSpeaks` and the mid-cut grey zone stay barge-in-only (aborted=false), and the rethrow itself is
+      // the record of this piece's failure — the caller attributes it (`errorStage: "tts"`) and abandons the turn.
+      this.endSpeak(text, pcmBytesOut, false);
+      throw e;
     }
     return this.endSpeak(text, pcmBytesOut, false);
   }
