@@ -116,6 +116,18 @@ export interface TurnMeterFacts extends Pick<TurnCogsClose, "ttsCharsHeard"> {
  * Turn wall-time is computed HERE, from the same clock the ledger uses, so the turn's billable minutes and its
  * `idleAmplification` denominator can never come from two different clocks.
  */
+export function meterFailedTurn(
+  deps: TurnMeterDeps,
+  ids: Record<string, unknown>,
+  who: TurnMeterWho,
+  turnId: string,
+  startMs: number,
+  speech?: TurnCogsClose["speech"],
+): void {
+  const cogs = who.ledger.closeTurn({ turnWallMs: deps.now() - startMs, speech, ttsCharsHeard: 0 });
+  deps.log("agent-turn-cogs", { ...ids, turnId, ...cogs, ...voiceTurnCogs(cogs, who.rates) });
+}
+
 export async function meterFinishedTurn(
   deps: TurnMeterDeps,
   ids: Record<string, unknown>,

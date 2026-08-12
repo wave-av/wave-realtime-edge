@@ -43,7 +43,7 @@ import { decodePacket } from "./encoders/container-adapter.js";
 import { type IngestFraming } from "./agent-ingest-adapter.js";
 import { SpeechSession, streamSpeakSentences, type StreamSpeakAcc } from "./agent-turn-speech.js";
 import { SentenceChunker } from "./sentence-chunker.js";
-import { meterFinishedTurn } from "./agent-turn-meter.js";
+import { meterFailedTurn, meterFinishedTurn } from "./agent-turn-meter.js";
 import { TurnCogsLedger } from "./voice-cogs-ledger.js";
 import type { VoiceCogsRates } from "./voice-cogs.js";
 import { Vad, vadConfigFromEnv, type VadConfig, type VadEnv } from "./agent-vad.js";
@@ -266,6 +266,7 @@ export class TurnTakingCore {
    */
   async onFrame(frame: Uint8Array): Promise<void> {
     let stage = "decode";
+    let handedToTurn = false;
     try {
       const pkt = decodePacket(frame);
       if (pkt.payload.length === 0) return; // keep-alive / empty
@@ -297,9 +298,12 @@ export class TurnTakingCore {
       if (!stt.isFinal) return; // a future STREAMING STT may emit partials behind this same seam; v1 batch ⇒ final
       const userText = stt.transcript.trim();
       if (userText.length === 0) return; // silence / nothing recognized → no turn
+      handedToTurn = true;
       await this.runTurn(userText);
     } catch (e) {
       this.deps.log("agent-turn-error", { stage, message: (e as Error)?.message ?? "unknown" });
+    } finally {
+      if (!handedToTurn) this.cogs.resetStt();
     }
   }
 
@@ -331,6 +335,8 @@ export class TurnTakingCore {
     this.vad.markSpeaking();
     const startMs = this.deps.now();
     let stage = "llm";
+    let activeSpeech: SpeechSession | undefined;
+    let accounted = false;
     try {
       const userMsg: LlmMessage = { role: "user", content: userText };
       // The working history for THIS turn (committed state + this turn's user/assistant/tool messages). Nothing is
@@ -354,7 +360,7 @@ export class TurnTakingCore {
         const toolUses: ToolUse[] = [];
         if (eager) {
           // ── D1 sentence-streaming path (the ONLY iteration — no tools are advertised, so there is no loop) ──
-          const speech = this.openSpeech();
+          const speech = (activeSpeech = this.openSpeech());
           const acc: StreamSpeakAcc = { assistant: "", spoken: "", toolUses: [], aborted: false };
           const chunker = new SentenceChunker();
           try {
@@ -396,6 +402,7 @@ export class TurnTakingCore {
           const tail = chunker.flush(); // the trailing partial sentence the boundary policy held back
           if (tail.length > 0 && (await speech.speak(tail)) < 0) return; // aborted mid-tail: history already valid
           await this.logMeter(userText, assistant, toolsUsed, turnId, startMs, speech, acc.spoken.length);
+          accounted = true;
           return;
         }
         for await (const evt of this.deps.complete([...working], toolDefs)) {
@@ -417,10 +424,11 @@ export class TurnTakingCore {
           this.messages.push(...working.slice(this.messages.length));
           this.committed = true;
           stage = "tts";
-          const speech = this.openSpeech();
+          const speech = (activeSpeech = this.openSpeech());
           const pcmBytesOut = await speech.speak(assistant);
           if (pcmBytesOut < 0) return; // aborted mid-TTS (already committed history is valid + alternating)
           await this.logMeter(userText, assistant, toolsUsed, turnId, startMs, speech, assistant.length);
+          accounted = true;
           return;
         }
 
@@ -443,6 +451,9 @@ export class TurnTakingCore {
     } catch (e) {
       this.deps.log("agent-turn-error", { stage, ...this.idFields(), message: (e as Error)?.message ?? "unknown" });
     } finally {
+      if (!accounted) {
+        meterFailedTurn(this.deps, this.idFields(), { org: this.config.org, room: this.config.roomId, agentId: this.config.agentId, ledger: this.cogs, rates: this.cogsRates }, turnId, startMs, activeSpeech);
+      }
       this.turnInFlight = false;
     }
   }

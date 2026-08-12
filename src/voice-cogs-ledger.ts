@@ -58,6 +58,19 @@ export class TurnCogsLedger {
     this.sttCalls += 1;
   }
 
+  /** Drop an STT submission that did not become a turn (for example an empty transcript). */
+  resetStt(): void {
+    this.sttAudioMs = 0;
+    this.sttCalls = 0;
+  }
+
+  /** Read and clear STT quantities for a terminal turn attempt. */
+  takeStt(): { audioMs: number; calls: number } {
+    const stt = { audioMs: this.sttAudioMs, calls: this.sttCalls };
+    this.resetStt();
+    return stt;
+  }
+
   /**
    * Close a turn: emit its measured terms and advance the DO mark. Called once per metered turn.
    *
