@@ -7,6 +7,8 @@
  * field (time-to-first-audio), which is the receipt the sentence-streaming fix is measured by.
  */
 import type { VoiceTurnUsage } from "./voice-meter.js";
+import { voiceTurnCogs, type VoiceCogsRates, type VoiceTurnCogsTerms } from "./voice-cogs.js";
+import type { TurnCogsLedger, TurnCogsClose } from "./voice-cogs-ledger.js";
 
 /** The deps this needs: the structured logger, the (fail-open) usage emit, and the clock. */
 export interface TurnMeterDeps {
@@ -24,10 +26,20 @@ export interface TurnMeterInput {
   assistant: string;
   toolsUsed: number;
   pcmBytesOut: number;
-  /** Turn start (deps.now() at the top of runTurn). */
+  /** Turn start (deps.now() at the top of runTurn). Kept for `ttfaMs`; NOT re-read against the clock here. */
   startMs: number;
+  /**
+   * Turn wall-time, computed ONCE by the caller from a single `deps.now()` read — the same value handed to
+   * `TurnCogsLedger.closeTurn`. Recomputing it here would put the billable minutes and the ledger's
+   * `idleAmplification` denominator on two different clock reads.
+   */
+  turnWallMs: number;
   /** deps.now() when the FIRST audio frame hit the wire, or -1 if nothing was published. */
   firstAudioMs: number;
+  /** E0-P2 — this turn's measured COGS quantities (from `TurnCogsLedger.closeTurn`). */
+  cogs: VoiceTurnCogsTerms;
+  /** E0-P2 — vendor rates, if any are provisioned. Absent ⇒ quantities are reported `unpriced`, never guessed. */
+  cogsRates?: VoiceCogsRates;
 }
 
 /**
@@ -40,7 +52,7 @@ export interface TurnMeterInput {
  * -1 means nothing was published (no ingest socket, or the turn died before any audio).
  */
 export async function logTurnMeter(deps: TurnMeterDeps, ids: Record<string, unknown>, m: TurnMeterInput): Promise<void> {
-  const turnWallMs = deps.now() - m.startMs;
+  const turnWallMs = m.turnWallMs;
   deps.log("agent-turn-meter", {
     ...ids,
     turnId: m.turnId,
@@ -51,6 +63,16 @@ export async function logTurnMeter(deps: TurnMeterDeps, ids: Record<string, unkn
     turnWallMs,
     ttfaMs: m.firstAudioMs < 0 ? -1 : m.firstAudioMs - m.startMs,
   });
+  // E0-P2 — the COGS receipt, on its OWN event and deliberately NOT on the billable line.
+  //
+  // These are COST quantities, not customer usage. Adding them to the usage envelope would make them look like
+  // billable dimensions to every downstream reader of the gateway's raw-usage plane, and inventing a billable
+  // identity is the exact mistake this epic already corrected once (R25: `voice_agent_minutes` must not become a
+  // catalog meter). The billable line stays exactly one thing — turn wall-minutes — and cost is observed beside
+  // it. `unitCostUsd` is present only when rates were provisioned WITH a source; otherwise `provenance` says
+  // `unpriced` and the quantities stand alone, which is an honest half-answer rather than a fabricated whole one.
+  const cogs = voiceTurnCogs(m.cogs, m.cogsRates);
+  deps.log("agent-turn-cogs", { ...ids, turnId: m.turnId, turnCompleted: true, ...m.cogs, ...cogs });
   try {
     await deps.emitMeter({
       org: m.org,
@@ -68,4 +90,96 @@ export async function logTurnMeter(deps: TurnMeterDeps, ids: Record<string, unkn
     // from this event alone.
     deps.log("agent-turn-meter-error", { ...ids, turnId: m.turnId, message: (e as Error)?.message ?? "unknown" });
   }
+}
+
+/** Who the turn belongs to, plus the session-scoped state the per-turn accounting reads. */
+export interface TurnMeterWho {
+  org: string;
+  room: string;
+  agentId: string;
+  /** E0-P2 session ledger — closed exactly once per metered turn (it advances the DO mark). */
+  ledger: TurnCogsLedger;
+  /** E0-P2 vendor rates, if provisioned. */
+  rates?: VoiceCogsRates;
+}
+
+/** The per-turn facts the caller holds. `speech` carries both the TTS counters and the TTFA receipt. */
+export interface TurnMeterFacts {
+  userText: string;
+  assistant: string;
+  toolsUsed: number;
+  turnId: string;
+  /** Turn start (the core's `now()` at the top of runTurn). */
+  startMs: number;
+  speech: NonNullable<TurnCogsClose["speech"]> & { firstAudioMs: number };
+}
+
+/**
+ * Account for one finished turn: close the COGS ledger, then hand everything to `logTurnMeter`.
+ *
+ * This lives here rather than in agent-turn.ts because "account for a finished turn" is this file's one job, and
+ * agent-turn.ts is past the token tier of the two-tier file-size gate — where the rule is DECOMPOSE, never trim.
+ * Turn wall-time is computed HERE, from the same clock the ledger uses, so the turn's billable minutes and its
+ * `idleAmplification` denominator can never come from two different clocks.
+ */
+export async function meterFinishedTurn(
+  deps: TurnMeterDeps,
+  ids: Record<string, unknown>,
+  who: TurnMeterWho,
+  t: TurnMeterFacts,
+): Promise<void> {
+  const turnWallMs = deps.now() - t.startMs;
+  await logTurnMeter(deps, ids, {
+    org: who.org,
+    room: who.room,
+    agentId: who.agentId,
+    turnId: t.turnId,
+    userText: t.userText,
+    assistant: t.assistant,
+    toolsUsed: t.toolsUsed,
+    pcmBytesOut: t.speech.pcmBytesOut,
+    startMs: t.startMs,
+    turnWallMs,
+    firstAudioMs: t.speech.firstAudioMs,
+    cogs: who.ledger.closeTurn({ turnWallMs, speech: t.speech }),
+    cogsRates: who.rates,
+  });
+}
+
+/**
+ * Account for a turn that DIED before the clean-completion meter: a barge-in, a mid-stream LLM/TTS error, an
+ * empty reply, the tool cap, or an unexpected tool_use. No billable usage is emitted (an abandoned turn is not
+ * billed today, and a COST instrument must not change billing), but the COGS receipt still lands: the TTS
+ * characters were SUBMITTED, and paid for, whether or not the listener heard them. Skipping these rows would
+ * structurally zero `ttsAbortedSpeaks` and the barge-in wastage term in production, which is precisely the
+ * quantity this epic exists to measure. Synchronous and log-only, so it is safe from a `finally`.
+ */
+export function meterAbandonedTurn(
+  deps: Pick<TurnMeterDeps, "log" | "now">,
+  ids: Record<string, unknown>,
+  who: TurnMeterWho,
+  t: { turnId: string; startMs: number; speech?: TurnCogsClose["speech"] },
+): void {
+  const turnWallMs = deps.now() - t.startMs;
+  const terms = who.ledger.closeTurn({ turnWallMs, speech: t.speech });
+  const cogs = voiceTurnCogs(terms, who.rates);
+  deps.log("agent-turn-cogs", { ...ids, turnId: t.turnId, turnCompleted: false, ...terms, ...cogs });
+}
+
+/**
+ * Account for the SESSION's terminal slice at teardown: the DO wall-clock since the last closed turn, plus any
+ * STT that never became a turn. Sessions usually END idle, so skipping this would drop the final idle window —
+ * the exact cost shape this epic opened on — and the ledger's slices would sum to session duration only up to
+ * the last turn. Quantities only, on their own event: this is a remainder receipt, not a turn, so it carries no
+ * TTS terms and no pricing (fabricating a zeroed turn row here would violate "never zero what was not measured").
+ * Idempotent (the ledger closes once); synchronous and log-only, so it is safe from any teardown path.
+ */
+export function meterSessionClose(
+  deps: Pick<TurnMeterDeps, "log">,
+  ids: Record<string, unknown>,
+  who: Pick<TurnMeterWho, "ledger">,
+): void {
+  const terminal = who.ledger.closeSession();
+  if (!terminal) return; // already closed — a double teardown must not re-charge the tail
+  deps.log("agent-session-cogs", { ...ids, ...terminal });
 }

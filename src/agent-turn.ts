@@ -43,7 +43,9 @@ import { decodePacket } from "./encoders/container-adapter.js";
 import { type IngestFraming } from "./agent-ingest-adapter.js";
 import { SpeechSession, streamSpeakSentences, type StreamSpeakAcc } from "./agent-turn-speech.js";
 import { SentenceChunker } from "./sentence-chunker.js";
-import { logTurnMeter } from "./agent-turn-meter.js";
+import { meterFinishedTurn, meterAbandonedTurn, meterSessionClose } from "./agent-turn-meter.js";
+import { TurnCogsLedger } from "./voice-cogs-ledger.js";
+import type { VoiceCogsRates } from "./voice-cogs.js";
 import { Vad, vadConfigFromEnv, type VadConfig, type VadEnv } from "./agent-vad.js";
 import {
   ToolAllowlist,
@@ -216,6 +218,10 @@ export class TurnTakingCore {
   private readonly ttsLeadMs: number;
   /** D1: this turn already spliced its history commit (full OR spoken-prefix). Guarantees at-most-once. */
   private committed = false;
+  /** E0-P2 — the session's COGS ledger (DO wall-clock + STT submitted audio). Lives in its own module. */
+  private readonly cogs: TurnCogsLedger;
+  /** E0-P2 — vendor rates, if provisioned. Absent ⇒ the COGS receipt reports `unpriced` rather than a guess. */
+  private readonly cogsRates?: VoiceCogsRates;
 
   constructor(
     deps: AgentTurnDeps & AgentMediaDeps,
@@ -229,6 +235,8 @@ export class TurnTakingCore {
       maxToolIterations?: number;
       /** Step-4: TTS send-ahead lead (ms) for real-time pacing → interruptible playout (default DEFAULT_TTS_LEAD_MS). */
       ttsLeadMs?: number;
+      /** E0-P2: vendor COGS rates. Omitted ⇒ quantities are measured and reported UNPRICED (never estimated). */
+      cogsRates?: VoiceCogsRates;
     },
   ) {
     this.deps = deps;
@@ -236,6 +244,8 @@ export class TurnTakingCore {
     this.framing = opts?.framing ?? "packet";
     this.messages = [{ role: "system", content: buildTurnSystemPrompt(config) }];
     this.vad = new Vad(opts?.vad);
+    this.cogs = new TurnCogsLedger(() => this.deps.now());
+    this.cogsRates = opts?.cogsRates;
     this.ttsLeadMs = typeof opts?.ttsLeadMs === "number" && opts.ttsLeadMs >= 0 ? Math.floor(opts.ttsLeadMs) : DEFAULT_TTS_LEAD_MS;
     this.tools = opts?.tools ?? new ToolAllowlist([]);
     this.maxToolIterations =
@@ -281,6 +291,7 @@ export class TurnTakingCore {
       this.deps.log("agent-vad-endpoint", { ...this.idFields(), rms: Math.round(this.vad.lastFrameRms) });
       stage = "stt";
       const pcm = concat(this.utterance);
+      this.cogs.recordStt(pcm.length); // E0-P2: what the STT vendor bills is the buffer we POST, padding included
       this.resetUtterance(); // the utterance ended at speech-end — consume it regardless of the STT outcome
       const stt = await this.deps.transcribe(pcm);
       if (!stt.isFinal) return; // a future STREAMING STT may emit partials behind this same seam; v1 batch ⇒ final
@@ -320,6 +331,11 @@ export class TurnTakingCore {
     this.vad.markSpeaking();
     const startMs = this.deps.now();
     let stage = "llm";
+    // E0-P2: the turn's speech session, hoisted so the `finally` COGS emit below can read its counters on EVERY
+    // exit. The abandoned exits (barge-in, mid-stream error, empty reply, tool cap, unexpected tool_use) are
+    // exactly the turns that WASTE, so a receipt skipped there would structurally zero the wastage term.
+    let turnSpeech: SpeechSession | undefined;
+    let metered = false;
     try {
       const userMsg: LlmMessage = { role: "user", content: userText };
       // The working history for THIS turn (committed state + this turn's user/assistant/tool messages). Nothing is
@@ -343,7 +359,7 @@ export class TurnTakingCore {
         const toolUses: ToolUse[] = [];
         if (eager) {
           // ── D1 sentence-streaming path (the ONLY iteration — no tools are advertised, so there is no loop) ──
-          const speech = this.openSpeech();
+          const speech = (turnSpeech = this.openSpeech());
           const acc: StreamSpeakAcc = { assistant: "", spoken: "", toolUses: [], aborted: false };
           const chunker = new SentenceChunker();
           try {
@@ -384,7 +400,8 @@ export class TurnTakingCore {
           stage = "tts";
           const tail = chunker.flush(); // the trailing partial sentence the boundary policy held back
           if (tail.length > 0 && (await speech.speak(tail)) < 0) return; // aborted mid-tail: history already valid
-          await this.logMeter(userText, assistant, toolsUsed, speech.pcmBytesOut, startMs, turnId, speech.firstAudioMs);
+          metered = true;
+          await this.logMeter(userText, assistant, toolsUsed, turnId, startMs, speech);
           return;
         }
         for await (const evt of this.deps.complete([...working], toolDefs)) {
@@ -406,10 +423,11 @@ export class TurnTakingCore {
           this.messages.push(...working.slice(this.messages.length));
           this.committed = true;
           stage = "tts";
-          const speech = this.openSpeech();
+          const speech = (turnSpeech = this.openSpeech());
           const pcmBytesOut = await speech.speak(assistant);
           if (pcmBytesOut < 0) return; // aborted mid-TTS (already committed history is valid + alternating)
-          await this.logMeter(userText, assistant, toolsUsed, pcmBytesOut, startMs, turnId, speech.firstAudioMs);
+          metered = true;
+          await this.logMeter(userText, assistant, toolsUsed, turnId, startMs, speech);
           return;
         }
 
@@ -433,6 +451,15 @@ export class TurnTakingCore {
       this.deps.log("agent-turn-error", { stage, ...this.idFields(), message: (e as Error)?.message ?? "unknown" });
     } finally {
       this.turnInFlight = false;
+      // E0-P2: EVERY turn closes the ledger exactly once. A turn that died before the clean-completion meter
+      // still SUBMITTED characters the vendor bills, so it still gets a COGS receipt (log-only, never a billable
+      // emit). Without this, no emitted row could ever carry abortedSpeaks > 0 and the barge-in wastage term
+      // would be structurally ~0 in production: the aborted turns are exactly the ones that waste.
+      if (!metered) {
+        const { org, roomId: room, agentId } = this.config;
+        const who = { org, room, agentId, ledger: this.cogs, rates: this.cogsRates };
+        meterAbandonedTurn(this.deps, this.idFields(), who, { turnId, startMs, speech: turnSpeech });
+      }
     }
   }
 
@@ -487,33 +514,27 @@ export class TurnTakingCore {
     });
   }
 
-  /**
-   * Structured-log the honest per-turn counts AND emit the real `voice_agent_minutes` usage to the gateway
-   * (step 7). The emit is FAIL-OPEN: it is awaited inside a try/catch so a metering error (or a thrown fake)
-   * is logged and swallowed — it NEVER breaks the turn or drops media. The live `emitMeter` (buildTurnDeps)
-   * mirrors src/metering.ts (POST /v1/internal/usage). turnWallMs drives the billable fractional minutes.
-   */
+  /** Account for a finished turn (counts + E0-P2 COGS + the billable emit). Body: agent-turn-meter.ts. */
   private async logMeter(
     userText: string,
     assistant: string,
     toolsUsed: number,
-    pcmBytesOut: number,
-    startMs: number,
     turnId: string,
-    firstAudioMs: number,
+    startMs: number,
+    speech: SpeechSession,
   ): Promise<void> {
-    await logTurnMeter(this.deps, this.idFields(), {
-      org: this.config.org,
-      room: this.config.roomId,
-      agentId: this.config.agentId,
-      turnId,
-      userText,
-      assistant,
-      toolsUsed,
-      pcmBytesOut,
-      startMs,
-      firstAudioMs,
-    });
+    const { org, roomId: room, agentId } = this.config;
+    const who = { org, room, agentId, ledger: this.cogs, rates: this.cogsRates };
+    await meterFinishedTurn(this.deps, this.idFields(), who, { userText, assistant, toolsUsed, turnId, startMs, speech });
+  }
+
+  /**
+   * E0-P2 — session-end receipt: flush the FINAL idle DO slice (last closed turn → teardown, plus any STT that
+   * never became a turn) as one `agent-session-cogs` line. Idempotent and log-only (agent-turn-meter.ts), so it
+   * is safe to call from any teardown path, any number of times.
+   */
+  closeSession(): void {
+    meterSessionClose(this.deps, this.idFields(), { ledger: this.cogs });
   }
 
   /**
