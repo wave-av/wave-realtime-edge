@@ -551,18 +551,21 @@ bucket_name = "wave-realtime-recordings-canary"
 # meetingId→org map — MUST be a DISTINCT namespace from the top-level (prod) binding above: this same
 # binding now also backs the #278 egress kill-switch/cost-guard registry (egress-killswitch.ts), so sharing
 # the prod id here would let canary egress arm/disarm mutate PROD kill-switch + concurrency-cap state.
-# ◆ NOT YET CREATED — no canary-specific RT_MEETING_ORG namespace exists in this repo/account today. Do NOT
-# reuse the prod id as a stopgap. Before canary carries any egress-guarded traffic, create one:
-#   wrangler kv namespace create RT_MEETING_ORG_CANARY   (same CF account as the prod namespace, d674452f)
-# and paste its id below. Until then this id is a placeholder and canary deploys of this binding will fail
-# closed (structurally invalid id) rather than silently sharing prod state — intentional, not an oversight.
+# CREATED 2026-08-13 as `wave-realtime-edge-canary-RT_MEETING_ORG` — and it is DISTINCT from the prod id
+# above (canary 8a1adad9…, prod 4acd6ec7…), which is the property this whole comment exists to protect.
+# Minted through the governed path, NOT by hand: wave-foundation's `provision-kv-namespace.yml`
+# (workflow_dispatch, run 31731783720). That workflow exists because minting needs a CF token with
+# `Workers KV Storage:Edit`, which the Doppler wave/prd token does not carry and which a PUBLIC repo's CI
+# cannot reach — the reason this line sat as a literal `TODO-` placeholder long enough that the first
+# person to actually use the canary hit it (wave-av/claude-workstation#2888). Re-dispatching is safe: a
+# second run REUSED this same id rather than minting a duplicate (run 31731858205), and >1 namespace
+# sharing a title is refused outright rather than resolved arbitrarily.
 # Inert-for-now note: canary does NOT currently arm routed egress with a cost guard (RT_MEETING_ORG is not
-# read by any canary-only code path beyond the pre-existing WHIP/meeting-lookup reuse below), so the shared
-# id was latent, not actively corrupting prod state as merged — but it must still be split before canary ever
-# carries egress, per the #278 review.
+# read by any canary-only code path beyond the pre-existing WHIP/meeting-lookup reuse below) — but the
+# split is now real rather than pending, per the #278 review.
 [[env.canary.kv_namespaces]]
 binding = "RT_MEETING_ORG"
-id = "TODO-canary-rt-meeting-org"
+id = "8a1adad98b304866b33770cdded9a7ee"
 
 # FOUNDATION_VERSION — restated because wrangler does NOT inherit `unsafe` into an [env.*] block; without
 # this, `deploy --env canary` warns `Please add "unsafe" to "env.canary"` and the canary worker ships WITHOUT
