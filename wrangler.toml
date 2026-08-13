@@ -540,10 +540,21 @@ RT_ADAPTER_MAX_ATTEMPTS = "14"
 # would make the canary's SFU push media at the prod worker (foreign session/token -> create-adapter 503). Pin
 # it to the canary's OWN workers.dev host so the SFU dials the SAME worker that signed the capability token.
 RECORDER_PUBLIC_WSS = "wss://wave-realtime-edge-canary.jakefineman.workers.dev/v1/realtime/recorder"
+# #81 step-4 barge-in tuning, restated for canary/prod FIDELITY (named envs do NOT inherit top-level [vars]).
+# Read ONLY by the voice-agent TTS path (speak() pacing), which cannot run here: VOICE_AGENT_PROVIDER is
+# deliberately NOT set on the canary, so voiceAgentEnabled(env)=false and /v1/realtime/agents/* still falls
+# through to the honest 501 catch-all. This value is therefore INERT — it is here so that IF Jake names the
+# canary voice-agent crossing, the canary rehearses prod's tuned 30ms lead instead of the code default 150.
+AGENT_TTS_LEAD_MS = "30"
 
 # Canary recordings bucket — a DISTINCT bucket so canary recordings never mix with prod. Created in the deploy
 # step (`wrangler r2 bucket create wave-realtime-recordings-canary`); --dry-run tolerates a not-yet-existing
-# bucket. RT_RESIDENCY is unset, so RT_RECORDINGS_ENAM/EU are NOT needed (and not restated) on the canary.
+# bucket. RT_RESIDENCY is unset ON THE CANARY, so RT_RECORDINGS_ENAM/EU/APAC/SAM are NOT needed (and not
+# restated) here. Read that precisely: RT_RESIDENCY = "1" IS armed at the TOP LEVEL (line ~63, #127) — it is
+# unset here only because named envs do NOT inherit top-level [vars]. `wrangler deploy --env canary` therefore
+# WARNS that the four residency buckets are missing; that warning is EXPECTED and must be left unfixed.
+# Restating those buckets (or the flag) would arm multi-region storage on a canary — a Jake-named ◆ crossing.
+# test/wrangler-inert.test.ts asserts the canary never sets RT_RESIDENCY, which is what keeps this true.
 [[env.canary.r2_buckets]]
 binding = "RT_RECORDINGS"
 bucket_name = "wave-realtime-recordings-canary"
@@ -591,3 +602,18 @@ max_instances = 3
 [[env.canary.durable_objects.bindings]]
 name = "RECORDER"
 class_name = "RecorderContainer"
+
+# ── #81 AGENT_SESSION DO — restated for canary/prod FIDELITY. SHIPS FULLY INERT. ──
+# `wrangler deploy --env canary` (run 31735320178) warned AGENT_SESSION was a top-level binding absent from
+# env.canary, because durable_objects config is NOT inherited by named envs. A canary whose bindings differ
+# from prod is not a rehearsal of prod, so it is restated here — the same reason FOUNDATION_VERSION is.
+# INERT, and here is the exact mechanism: the /v1/realtime/agents/* dispatch + egress routes are gated by
+# voiceAgentEnabled(env), which requires VOICE_AGENT_PROVIDER="wave". That var is deliberately NOT set on the
+# canary (arming it in any live env is a Jake-named ◆ crossing — see the top-level note at line ~231), so this
+# binding resolves the class and nothing more; an agents request still falls through to the honest 501
+# catch-all in worker.ts. Binding a DO does not construct it — no instance exists until a route reaches it.
+# No container, no image build, no new secret: AgentSessionDO is a plain SQLite-backed DO, and migration v3
+# (new_sqlite_classes = ["AgentSessionDO"]) is top-level, which named envs DO inherit — so it resolves here.
+[[env.canary.durable_objects.bindings]]
+name = "AGENT_SESSION"
+class_name = "AgentSessionDO"
