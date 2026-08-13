@@ -564,6 +564,16 @@ bucket_name = "wave-realtime-recordings-canary"
 binding = "RT_MEETING_ORG"
 id = "TODO-canary-rt-meeting-org"
 
+# FOUNDATION_VERSION — restated because wrangler does NOT inherit `unsafe` into an [env.*] block; without
+# this, `deploy --env canary` warns `Please add "unsafe" to "env.canary"` and the canary worker ships WITHOUT
+# a binding prod has. A canary whose bindings differ from prod is not a rehearsal of prod, which is the only
+# thing a canary is for — so this is restated for FIDELITY, not because the value matters. Keep in lockstep
+# with the top-level [[unsafe.bindings]] block.
+[[env.canary.unsafe.bindings]]
+type = "plain_text"
+name = "FOUNDATION_VERSION"
+text = "scaffold"
+
 # ROOM DO — restated so the canary worker boots (room.ts RoomDO; migrations v1 inherited from top level).
 [[env.canary.durable_objects.bindings]]
 name = "ROOM"
