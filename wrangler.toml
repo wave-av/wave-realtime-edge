@@ -540,10 +540,44 @@ RT_ADAPTER_MAX_ATTEMPTS = "14"
 # would make the canary's SFU push media at the prod worker (foreign session/token -> create-adapter 503). Pin
 # it to the canary's OWN workers.dev host so the SFU dials the SAME worker that signed the capability token.
 RECORDER_PUBLIC_WSS = "wss://wave-realtime-edge-canary.jakefineman.workers.dev/v1/realtime/recorder"
+# #81 step-4 barge-in tuning, restated for canary/prod FIDELITY (named envs do NOT inherit top-level [vars]).
+# Read ONLY by the voice-agent TTS path (speak() pacing), which cannot run here: VOICE_AGENT_PROVIDER is
+# deliberately NOT set on the canary, so voiceAgentEnabled(env)=false and /v1/realtime/agents/* still falls
+# through to the honest 501 catch-all. This value is therefore INERT — it is here so that IF Jake names the
+# canary voice-agent crossing, the canary rehearses prod's tuned 30ms lead instead of the code default 150.
+AGENT_TTS_LEAD_MS = "30"
+
+# ── 4b — the three DEFAULT-OFF guards, restated EXPLICITLY as "0". ──
+# Behaviourally these are no-ops: absent and "0" mean the same thing to the code. They are written down
+# because absent and "0" do NOT mean the same thing to a READER. Every one of these is ◆-gated in prod, so
+# a blank where a guard should be is indistinguishable from an oversight — and the next person "closing the
+# canary/prod gap" would close it by copying prod's value. Stated as "0", the canary's position is a decision.
+EGRESS_ROUTER_ENABLED = "0"      # INERT — arming is a ◆ Jake crossing (#75; the ARM slice wires the RoomDO)
+EGRESS_DEST_MGMT_ENABLED = "0"   # INERT — arming is a ◆ Jake crossing (needs DEST_KEY_ENCRYPTION_KEY)
+E3N_AUTORECORD_ENABLED = "0"     # INERT — arming is a ◆ Jake crossing (needs retention #7 + the VOD meter SKU)
+
+# CONTAINER_HEALTH_ALARM_ENABLED (#234) — armed to match prod. READ-ONLY by construction: one authenticated
+# GET of the container-applications list per */15 cron tick, no mutation of anything, and inert without
+# CF_API_TOKEN/CF_ACCOUNT_ID. It watches the `active > 0 && healthy == 0` wedge signature that once took out
+# stream bridging account-wide while every other telemetry reading stayed green. Safe on a canary precisely
+# because it only ever reads. NOTE: the list it polls is ACCOUNT-WIDE, so canary and prod now observe the
+# same state independently — a second opinion on the same signal, not a second source of truth.
+CONTAINER_HEALTH_ALARM_ENABLED = "1"
+
+# NOT restated here: WHIP_SWEEP_ENABLED. It is prod-armed "1", and 4b as filed lists it as a no-crossing
+# restatement — but it EMITS BILLING. The sweeper bills WHIP sessions the SFU reports GONE, and the canary
+# already points GATEWAY_BASE_URL at the PROD gateway (api.wave.online) with the real WAVE_SERVICE_TOKEN.
+# Arming it here means canary test traffic writes real usage rows against prod. That is a metering decision,
+# not a fidelity restatement, so it is held for Jake — see the note on RT_RESIDENCY below for the same shape.
 
 # Canary recordings bucket — a DISTINCT bucket so canary recordings never mix with prod. Created in the deploy
 # step (`wrangler r2 bucket create wave-realtime-recordings-canary`); --dry-run tolerates a not-yet-existing
-# bucket. RT_RESIDENCY is unset, so RT_RECORDINGS_ENAM/EU are NOT needed (and not restated) on the canary.
+# bucket. RT_RESIDENCY is unset ON THE CANARY, so RT_RECORDINGS_ENAM/EU/APAC/SAM are NOT needed (and not
+# restated) here. Read that precisely: RT_RESIDENCY = "1" IS armed at the TOP LEVEL (line ~63, #127) — it is
+# unset here only because named envs do NOT inherit top-level [vars]. `wrangler deploy --env canary` therefore
+# WARNS that the four residency buckets are missing; that warning is EXPECTED and must be left unfixed.
+# Restating those buckets (or the flag) would arm multi-region storage on a canary — a Jake-named ◆ crossing.
+# test/wrangler-inert.test.ts asserts the canary never sets RT_RESIDENCY, which is what keeps this true.
 [[env.canary.r2_buckets]]
 binding = "RT_RECORDINGS"
 bucket_name = "wave-realtime-recordings-canary"
@@ -551,18 +585,31 @@ bucket_name = "wave-realtime-recordings-canary"
 # meetingId→org map — MUST be a DISTINCT namespace from the top-level (prod) binding above: this same
 # binding now also backs the #278 egress kill-switch/cost-guard registry (egress-killswitch.ts), so sharing
 # the prod id here would let canary egress arm/disarm mutate PROD kill-switch + concurrency-cap state.
-# ◆ NOT YET CREATED — no canary-specific RT_MEETING_ORG namespace exists in this repo/account today. Do NOT
-# reuse the prod id as a stopgap. Before canary carries any egress-guarded traffic, create one:
-#   wrangler kv namespace create RT_MEETING_ORG_CANARY   (same CF account as the prod namespace, d674452f)
-# and paste its id below. Until then this id is a placeholder and canary deploys of this binding will fail
-# closed (structurally invalid id) rather than silently sharing prod state — intentional, not an oversight.
+# CREATED 2026-08-13 as `wave-realtime-edge-canary-RT_MEETING_ORG` — and it is DISTINCT from the prod id
+# above (canary 8a1adad9…, prod 4acd6ec7…), which is the property this whole comment exists to protect.
+# Minted through the governed path, NOT by hand: wave-foundation's `provision-kv-namespace.yml`
+# (workflow_dispatch, run 31731783720). That workflow exists because minting needs a CF token with
+# `Workers KV Storage:Edit`, which the Doppler wave/prd token does not carry and which a PUBLIC repo's CI
+# cannot reach — the reason this line sat as a literal `TODO-` placeholder long enough that the first
+# person to actually use the canary hit it (wave-av/claude-workstation#2888). Re-dispatching is safe: a
+# second run REUSED this same id rather than minting a duplicate (run 31731858205), and >1 namespace
+# sharing a title is refused outright rather than resolved arbitrarily.
 # Inert-for-now note: canary does NOT currently arm routed egress with a cost guard (RT_MEETING_ORG is not
-# read by any canary-only code path beyond the pre-existing WHIP/meeting-lookup reuse below), so the shared
-# id was latent, not actively corrupting prod state as merged — but it must still be split before canary ever
-# carries egress, per the #278 review.
+# read by any canary-only code path beyond the pre-existing WHIP/meeting-lookup reuse below) — but the
+# split is now real rather than pending, per the #278 review.
 [[env.canary.kv_namespaces]]
 binding = "RT_MEETING_ORG"
-id = "TODO-canary-rt-meeting-org"
+id = "8a1adad98b304866b33770cdded9a7ee"
+
+# FOUNDATION_VERSION — restated because wrangler does NOT inherit `unsafe` into an [env.*] block; without
+# this, `deploy --env canary` warns `Please add "unsafe" to "env.canary"` and the canary worker ships WITHOUT
+# a binding prod has. A canary whose bindings differ from prod is not a rehearsal of prod, which is the only
+# thing a canary is for — so this is restated for FIDELITY, not because the value matters. Keep in lockstep
+# with the top-level [[unsafe.bindings]] block.
+[[env.canary.unsafe.bindings]]
+type = "plain_text"
+name = "FOUNDATION_VERSION"
+text = "scaffold"
 
 # ROOM DO — restated so the canary worker boots (room.ts RoomDO; migrations v1 inherited from top level).
 [[env.canary.durable_objects.bindings]]
@@ -578,3 +625,39 @@ max_instances = 3
 [[env.canary.durable_objects.bindings]]
 name = "RECORDER"
 class_name = "RecorderContainer"
+
+# ── #81 AGENT_SESSION DO — restated for canary/prod FIDELITY. SHIPS FULLY INERT. ──
+# `wrangler deploy --env canary` (run 31735320178) warned AGENT_SESSION was a top-level binding absent from
+# env.canary, because durable_objects config is NOT inherited by named envs. A canary whose bindings differ
+# from prod is not a rehearsal of prod, so it is restated here — the same reason FOUNDATION_VERSION is.
+# INERT, and here is the exact mechanism: the /v1/realtime/agents/* dispatch + egress routes are gated by
+# voiceAgentEnabled(env), which requires VOICE_AGENT_PROVIDER="wave". That var is deliberately NOT set on the
+# canary (arming it in any live env is a Jake-named ◆ crossing — see the top-level note at line ~231), so this
+# binding resolves the class and nothing more; an agents request still falls through to the honest 501
+# catch-all in worker.ts. Binding a DO does not construct it — no instance exists until a route reaches it.
+# No container, no image build, no new secret: AgentSessionDO is a plain SQLite-backed DO, and migration v3
+# (new_sqlite_classes = ["AgentSessionDO"]) is top-level, which named envs DO inherit — so it resolves here.
+[[env.canary.durable_objects.bindings]]
+name = "AGENT_SESSION"
+class_name = "AgentSessionDO"
+
+# ── 4c (PARTIAL) — ZOOM_RTMS_BRIDGE DO. Bound; both of its flags deliberately withheld. ──
+# Same zero-cost shape as AGENT_SESSION above: ZoomRtmsBridgeDO is a plain SQLite-backed DO, and its
+# migration v5 (new_sqlite_classes = ["ZoomRtmsBridgeDO"]) is top-level, which named envs DO inherit.
+#
+# cw#2888 files 4c as "the DO + WAVE_ZOOM_RTMS + WAVE_RTMS_PER_PARTICIPANT, as one unit, owner: agent".
+# Landing only the binding SPLITS that unit on purpose, because the unit as filed cannot be agent-owned:
+#
+#   1. WAVE_ZOOM_RTMS's own comment (line ~210) reads "Arming this flag in a live env is a Jake-named ◆
+#      crossing". Its receiver is HMAC-verified and fail-closed, but the flag is still ◆ by declaration.
+#   2. WAVE_RTMS_PER_PARTICIPANT fans out through the MoqPublishContainer DO (MOQ_PUBLISH) — which is NOT
+#      bound on this canary and belongs to slice 4d, the parked container/spend decision. Arming it here
+#      would point a live code path at a binding that does not exist: EXACTLY the "boots, then fails at the
+#      first call into a missing DO" failure that #2888 was written to prevent. 4c is not independent of 4d.
+#
+# Binding without arming is the safe direction of that coupling. A bound-but-unreached DO is inert; a flag
+# armed against a missing DO is a latent 500. With both flags absent, POST /zoom/rtms still falls through to
+# the honest 501 catch-all, and this binding only means the class resolves if Jake ever names the crossing.
+[[env.canary.durable_objects.bindings]]
+name = "ZOOM_RTMS_BRIDGE"
+class_name = "ZoomRtmsBridgeDO"

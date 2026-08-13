@@ -18,7 +18,7 @@
 // bargeSwap() call — ffmpeg spawn latency (~100-300ms) would otherwise inflate the measurement.
 //
 // Run: doppler run --project wave --config prd -- node harness/leg4-bargein.mjs
-// Needs: CF_CALLS_APP_ID, CF_CALLS_APP_SECRET, WAVE_REALTIME_INTERNAL_SECRET (bind). Secrets referenced, never logged.
+// Needs: CF_CALLS_APP_ID, CF_CALLS_APP_SECRET, WAVE_INTERNAL_SECRET (bind seal — the name the worker validates). Secrets referenced, never logged.
 
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -30,7 +30,20 @@ const SFU_BASE = process.env.SFU_API_BASE ?? "https://rtc.live.cloudflare.com/v1
 const EDGE_BASE = process.env.EDGE_BASE ?? "https://rt.wave.online";
 const APP_ID = process.env.CF_CALLS_APP_ID ?? "";
 const APP_SECRET = process.env.CF_CALLS_APP_SECRET ?? "";
-const SEAL = process.env.WAVE_REALTIME_INTERNAL_SECRET ?? "";
+// The bind seal MUST be WAVE_INTERNAL_SECRET, the secret the deployed worker validates (src/agent-session.ts,
+// src/dispatch-helpers.ts). No fallback to the legacy WAVE_REALTIME_INTERNAL_SECRET (also present in Doppler):
+// signing with it 401s, so if only the old name is set we stop loud and name the mismatch. Full history in
+// CHANGELOG.md and PR #359.
+const SEAL = process.env.WAVE_INTERNAL_SECRET ?? "";
+if (!SEAL && process.env.WAVE_REALTIME_INTERNAL_SECRET) {
+  console.log(JSON.stringify({
+    t: new Date().toISOString(),
+    msg: "LEG4-FATAL",
+    error: "WAVE_REALTIME_INTERNAL_SECRET is set but WAVE_INTERNAL_SECRET is not — the bind seal must be the " +
+      "secret the deployed worker validates (WAVE_INTERNAL_SECRET). Signing with the other one 401s.",
+  }));
+  process.exit(1);
+}
 
 const ORG = process.env.HARNESS_ORG ?? "harness";
 const ROOM = process.env.HARNESS_ROOM ?? `room-barge-${Date.now()}`;
@@ -43,7 +56,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 if (!/^[0-9a-f]{32,}$/i.test(APP_ID)) die("CF_CALLS_APP_ID missing");
 if (!APP_SECRET) die("CF_CALLS_APP_SECRET missing");
-if (!SEAL) die("WAVE_REALTIME_INTERNAL_SECRET missing (bind seal)");
+if (!SEAL) die("WAVE_INTERNAL_SECRET missing (bind seal — the secret the deployed worker validates)");
 
 async function bindAgent({ sessionId, trackName }) {
   const res = await fetch(`${EDGE_BASE}/v1/realtime/agents/bind`, {

@@ -10,9 +10,9 @@
 
 </div>
 
-> This README is machine-generated from WAVE's grounded Single Source of Truth — every
-> factual claim below traces to a resolver that `npm run verify` checks against the live
-> repo and live endpoints. Nothing here is asserted without a receipt.
+> The status claims below trace to the shipped `wrangler.toml` feature flags and
+> `src/route-dispatch.ts` route table at the pinned revision — flip a flag and the status
+> here is wrong. When in doubt, the code is the receipt.
 
 ---
 
@@ -23,7 +23,7 @@ npm install
 ```
 
 ```bash
-npx wrangler dev      # local dev (health only until substrate lands)
+npx wrangler dev      # local dev (full route surface)
 npm run typecheck
 npm run test          # contract tests (vitest)
 npm run deploy        # wrangler deploy
@@ -31,9 +31,22 @@ npm run deploy        # wrangler deploy
 
 ## Status
 
-Early scaffold. The Worker serves /health; all other routes return 501 REALTIME_NOT_IMPLEMENTED. The substrate decision — custom SFU on Workers + Durable Objects vs. LiveKit — is Wave-1 work and not yet made.
+**Live.** The substrate decision is made and shipped: a **custom SFU on Cloudflare Realtime (Calls) + a per-room Durable Object** — `SfuClient` (`src/sfu.ts`) is the media plane, `RoomDO` (`src/room.ts`) is the control plane (`/v1/realtime/rooms/{room}/{intent}`). Not LiveKit.
 
-An OpenAPI 3.1 spec (docs/api/openapi.yaml) and contract test suite exist and are passing (#10/#12); the runtime implementation is the open work.
+| Surface | Path | Status |
+| --- | --- | --- |
+| Interactive rooms (join/publish/subscribe/renegotiate/leave) | `/v1/realtime/rooms/{room}/{intent}` | **Live** — RoomDO substrate |
+| WHIP v1 ingest (publish WebRTC) | `/v1/whip/publish` · `/v1/whip/resource/{id}` | **Live** (armed 2026-06-24) |
+| WHEP v1 egress (subscribe WebRTC) | `/v1/whep/subscribe` · `/v1/whep/resource/{id}` | **Live** (armed 2026-07-01) |
+| CF Stream → SFU bridge | `/v1/stream/bridge/webhook` | **Live** (armed 2026-06-26) |
+| Voice agents | `/v1/realtime/agents/*` | **Live** (`VOICE_AGENT_PROVIDER=wave`, armed 2026-06-25) |
+| Recording (managed PULL) | `/rtk/recording-webhook` | **Live** (`RT_RECORD=1`, `RT_ENCODER=managed`) |
+| Routed ingest router | `/v1/realtime/ingress/{protocol}/{intent}` | **Live** — `whip` only; `rtmp`/`srt`/`url` return 501 (need a VM listener) |
+| Routed egress router (wave-render/RunPod/Stream) | `EGRESS_ROUTER_ENABLED` | **Inert** — backends built, not armed |
+| Room presence WebSocket | `/v1/realtime/rooms/{room}/presence` | **Inert** — `PRESENCE_ENABLED` off |
+| Multi-region cascade | `RT_CASCADE` | **Inert** — single-region today |
+
+An OpenAPI 3.1 spec (`docs/api/openapi.yaml`) and a 200+ file contract test suite run on every PR.
 
 Like Stripe is for payments and Resend is for email — WAVE is for live streaming and video. This spoke is the interactive media layer: 2-way N-N calls and voice agents, the complement to wave-moq-edge (1-to-many broadcast).
 
@@ -50,7 +63,7 @@ Like Stripe is for payments and Resend is for email — WAVE is for live streami
 
 ```text
 browser ──WebRTC──▶ wave-realtime-edge (this spoke)
-                      │  edge SFU · CF Workers + DOs (substrate TBD)
+                      │  edge SFU · Cloudflare Realtime (Calls) + per-room Durable Object
                       │  /api/* → api.wave.online (gateway-enforced)
                       ▼
                   the WAVE API gateway → auth · scope · meter
@@ -59,53 +72,55 @@ browser ──WebRTC──▶ wave-realtime-edge (this spoke)
 ## See also
 
 docs/api/openapi.yaml — OpenAPI 3.1 contract (passing contract tests)
-docs/REALTIME.md — substrate decision notes
+docs/REALTIME.md — realtime API surface and substrate notes
 threat-model.md, SECURITY.md, CONTRIBUTING.md
 
 ## Capabilities
 
 | Capability | Status |
 | --- | --- |
-| Unconditional liveness check, GET /health, no auth | ![ga](https://img.shields.io/badge/ga-brightgreen?style=flat-square) |
-| WebSocket room presence/state-sync at /v1/realtime/rooms/{room}/presence | ![scaffolded](https://img.shields.io/badge/scaffolded-orange?style=flat-square) |
-| Custom SFU on a Cloudflare Durable Object (ROOM binding) for multi-party media | ![preview](https://img.shields.io/badge/preview-blue?style=flat-square) |
-| IETF WHEP v1 egress: POST /v1/whep/subscribe, PATCH/DELETE /v1/whep/resource/{id} | ![preview](https://img.shields.io/badge/preview-blue?style=flat-square) |
-| IETF WHIP v1 ingest: POST /v1/whip/publish, PATCH/DELETE /v1/whip/resource/{id} | ![preview](https://img.shields.io/badge/preview-blue?style=flat-square) |
+| Interactive rooms via RoomDO: join/publish/subscribe/renegotiate/leave at /v1/realtime/rooms/{room}/{intent} | ![live](https://img.shields.io/badge/live-brightgreen?style=flat-square) |
+| Custom SFU on Cloudflare Realtime (Calls): SfuClient media plane | ![live](https://img.shields.io/badge/live-brightgreen?style=flat-square) |
+| IETF WHEP v1 egress: POST /v1/whep/subscribe, PATCH/DELETE /v1/whep/resource/{id} | ![live](https://img.shields.io/badge/live-brightgreen?style=flat-square) |
+| IETF WHIP v1 ingest: POST /v1/whip/publish, PATCH/DELETE /v1/whip/resource/{id} | ![live](https://img.shields.io/badge/live-brightgreen?style=flat-square) |
+| CF Stream → SFU bridge webhook at /v1/stream/bridge/webhook | ![live](https://img.shields.io/badge/live-brightgreen?style=flat-square) |
+| Voice agents at /v1/realtime/agents/* (VOICE_AGENT_PROVIDER=wave) | ![live](https://img.shields.io/badge/live-brightgreen?style=flat-square) |
+| Managed PULL recording (RT_RECORD=1, RT_ENCODER=managed) | ![live](https://img.shields.io/badge/live-brightgreen?style=flat-square) |
+| Unconditional liveness check, GET /health, no auth | ![live](https://img.shields.io/badge/live-brightgreen?style=flat-square) |
+| Routed egress router (wave-render / RunPod NVENC / CF Stream passthrough), EGRESS_ROUTER_ENABLED=0 | ![inert](https://img.shields.io/badge/inert-lightgrey?style=flat-square) |
+| WebSocket room presence/state-sync at /v1/realtime/rooms/{room}/presence, PRESENCE_ENABLED off | ![inert](https://img.shields.io/badge/inert-lightgrey?style=flat-square) |
+| Multi-region cascade relays, RT_CASCADE off (single-region today) | ![inert](https://img.shields.io/badge/inert-lightgrey?style=flat-square) |
 
 ## API
 
 | Method | Path | Does |
 | --- | --- | --- |
 | `GET` | `/health` | Liveness check, no auth |
+| `GET` | `/` | Branded landing page |
+| `POST` | `/rtk/join` | RealtimeKit meeting create + participant token mint |
+| `POST` | `/rtk/turn` | TURN/ICE credential mint (WebRTC NAT traversal) |
+| `POST` | `/rtk/recording-webhook` | Recording status update (managed PULL puller) — public by design; self-authenticates via the `rtk-signature` header (RSA-SHA256), no bearer |
+| `POST` | `/v1/realtime/rooms/{room}/{intent}` | Room signaling: join/publish/subscribe/renegotiate/leave (RoomDO) |
 | `POST` | `/v1/whip/publish` | WHIP ingest offer handshake -&gt; 201 + SDP answer |
 | `PATCH` | `/v1/whip/resource/{id}` | WHIP trickle-ICE candidate update |
 | `DELETE` | `/v1/whip/resource/{id}` | WHIP teardown, stops the ingest meter |
 | `POST` | `/v1/whep/subscribe` | WHEP egress offer handshake -&gt; 201 + SDP answer |
 | `PATCH` | `/v1/whep/resource/{id}` | WHEP trickle-ICE candidate update |
 | `DELETE` | `/v1/whep/resource/{id}` | WHEP teardown, stops the egress meter |
-| `GET` | `/v1/realtime/rooms/{room}/presence` | WebSocket upgrade for room presence/state-sync (PRESENCE_ENABLED gated) |
+| `POST` | `/v1/stream/bridge/webhook` | CF Stream → SFU bridge receiver (HMAC-verified) |
+| `POST` | `/v1/realtime/agents/{intent}` | Voice agent bind/info (VOICE_AGENT_PROVIDER=wave) |
+| `POST` | `/v1/realtime/ingress/{protocol}/{intent}` | Routed ingest create/delete (`whip` live; `rtmp`/`srt`/`url` return 501) |
+| `GET` | `/v1/realtime/rooms/{room}/presence` | WebSocket upgrade for room presence/state-sync (PRESENCE_ENABLED gated, inert) |
 
 ## Transports
 
 | Transport | Direction | Status |
 | --- | --- | --- |
-| WHIP | in | ![preview](https://img.shields.io/badge/preview-blue?style=flat-square) |
-| WHEP | out | ![preview](https://img.shields.io/badge/preview-blue?style=flat-square) |
-| presence-websocket | bidir | ![scaffolded](https://img.shields.io/badge/scaffolded-orange?style=flat-square) |
-
-## The receipts
-
-Every claim below is checked by `npm run verify` against the live repo or endpoint — a non-`pass` verdict fails the gate.
-
-| Claim | How it's verified |
-| --- | --- |
-| Protocol requests carry a wave-token-v1 Bearer token, forwarded untouched to the gateway | resolved by grepping `docs/REALTIME.md` |
-| Worker is routed on the custom domain rt.wave.online | resolved by grepping `wrangler.toml` |
-| Publishes rtc.session.opened and rtc.session.closed as x402-metered events | resolved by grepping `capabilities.json` |
-| Presence route is gated by PRESENCE_ENABLED, which is absent from wrangler.toml (default off) | resolved by grepping `src/dispatch-helpers.ts` |
-| Repo is tagged protocol-plane-layer-1 in capabilities.json | resolved by grepping `capabilities.json` |
-| WHEP_EGRESS_ENABLED is armed ("1") in the deployed wrangler.toml env | resolved by grepping `wrangler.toml` |
-| WHIP_INGEST_ENABLED is armed ("1") in the deployed wrangler.toml env | resolved by grepping `wrangler.toml` |
+| WHIP | in | ![live](https://img.shields.io/badge/live-brightgreen?style=flat-square) |
+| WHEP | out | ![live](https://img.shields.io/badge/live-brightgreen?style=flat-square) |
+| CF Realtime (Calls) SFU rooms | bidir | ![live](https://img.shields.io/badge/live-brightgreen?style=flat-square) |
+| CF Stream → SFU bridge | in | ![live](https://img.shields.io/badge/live-brightgreen?style=flat-square) |
+| presence-websocket | bidir | ![inert](https://img.shields.io/badge/inert-lightgrey?style=flat-square) |
 
 ## Topics
 
