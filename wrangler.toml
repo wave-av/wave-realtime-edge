@@ -547,6 +547,29 @@ RECORDER_PUBLIC_WSS = "wss://wave-realtime-edge-canary.jakefineman.workers.dev/v
 # canary voice-agent crossing, the canary rehearses prod's tuned 30ms lead instead of the code default 150.
 AGENT_TTS_LEAD_MS = "30"
 
+# ── 4b — the three DEFAULT-OFF guards, restated EXPLICITLY as "0". ──
+# Behaviourally these are no-ops: absent and "0" mean the same thing to the code. They are written down
+# because absent and "0" do NOT mean the same thing to a READER. Every one of these is ◆-gated in prod, so
+# a blank where a guard should be is indistinguishable from an oversight — and the next person "closing the
+# canary/prod gap" would close it by copying prod's value. Stated as "0", the canary's position is a decision.
+EGRESS_ROUTER_ENABLED = "0"      # INERT — arming is a ◆ Jake crossing (#75; the ARM slice wires the RoomDO)
+EGRESS_DEST_MGMT_ENABLED = "0"   # INERT — arming is a ◆ Jake crossing (needs DEST_KEY_ENCRYPTION_KEY)
+E3N_AUTORECORD_ENABLED = "0"     # INERT — arming is a ◆ Jake crossing (needs retention #7 + the VOD meter SKU)
+
+# CONTAINER_HEALTH_ALARM_ENABLED (#234) — armed to match prod. READ-ONLY by construction: one authenticated
+# GET of the container-applications list per */15 cron tick, no mutation of anything, and inert without
+# CF_API_TOKEN/CF_ACCOUNT_ID. It watches the `active > 0 && healthy == 0` wedge signature that once took out
+# stream bridging account-wide while every other telemetry reading stayed green. Safe on a canary precisely
+# because it only ever reads. NOTE: the list it polls is ACCOUNT-WIDE, so canary and prod now observe the
+# same state independently — a second opinion on the same signal, not a second source of truth.
+CONTAINER_HEALTH_ALARM_ENABLED = "1"
+
+# NOT restated here: WHIP_SWEEP_ENABLED. It is prod-armed "1", and 4b as filed lists it as a no-crossing
+# restatement — but it EMITS BILLING. The sweeper bills WHIP sessions the SFU reports GONE, and the canary
+# already points GATEWAY_BASE_URL at the PROD gateway (api.wave.online) with the real WAVE_SERVICE_TOKEN.
+# Arming it here means canary test traffic writes real usage rows against prod. That is a metering decision,
+# not a fidelity restatement, so it is held for Jake — see the note on RT_RESIDENCY below for the same shape.
+
 # Canary recordings bucket — a DISTINCT bucket so canary recordings never mix with prod. Created in the deploy
 # step (`wrangler r2 bucket create wave-realtime-recordings-canary`); --dry-run tolerates a not-yet-existing
 # bucket. RT_RESIDENCY is unset ON THE CANARY, so RT_RECORDINGS_ENAM/EU/APAC/SAM are NOT needed (and not
@@ -617,3 +640,24 @@ class_name = "RecorderContainer"
 [[env.canary.durable_objects.bindings]]
 name = "AGENT_SESSION"
 class_name = "AgentSessionDO"
+
+# ── 4c (PARTIAL) — ZOOM_RTMS_BRIDGE DO. Bound; both of its flags deliberately withheld. ──
+# Same zero-cost shape as AGENT_SESSION above: ZoomRtmsBridgeDO is a plain SQLite-backed DO, and its
+# migration v5 (new_sqlite_classes = ["ZoomRtmsBridgeDO"]) is top-level, which named envs DO inherit.
+#
+# cw#2888 files 4c as "the DO + WAVE_ZOOM_RTMS + WAVE_RTMS_PER_PARTICIPANT, as one unit, owner: agent".
+# Landing only the binding SPLITS that unit on purpose, because the unit as filed cannot be agent-owned:
+#
+#   1. WAVE_ZOOM_RTMS's own comment (line ~210) reads "Arming this flag in a live env is a Jake-named ◆
+#      crossing". Its receiver is HMAC-verified and fail-closed, but the flag is still ◆ by declaration.
+#   2. WAVE_RTMS_PER_PARTICIPANT fans out through the MoqPublishContainer DO (MOQ_PUBLISH) — which is NOT
+#      bound on this canary and belongs to slice 4d, the parked container/spend decision. Arming it here
+#      would point a live code path at a binding that does not exist: EXACTLY the "boots, then fails at the
+#      first call into a missing DO" failure that #2888 was written to prevent. 4c is not independent of 4d.
+#
+# Binding without arming is the safe direction of that coupling. A bound-but-unreached DO is inert; a flag
+# armed against a missing DO is a latent 500. With both flags absent, POST /zoom/rtms still falls through to
+# the honest 501 catch-all, and this binding only means the class resolves if Jake ever names the crossing.
+[[env.canary.durable_objects.bindings]]
+name = "ZOOM_RTMS_BRIDGE"
+class_name = "ZoomRtmsBridgeDO"
