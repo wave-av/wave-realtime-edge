@@ -217,6 +217,19 @@ WAVE_ZOOM_RTMS = "1"
 # live proof (#314).
 WAVE_RTMS_PER_PARTICIPANT = "1"
 
+# ── LK-rip #46 room/session lifecycle event emit → WSC Argus ingest. ARMED "1". ──
+# An ARM FLAG, not a credential: isEmitArmed() (src/event-emitter.ts) is
+# `WAVE_REALTIME_EVENTS_EMIT === "1" && Boolean(WAVE_REALTIME_WEBHOOK_SECRET)`, so the value space is the
+# literal "1" or anything-else, and it carries no secret material. It lived as a `wrangler secret` on the prod
+# worker and in NO Doppler config, which meant the prod worker could not be rebuilt from SSOT for this name —
+# a clean re-provision silently shipped it absent and emission went dark with no signal
+# (wave-foundation#1178). Declaring it here makes the SSOT git, where the other arm flags already live.
+# The real secret of the pair, WAVE_REALTIME_WEBHOOK_SECRET, stays a `wrangler secret` sourced from Doppler:
+# without it this flag is inert on its own, so arming here exposes nothing.
+# NOT restated under [env.canary.vars] — named envs do not inherit top-level [vars], so the canary stays
+# inert, matching how every other arm flag in this file treats the canary.
+WAVE_REALTIME_EVENTS_EMIT = "1"
+
 # ── #82/#114 CASCADE multi-region relay (RT_CASCADE). INERT by default. ──
 # Absent/"0"/"false" → the realtime room path is byte-identical to today: a join routes to the PRIMARY Room
 # DO `idFromName(org:room)` with NO locationHint and NO regional relay. Set RT_CASCADE="1" → a regional join
