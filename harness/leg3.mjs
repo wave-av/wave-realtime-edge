@@ -11,8 +11,8 @@
 //      the agent actually said coherent words back. Prints ttfa (latency proxy) + the transcript.
 //
 // Run: doppler run --project wave --config prd -- node harness/leg3.mjs
-// Needs: CF_CALLS_APP_ID, CF_CALLS_APP_SECRET, WAVE_REALTIME_INTERNAL_SECRET (bind), WAVE_GATEWAY_URL,
-//        WAVE_GATEWAY_API_KEY (customer STT). Secrets are referenced, never logged.
+// Needs: CF_CALLS_APP_ID, CF_CALLS_APP_SECRET, WAVE_INTERNAL_SECRET (bind seal, the name the worker validates),
+//        WAVE_GATEWAY_URL, WAVE_GATEWAY_API_KEY (customer STT). Secrets are referenced, never logged.
 
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -26,7 +26,18 @@ const SFU_BASE = process.env.SFU_API_BASE ?? "https://rtc.live.cloudflare.com/v1
 const EDGE_BASE = process.env.EDGE_BASE ?? "https://rt.wave.online";
 const APP_ID = process.env.CF_CALLS_APP_ID ?? "";
 const APP_SECRET = process.env.CF_CALLS_APP_SECRET ?? "";
-const SEAL = process.env.WAVE_REALTIME_INTERNAL_SECRET ?? "";
+// The bind seal must be WAVE_INTERNAL_SECRET, the secret the deployed worker validates. No fallback to the
+// legacy WAVE_REALTIME_INTERNAL_SECRET: signing with it 401s (see leg4-bargein.mjs).
+const SEAL = process.env.WAVE_INTERNAL_SECRET ?? "";
+if (!SEAL && process.env.WAVE_REALTIME_INTERNAL_SECRET) {
+  console.log(JSON.stringify({
+    t: new Date().toISOString(),
+    msg: "LEG3-FATAL",
+    error: "WAVE_REALTIME_INTERNAL_SECRET is set but WAVE_INTERNAL_SECRET is not: the bind seal must be the " +
+      "secret the deployed worker validates (WAVE_INTERNAL_SECRET). Signing with the other one 401s.",
+  }));
+  process.exit(1);
+}
 const GW_URL = (process.env.WAVE_GATEWAY_URL ?? "").replace(/\/+$/, "");
 const GW_KEY = process.env.WAVE_GATEWAY_API_KEY ?? "";
 
@@ -39,7 +50,7 @@ const die = (m) => { log("LEG3-FATAL", { error: m }); process.exit(1); };
 
 if (!/^[0-9a-f]{32,}$/i.test(APP_ID)) die("CF_CALLS_APP_ID missing");
 if (!APP_SECRET) die("CF_CALLS_APP_SECRET missing");
-if (!SEAL) die("WAVE_REALTIME_INTERNAL_SECRET missing (bind seal)");
+if (!SEAL) die("WAVE_INTERNAL_SECRET missing (bind seal, the secret the deployed worker validates)");
 
 /** Wrap interleaved 16-bit-LE PCM in a minimal WAV container. */
 function wav(pcm, sampleRate, channels) {
