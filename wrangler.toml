@@ -110,6 +110,13 @@ WHEP_EGRESS_ENABLED = "1"   # ◆ ARMED 2026-07-01 (Jake-named: "activate the WH
 # isolation reuses the `stream-input-org:{uid}` KV map (src/stream-bridge.ts).
 USE_CLOUDFLARE_STREAM = "1"  # ◆ ARMED 2026-07-01 — CF Stream WebRTC playback backend live
 
+# ── E-ROOMS P4 (#73) — client presence + state-sync + data channel. DEFAULT OFF → inert ──
+# PRESENCE_ENABLED gates the POST /v1/realtime/rooms/:room/presence surface (src/route-dispatch.ts:387-392,
+# src/dispatch-helpers.ts:122-127). Absent/"0" → the route falls through to the generic :intent handler
+# (501). Arming this is purely additive — presence is matched BEFORE the generic :intent route and changes
+# no existing signaling path.
+PRESENCE_ENABLED = "1"  # ◆ ARMED 2026-08-13 — room presence/state-sync live
+
 # ── #75 E-EGRESS-ROUTER — routed egress. DEFAULT OFF / FULLY INERT. ──
 # EGRESS_ROUTER_ENABLED gates whether the RoomDO instantiates a routed-egress MediaConsumer (#74 tap) and drives it
 # through egressRoute (#75 P1). Absent/"0" → NO egress consumer is attached: the tap fans out to nothing new and the
