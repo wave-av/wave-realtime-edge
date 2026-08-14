@@ -241,6 +241,17 @@ WAVE_RTMS_PER_PARTICIPANT = "1"
 # activate on an explicit agent bind (POST /v1/realtime/agents/bind); live rooms are unaffected until bound.
 VOICE_AGENT_PROVIDER = "wave"
 
+# ── Task #81 tool-calling — VOICE_AGENT_TOOLS, the agent-least-privilege allowlist (agent-tools.ts
+# toolAllowlistFromEnv). Absent/blank/unparseable → EMPTY allowlist (fail-CLOSED: the agent runs text-only,
+# never accidentally exposes a tool). Format is a JSON array of Anthropic ToolDefinition
+# ({name, description, input_schema}) — NOT a comma-separated name list; the runtime hands these definitions
+# straight to the model and, on a matching tool_use, POSTs {name, input} to the gateway's
+# /v1/internal/tools/exec lane (Bearer WAVE_GATEWAY_TOKEN), which re-checks the SAME name against its own
+# VOICE_TOOL_REGISTRY server-side (defense in depth, both fail closed). This one entry mirrors that registry's
+# wave_usage_summary definition verbatim so a voice caller can ask "what's my usage this period" and get a
+# read-only, org-scoped answer (org comes from the authenticated session — never a model-suppliable argument).
+VOICE_AGENT_TOOLS = "[{\"name\":\"wave_usage_summary\",\"description\":\"Read the CALLER'S OWN WAVE usage for the current billing period: per-meter used/limit/overage in the billed unit, plus the org's subscription tier. Read-only; never bills, never mutates. The org is taken from the authenticated session — it cannot be supplied as an argument.\",\"input_schema\":{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false}}]"
+
 # ── #81 step-4 barge-in — TTS real-time send-ahead LEAD (ms). speak() paces the reply to the playout clock so
 # the agent the LISTENER hears is interruptible: turnInFlight spans playout (bargeIn fires mid-reply) and on
 # abort only ≤lead drains. Default in code is 150 (audio-safe); TUNED to 30 here from a live leg4 sweep
