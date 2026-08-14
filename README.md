@@ -35,7 +35,7 @@ npm run deploy        # wrangler deploy
 
 ## Status
 
-Early scaffold. The Worker serves /health; all other routes return 501 REALTIME_NOT_IMPLEMENTED. The media substrate is Wave-1 work.
+Early scaffold. `/health` is public and returns 200. Enabled paid routes (including `/v1/whip/*`, `/v1/whep/*`, and `/rtk/join`) reject direct calls with `401` when the gateway-injected `x-wave-internal` header is missing. Unimplemented or disabled routes fall through to `501 REALTIME_NOT_IMPLEMENTED`. The media substrate is Wave-1 work.
 
 An OpenAPI 3.1 spec (docs/api/openapi.yaml) and contract test suite exist and are passing (#10/#12); the runtime implementation is the open work.
 
@@ -70,11 +70,11 @@ threat-model.md, SECURITY.md, CONTRIBUTING.md
 
 | Capability | Status |
 | --- | --- |
-| Unconditional liveness check, GET /health, no auth | ![ga](https://img.shields.io/badge/ga-brightgreen?style=flat-square) |
-| WebSocket room presence/state-sync at /v1/realtime/rooms/{room}/presence | ![scaffolded](https://img.shields.io/badge/scaffolded-orange?style=flat-square) |
-| Custom SFU on a Cloudflare Durable Object (ROOM binding) for multi-party media | ![preview](https://img.shields.io/badge/preview-blue?style=flat-square) |
-| IETF WHEP v1 egress: POST /v1/whep/subscribe, PATCH/DELETE /v1/whep/resource/{id} | ![preview](https://img.shields.io/badge/preview-blue?style=flat-square) |
-| IETF WHIP v1 ingest: POST /v1/whip/publish, PATCH/DELETE /v1/whip/resource/{id} | ![preview](https://img.shields.io/badge/preview-blue?style=flat-square) |
+| Unconditional liveness check, GET /health, no auth | ![alpha](https://img.shields.io/badge/alpha-lightgrey?style=flat-square) |
+| WebSocket room presence/state-sync at /v1/realtime/rooms/{room}/presence | ![planned](https://img.shields.io/badge/planned-lightgrey?style=flat-square) |
+| Custom SFU on a Cloudflare Durable Object (ROOM binding) for multi-party media | ![planned](https://img.shields.io/badge/planned-lightgrey?style=flat-square) |
+| IETF WHEP v1 egress: POST /v1/whep/subscribe, PATCH/DELETE /v1/whep/resource/{id} | ![planned](https://img.shields.io/badge/planned-lightgrey?style=flat-square) |
+| IETF WHIP v1 ingest: POST /v1/whip/publish, PATCH/DELETE /v1/whip/resource/{id} | ![planned](https://img.shields.io/badge/planned-lightgrey?style=flat-square) |
 
 ## API
 
