@@ -18,7 +18,7 @@
     "@wave-av/spoke-chassis": "^0.14.3"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260613.1",
+    "@cloudflare/workers-types": "^5.0.0",
     "typescript": "^5.9.3",
     "vitest": "^4.1.8",
     "wrangler": "^4.100.0"
