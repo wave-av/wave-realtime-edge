@@ -44,7 +44,44 @@ jobs:
         run: npm ci || npm install
 
       - name: Run contract tests
-        run: npm test
+        # --coverage (see vitest.config.ts) writes ./coverage/lcov.info. Same suite, same
+        # assertions — the flag only adds the V8 report.
+        run: npm run test:coverage
+
+      - name: Upload coverage to Codecov
+        # CODECOV_TOKEN is a REPO-level Actions secret holding this repo's Codecov *upload* token.
+        # Codecov issues two non-interchangeable credentials: the org API/read token authenticates
+        # api.codecov.io, while only the per-repo upload token is accepted here. Least privilege —
+        # a leak of this value only lets someone post coverage to this one repo.
+        #
+        # fail_ci_if_error: true is deliberate. The previous fleet-wide Codecov attempt used
+        # `false` everywhere, which turned every rejected upload into a silent no-op and is the
+        # direct reason nothing was ever ingested across 135 repos. Loud beats invisible.
+        #
+        # if: always() so coverage still uploads when a test fails — a failing PR is exactly when
+        # the coverage delta is most worth seeing.
+        #
+        # This repo is PUBLIC, so the guard also skips fork PRs: GitHub withholds secrets from a
+        # fork's run, which would leave `token` empty and — with fail_ci_if_error true — fail every
+        # external contributor's PR on a step they cannot possibly satisfy. Coverage for the merge
+        # commit is still recorded by the push-to-main run. (These are `if:` expressions evaluated
+        # by the Actions expression engine, never interpolated into a shell.)
+        #
+        # disable_search: true + an explicit `files:` keeps the uploader from walking the tree —
+        # this job writes a .npmrc containing a GitHub Packages token, and it must never be swept
+        # into an upload.
+        if: >-
+          always() &&
+          (github.event_name != 'pull_request' ||
+           github.event.pull_request.head.repo.full_name == github.repository)
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/lcov.info
+          flags: worker
+          name: wave-realtime-edge-worker
+          disable_search: true
+          fail_ci_if_error: true
 
   typecheck:
     name: Typecheck (tsc --noEmit)

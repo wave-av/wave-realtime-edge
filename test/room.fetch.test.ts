@@ -4,7 +4,7 @@
 // Signaling orchestration (src/signaling.ts) over THIS room's RoomCore (DO storage) + an SfuClient built
 // from the DO's env. These tests construct RoomDO directly with an in-memory storage stub and a stubbed
 // SFU (env.__sfuFetch) so no live DO runtime / CF network is needed.
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { RoomDO } from "../src/room.js";
 
 // In-memory DO storage stub (matches RoomStorage: get/put).
@@ -89,6 +89,14 @@ describe("RoomDO.fetch — leave emits metering when provisioned", () => {
 			calls.push({ url: String(input) });
 			return new Response("{}", { status: 200 });
 		}) as unknown as typeof fetch;
+		// Billable time is `leftAt - joinedAt` (metering.ts connectedMinutes), and it is billable only
+		// when that difference is STRICTLY > 0. join/publish/leave below are pure in-memory calls that
+		// routinely complete inside a single millisecond, which made this assertion a coin-flip:
+		// measured 2 failures in 12 runs under `vitest run --coverage`. Pin the clock instead of
+		// racing it — only Date is faked, so setTimeout/queueMicrotask stay real and nothing that
+		// awaits a real timer can hang.
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
 		try {
 			const e = env({ GATEWAY_BASE_URL: "https://api.wave.online", WAVE_SERVICE_TOKEN: "svc-token" });
 			// join → publish video → leave (so there is billable video time).
@@ -100,11 +108,14 @@ describe("RoomDO.fetch — leave emits metering when provisioned", () => {
 					offer: { type: "offer", sdp: "v=0" },
 				}),
 			);
+			// 5 minutes of session before the leave — a real billable window, not a sub-ms accident.
+			vi.setSystemTime(new Date("2026-01-01T00:05:00.000Z"));
 			const res = await new RoomDO({ storage }, e).fetch(intent("leave", { ctx }));
 			expect(res.status).toBe(200);
 			expect(calls.length).toBeGreaterThan(0);
 			expect(calls.every((c) => c.url.includes("/v1/internal/usage"))).toBe(true);
 		} finally {
+			vi.useRealTimers();
 			globalThis.fetch = realFetch;
 		}
 	});
