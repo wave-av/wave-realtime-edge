@@ -8,7 +8,10 @@
     "deploy:dry": "wrangler deploy --dry-run --outdir /tmp/rt-dry",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "egress:kill": "node scripts/kill-egress.mjs on",
+    "egress:unkill": "node scripts/kill-egress.mjs off",
+    "egress:kill:status": "node scripts/kill-egress.mjs status"
   },
   "dependencies": {
     "@cloudflare/containers": "^0.3.7",

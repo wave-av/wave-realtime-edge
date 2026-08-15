@@ -34,6 +34,7 @@ import type {
 export interface StreamInputKv {
   get(key: string): Promise<string | null>;
   put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<void>;
+  delete(key: string): Promise<void>;
 }
 
 /** Reverse-index KV key prefix: `org → [its live-input uids]`, powering org-scoped source discovery. Distinct
@@ -63,12 +64,18 @@ export interface CfStreamLiveClientConfig {
   readonly now?: () => number;
   /** KV TTL (seconds) for both bindings. Matches the 14-day window other RT_MEETING_ORG writes use. */
   readonly ttlSeconds?: number;
+  /** E3n (wre#290) auto-record flag, resolved by the caller from `E3N_AUTORECORD_ENABLED`. Absent/false → the
+   *  input is created with `recording:{mode:"off"}` (today's byte-identical behavior). True → `"automatic"`, so
+   *  CF Stream records every broadcast on this input for the completion-sweep (`e3n-recording-sweep.ts`) to
+   *  correlate and register as VOD. This is the ONLY behavioral flip E3n makes here — no new I/O either way. */
+  readonly autoRecordEnabled?: boolean;
 }
 
 const CF_API_BASE = "https://api.cloudflare.com/client/v4";
 const DEFAULT_TTL_SECONDS = 60 * 60 * 24 * 14; // 14d — parity with route-dispatch RT_MEETING_ORG writes
-/** A CF Stream live-input uid is 32 lowercase hex — the SAME shape WHEP validates as `?resource=`. */
-const LIVE_INPUT_UID = /^[0-9a-f]{32}$/;
+/** A CF Stream live-input uid is 32 lowercase hex — the SAME shape WHEP validates as `?resource=`. Exported so
+ *  callers (whep-sources.ts teardown) can pre-validate a path-derived uid against the SAME shape before use. */
+export const LIVE_INPUT_UID = /^[0-9a-f]{32}$/;
 
 /** Shape of the CF create-live-input reply we consume (grounded against the live API 2026-07-15). */
 interface CfCreateInputResult {
@@ -106,6 +113,7 @@ export class CfStreamLiveClientImpl implements CfStreamLiveClient {
   private readonly fetchFn: typeof fetch;
   private readonly now: () => number;
   private readonly ttl: number;
+  private readonly autoRecord: boolean;
 
   constructor(private readonly cfg: CfStreamLiveClientConfig) {
     // BIND to globalThis: the Workers/undici global `fetch` throws "Illegal invocation" when called as a
@@ -114,10 +122,13 @@ export class CfStreamLiveClientImpl implements CfStreamLiveClient {
     this.fetchFn = cfg.fetchFn ?? fetch.bind(globalThis);
     this.now = cfg.now ?? Date.now;
     this.ttl = cfg.ttlSeconds ?? DEFAULT_TTL_SECONDS;
+    this.autoRecord = cfg.autoRecordEnabled === true;
   }
 
   async createLiveInput(req: CfStreamLiveIngestRequest): Promise<CfStreamLiveResult> {
-    // 1. Create the CF Stream Live input (recording off; defaultCreator carries the org for CF-side attribution).
+    // 1. Create the CF Stream Live input. E3n (wre#290): recording mode flips to "automatic" ONLY when the
+    //    caller resolved `E3N_AUTORECORD_ENABLED` truthy — default stays "off", byte-identical to today.
+    //    defaultCreator carries the org for CF-side attribution either way.
     let created: CfCreateInputResult;
     try {
       const res = await this.fetchFn(`${CF_API_BASE}/accounts/${this.cfg.accountId}/stream/live_inputs`, {
@@ -125,7 +136,7 @@ export class CfStreamLiveClientImpl implements CfStreamLiveClient {
         headers: { authorization: `Bearer ${this.cfg.apiToken}`, "content-type": "application/json" },
         body: JSON.stringify({
           meta: { name: `wave:${req.org}:${req.room}` },
-          recording: { mode: "off" },
+          recording: { mode: this.autoRecord ? "automatic" : "off" },
           defaultCreator: req.org,
         }),
       });
@@ -180,13 +191,26 @@ export class CfStreamLiveClientImpl implements CfStreamLiveClient {
   /** Best-effort compensation delete of an orphaned CF input (never throws — compensation must not mask the
    *  original error it is cleaning up after). */
   private async bestEffortDelete(uid: string): Promise<void> {
+    await CfStreamLiveClientImpl.bestEffortDeleteInput(this.fetchFn, this.cfg.accountId, this.cfg.apiToken, uid);
+  }
+
+  /** Public best-effort DELETE of a CF Stream Live input by uid — never throws (logs on failure). Callers that
+   *  create an input OUTSIDE the atomic `createLiveInput` success path (e.g. a synthetic proof probe that must
+   *  not leak a real CF input + KV entries every run) use this to compensate. Static so a caller with only a
+   *  `uid` + the same config (no live client instance needed) can still clean up. */
+  static async bestEffortDeleteInput(
+    fetchFn: typeof fetch,
+    accountId: string,
+    apiToken: string,
+    uid: string,
+  ): Promise<void> {
     try {
-      await this.fetchFn(`${CF_API_BASE}/accounts/${this.cfg.accountId}/stream/live_inputs/${uid}`, {
+      await fetchFn(`${CF_API_BASE}/accounts/${accountId}/stream/live_inputs/${uid}`, {
         method: "DELETE",
-        headers: { authorization: `Bearer ${this.cfg.apiToken}` },
+        headers: { authorization: `Bearer ${apiToken}` },
       });
-    } catch {
-      /* best-effort — the caller already has the fatal reason */
+    } catch (e) {
+      console.warn(`cf-stream-live bestEffortDeleteInput failed uid=${uid}: ${(e as Error)?.message ?? e}`);
     }
   }
 }

@@ -33,6 +33,13 @@
 import { egressRoute, type EgressBackend, type EgressCodec, type EgressJob, type EgressLatency, type EgressOutput } from "./egress-router.js";
 import { egressRouterEnabled } from "./egress-wave-render.js";
 import type { MediaConsumer, TapFrame, TapSelector } from "./media-tap.js";
+import {
+  circuitBreakerCheck,
+  DEFAULT_BUDGET_LIMITS,
+  type AlertSink,
+  type BudgetLimits,
+  type KillswitchStore,
+} from "./egress-killswitch.js";
 
 /** One composite input: the latest decoded frame the backend holds for a given room track. The bytes travel with
  *  their identity + arrival time so the encode request needs no side-channel (mirrors `TapFrame`). */
@@ -54,14 +61,33 @@ export interface RunpodNvencEncodeRequest {
   readonly output: EgressOutput;
   readonly latency: EgressLatency;
   readonly sources: readonly EncodeSource[];
+  /**
+   * OPTIONAL — W1 SLICE-2B O2 (wre#288, edge-arm seam). When present, this encode is destined for a LIVE SRT
+   * restream (`armExternalSrtRestream`, egress-arm.ts) rather than a batch artifact: the origin should push the
+   * composited/encoded stream to `url` (an `srt://` destination, already SSRF-checked at connect by the caller)
+   * using `passphrase` if the destination requires one. ABSENT (the default) preserves the existing batch-artifact
+   * contract exactly — every current caller/test is unaffected.
+   *
+   * CONCRETE HANDLING DEFERRED. This field is a pure interface seam only: the actual RunPod-side SRT push (opening
+   * the SRT socket, streaming NVENC output frames to it rather than uploading a finished artifact) is NOT
+   * implemented here — that is the runpod-container ◆ GPU-spend task this edge-arm slice explicitly excludes. A
+   * `RunpodNvencClient` that does not yet support live SRT push should ignore/reject this field, not silently
+   * fabricate a stream.
+   */
+  readonly destination?: { readonly url: string; readonly passphrase?: string };
 }
 
 /** The origin's reply. Discriminated so a non-2xx (e.g. endpoint 5xx / auth 401) carries a stable status + reason and
- *  is never mistaken for a produced artifact. The ok branch carries a REFERENCE to the encoded artifact (video is far
- *  too large to inline, unlike the P2 still) plus `gpuSeconds` — the measured GPU wall-time the encode consumed, the
- *  sole basis for grounded COGS. */
+ *  is never mistaken for a produced artifact. The `artifactKey` ok branch carries a REFERENCE to the encoded artifact
+ *  (video is far too large to inline, unlike the P2 still); the `streamed` ok branch (W1 O2, wre#288) instead confirms
+ *  the encode was pushed LIVE to the request's `destination` (an SRT egress) rather than materializing an artifact —
+ *  no `artifactKey` exists in that case, so the two are kept as SEPARATE `ok: true` variants (never a single shape
+ *  with an optional `artifactKey`, which would let a caller silently treat "streamed, no artifact" as "artifact
+ *  missing/undefined"). Both ok branches carry `gpuSeconds` — the measured GPU wall-time the encode consumed, the
+ *  sole basis for grounded COGS — so `cogsUsd(result.gpuSeconds)` works unchanged for either. */
 export type RunpodNvencResult =
   | { readonly ok: true; readonly artifactKey: string; readonly codec: EgressCodec; readonly gpuSeconds: number }
+  | { readonly ok: true; readonly streamed: true; readonly codec: EgressCodec; readonly gpuSeconds: number }
   | { readonly ok: false; readonly status: number; readonly reason: string };
 
 /** The injected origin seam. The backend depends ONLY on this interface — the concrete adapter (RunPod serverless
@@ -127,7 +153,21 @@ export type EgressEncodeOutcome =
   | { readonly status: "encoded"; readonly result: RunpodNvencResult; readonly cogsUsd: number | null }
   | { readonly status: "deferred"; readonly backend: EgressBackend }
   | { readonly status: "unroutable"; readonly reason: string }
-  | { readonly status: "empty" };
+  | { readonly status: "empty" }
+  | { readonly status: "circuitOpen"; readonly orgId: string };
+
+/** #278, W0 — the COGS circuit-breaker hook: when supplied, every SUCCESSFUL encode's measured `cogsUsd`
+ *  (never a fabricated number) is accumulated per `orgId` per time window (`egress-killswitch.ts`); crossing
+ *  `limits.budgetUsd` trips the breaker — the backend fires `alertSink` once and then short-circuits every
+ *  subsequent `encode()` call with `{status: "circuitOpen"}` (no further RunPod spend for that org instance)
+ *  until a NEW backend instance is constructed (a deliberate hard stop, not an auto-recovering breaker — a
+ *  human/ops decision re-arms it, mirroring the kill switch's "nothing auto re-arms" stance). */
+export interface RunpodNvencBudgetGuard {
+  readonly store: KillswitchStore;
+  readonly orgId: string;
+  readonly limits?: BudgetLimits;
+  readonly alertSink: AlertSink;
+}
 
 /** Build the typed `EgressJob` for the current room view. Pure: geometry/codec/latency come from config, `sourceCount`
  *  from the live track set. `needsCompositing` is the profile's — so the router sends a passthrough profile to cfStream
@@ -160,15 +200,22 @@ export class RunpodNvencEgressBackend implements MediaConsumer {
   readonly id: string;
   readonly selector: TapSelector;
   private readonly latest = new Map<string, EncodeSource>();
+  private circuitOpen = false;
 
   constructor(
     private readonly config: RunpodNvencEgressConfig,
     private readonly client: RunpodNvencClient,
     private readonly cost: RunpodNvencCost = DEFAULT_RUNPOD_NVENC_COST,
     opts: { id?: string; selector?: TapSelector } = {},
+    private readonly budgetGuard?: RunpodNvencBudgetGuard,
   ) {
     this.id = opts.id ?? RUNPOD_NVENC_EGRESS_ID;
     this.selector = opts.selector ?? VIDEO_ONLY_SELECTOR;
+  }
+
+  /** True once a budget-guarded encode has tripped the circuit breaker for this backend instance. */
+  isCircuitOpen(): boolean {
+    return this.circuitOpen;
   }
 
   /** Store the latest frame per track (newest wins — live media prefers fresh over complete, like the tap queue). */
@@ -199,6 +246,8 @@ export class RunpodNvencEgressBackend implements MediaConsumer {
    * the worker's measured `gpuSeconds`.
    */
   async encode(): Promise<EgressEncodeOutcome> {
+    if (this.circuitOpen && this.budgetGuard) return { status: "circuitOpen", orgId: this.budgetGuard.orgId };
+
     const sources = [...this.latest.values()];
     if (sources.length === 0) return { status: "empty" };
 
@@ -214,7 +263,16 @@ export class RunpodNvencEgressBackend implements MediaConsumer {
       latency: this.config.latency,
       sources,
     });
-    return { status: "encoded", result, cogsUsd: result.ok ? cogsUsd(result.gpuSeconds, this.cost) : null };
+    const cost = result.ok ? cogsUsd(result.gpuSeconds, this.cost) : null;
+
+    // #278 circuit breaker: accumulate the MEASURED cost (never fabricated) and trip on budget breach.
+    if (this.budgetGuard && cost !== null) {
+      const { store, orgId, limits, alertSink } = this.budgetGuard;
+      const breaker = await circuitBreakerCheck(store, orgId, cost, limits ?? DEFAULT_BUDGET_LIMITS, alertSink);
+      if (breaker.tripped) this.circuitOpen = true;
+    }
+
+    return { status: "encoded", result, cogsUsd: cost };
   }
 }
 

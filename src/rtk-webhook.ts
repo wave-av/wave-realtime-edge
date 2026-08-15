@@ -177,6 +177,13 @@ export function parseRtkEvent(rawText: string): RtkWebhookEvent | null {
  * fetch anything that isn't `https:` to a public host — blocking localhost, link-local (incl. the cloud
  * metadata 169.254.169.254), and RFC-1918 private literals. Hostnames that aren't IP literals are allowed
  * (RTK's storage CDN host isn't a fixed literal we can allowlist without brittleness).
+ *
+ * TRUSTED-SOURCE-ONLY, NOT ATTACKER-INPUT-SAFE: this checks literal IPs/hostnames only and never resolves
+ * DNS (the Workers runtime has no synchronous DNS API), so it does not defend a DNS-rebinding attack where a
+ * hostname resolves to a private/metadata IP only at fetch time. Every current caller passes a URL from a
+ * provenance-verified source (a signature-verified webhook body, or CF's own Stream API), never raw
+ * end-user input — callers reusing this guard for a NEW, less-trusted URL source must add their own
+ * origin/host allowlist on top (see `e3n-recording-pull.ts`'s `isCfStreamDownloadHost` for an example).
  */
 export function isSafePublicHttpsUrl(raw: string): boolean {
   let u: URL;

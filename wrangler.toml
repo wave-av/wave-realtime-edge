@@ -110,6 +110,13 @@ WHEP_EGRESS_ENABLED = "1"   # ◆ ARMED 2026-07-01 (Jake-named: "activate the WH
 # isolation reuses the `stream-input-org:{uid}` KV map (src/stream-bridge.ts).
 USE_CLOUDFLARE_STREAM = "1"  # ◆ ARMED 2026-07-01 — CF Stream WebRTC playback backend live
 
+# ── E-ROOMS P4 (#73) — client presence + state-sync + data channel. DEFAULT OFF → inert ──
+# PRESENCE_ENABLED gates the POST /v1/realtime/rooms/:room/presence surface (src/route-dispatch.ts:387-392,
+# src/dispatch-helpers.ts:122-127). Absent/"0" → the route falls through to the generic :intent handler
+# (501). Arming this is purely additive — presence is matched BEFORE the generic :intent route and changes
+# no existing signaling path.
+PRESENCE_ENABLED = "1"  # ◆ ARMED 2026-08-13 — room presence/state-sync live
+
 # ── #75 E-EGRESS-ROUTER — routed egress. DEFAULT OFF / FULLY INERT. ──
 # EGRESS_ROUTER_ENABLED gates whether the RoomDO instantiates a routed-egress MediaConsumer (#74 tap) and drives it
 # through egressRoute (#75 P1). Absent/"0" → NO egress consumer is attached: the tap fans out to nothing new and the
@@ -161,6 +168,35 @@ EGRESS_ROUTER_ENABLED = "0"  # INERT — #75 P2/P3/P4 backends built; arming is 
 # an internal/loopback/link-local/metadata/CGNAT(tailnet) address before the container-start sink.
 INGRESS_ROUTER_ENABLED = "1"  # ARMED 2026-07-15 (Jake-named ◆, whep-live-egress epic): the ONLY runtime caller is maybeHandleWhepSources (whep-sources.ts) → arms POST/GET /v1/whep/sources (gatewayGate + x-wave-org). P3/P4 backends re-export the flag but are never instantiated, so no other live behavior changes. Requires the Stream token bound (CLOUDFLARE_STREAM_API_TOKEN, provisioned).
 
+# ── W1 O3 (wre#289) — external egress DESTINATION management. DEFAULT OFF / FULLY INERT. ──
+# EGRESS_DEST_MGMT_ENABLED gates POST/GET/DELETE /v1/egress/destinations[/{id}] (src/egress-destinations.ts) —
+# the security foundation the O1/O2 external-RTMP/SRT restream arm will consume next (resolveDestinationForArm).
+# A SIBLING flag, not a reuse of INGRESS_ROUTER_ENABLED: this is new destination-CRUD + crypto surface and gets
+# its own Jake-named ◆ arm. Absent/"0" → the route falls through to the 501 catch-all, UNCHANGED. Every create
+# runs the #17 SSRF guard (src/ssrf-guard.ts, deny-by-default, DNS-rebind-safe) before persisting a url, and
+# encrypts streamKey/passphrase at rest (#18, src/dest-key-crypto.ts, AES-256-GCM) before any KV write.
+EGRESS_DEST_MGMT_ENABLED = "0"  # INERT — arming is a ◆ Jake crossing (requires DEST_KEY_ENCRYPTION_KEY provisioned)
+
+# ── E3n (wre#290) — auto-record → VOD register. DEFAULT OFF / FULLY INERT. ──
+# ONE flag gates BOTH halves (they ship together — auto-record alone would leak orphan/unbilled CF recordings):
+#   1. cf-stream-live-client.ts createLiveInput() flips recording.mode "off"→"automatic" for NEW live inputs.
+#   2. e3n-recording-sweep.ts's */15 cron correlates completed recordings (list CF videos by liveInput uid,
+#      NOT the unverified video-ready webhook field) → pulls bytes into R2 (org-prefixed key, RT_RECORDINGS_ENAM,
+#      the same gateway-allowlisted jurisdiction bucket the proven RT-P2.5 residency path uses) → registers with
+#      the gateway (recordings-register.ts, metadata-only). Absent/"0" → byte-identical to today (recording:off,
+#      sweep is a no-op every tick). Requires CF_STREAM_API_TOKEN/CLOUDFLARE_STREAM_API_TOKEN + CF_ACCOUNT_ID +
+#      RT_MEETING_ORG + RT_RECORDINGS_ENAM + WAVE_GATEWAY_ORIGIN/GATEWAY_BASE_URL + WAVE_SERVICE_TOKEN bound —
+#      any missing → liveE3nSweepDeps returns null → the tick logs `e3n-sweep-inert` and does nothing.
+# KNOWN GAPS before arming in prod (◆ Jake-named, see PR body): NO retention (issue #7 absent — recordings
+# accumulate, though every one is register-tracked, not orphaned) and NO VOD/recording meter SKU (absent —
+# register is metadata-only here, a gateway+pricing follow-up mints the billable meter).
+E3N_AUTORECORD_ENABLED = "0"  # INERT — arming is a ◆ Jake crossing (needs retention #7 + the VOD meter SKU first)
+
+# DEST_KEY_ENCRYPTION_KEY is a wrangler SECRET — `wrangler secret put DEST_KEY_ENCRYPTION_KEY` (Doppler wave/prd).
+# TODO(doppler ◆): base64-encoded 32-byte (256-bit) AES-GCM key; value NOT set here — Jake-named crossing.
+# Unset → create-time encryption throws → the route 503s (DEST_KEY_CRYPTO_NOT_CONFIGURED), never a silent
+# plaintext fallback.
+
 # ── B1 (#91-a) — CF Stream Live → SFU bridge control plane (POST /v1/stream/bridge/webhook). DEFAULT OFF. ──
 # STREAM_BRIDGE_ENABLED gates the self-authenticating CF Stream webhook receiver (src/stream-bridge.ts). Absent/
 # "0" → the route falls through to the honest 501 catch-all, UNCHANGED — the whole bridge is inert. The webhook
@@ -181,6 +217,13 @@ STREAM_BRIDGE_ENABLED = "1"
 # live Zoom meeting to prove. Arming this flag in a live env is a Jake-named ◆ crossing.
 WAVE_ZOOM_RTMS = "1"
 
+# ── #RTMS-fanout — per-participant demux + multi-protocol sink fan-out (RtmsBridgeCore). WAVE_RTMS_PER_PARTICIPANT
+# gates RtmsBridgeCore's perParticipantEnabled (still requires WAVE_ZOOM_RTMS on too — this flag alone changes
+# nothing). On: a frame carrying a valid (allowlisted) userId is demuxed to its own seq + fanned out to
+# deps.sinks(userId) via the MoqPublishContainer DO (MOQ_PUBLISH binding, below). Armed per Jake-authorized
+# live proof (#314).
+WAVE_RTMS_PER_PARTICIPANT = "1"
+
 # ── #82/#114 CASCADE multi-region relay (RT_CASCADE). INERT by default. ──
 # Absent/"0"/"false" → the realtime room path is byte-identical to today: a join routes to the PRIMARY Room
 # DO `idFromName(org:room)` with NO locationHint and NO regional relay. Set RT_CASCADE="1" → a regional join
@@ -197,6 +240,17 @@ WAVE_ZOOM_RTMS = "1"
 # ◆ ARMED 2026-06-25 (Jake-named GA cutover, #81): voice-agent routes + AgentSessionDO live. Routes only
 # activate on an explicit agent bind (POST /v1/realtime/agents/bind); live rooms are unaffected until bound.
 VOICE_AGENT_PROVIDER = "wave"
+
+# ── Task #81 tool-calling — VOICE_AGENT_TOOLS, the agent-least-privilege allowlist (agent-tools.ts
+# toolAllowlistFromEnv). Absent/blank/unparseable → EMPTY allowlist (fail-CLOSED: the agent runs text-only,
+# never accidentally exposes a tool). Format is a JSON array of Anthropic ToolDefinition
+# ({name, description, input_schema}) — NOT a comma-separated name list; the runtime hands these definitions
+# straight to the model and, on a matching tool_use, POSTs {name, input} to the gateway's
+# /v1/internal/tools/exec lane (Bearer WAVE_GATEWAY_TOKEN), which re-checks the SAME name against its own
+# VOICE_TOOL_REGISTRY server-side (defense in depth, both fail closed). This one entry mirrors that registry's
+# wave_usage_summary definition verbatim so a voice caller can ask "what's my usage this period" and get a
+# read-only, org-scoped answer (org comes from the authenticated session — never a model-suppliable argument).
+VOICE_AGENT_TOOLS = "[{\"name\":\"wave_usage_summary\",\"description\":\"Read the CALLER'S OWN WAVE usage for the current billing period: per-meter used/limit/overage in the billed unit, plus the org's subscription tier. Read-only; never bills, never mutates. The org is taken from the authenticated session — it cannot be supplied as an argument.\",\"input_schema\":{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false}}]"
 
 # ── #81 step-4 barge-in — TTS real-time send-ahead LEAD (ms). speak() paces the reply to the playout clock so
 # the agent the LISTENER hears is interruptible: turnInFlight spans playout (bargeIn fires mid-reply) and on
@@ -404,6 +458,20 @@ new_sqlite_classes = ["AgentSessionDO"]
 name = "ZOOM_RTMS_BRIDGE"
 class_name = "ZoomRtmsBridgeDO"
 
+# ── #314 — MoqPublishContainer DO (per-participant MoQ egress; moq-forward-target.ts reaches it via
+# `getContainer(env.MOQ_PUBLISH, "${org}:${meetingUuid}")`). Mirrors the RECORDER block above (same
+# rt-encoder-style image shape, same DO wiring). Image is built locally from the vendored
+# containers/moq-encode/Dockerfile. The migration (tag v6) is declared after v5 below, at the end of the
+# top-level [[migrations]] array, so it stays the highest/last tag (wrangler applies migrations in array order).
+[[containers]]
+class_name = "MoqPublishContainer"
+image = "./containers/moq-encode/Dockerfile"
+max_instances = 3
+
+[[durable_objects.bindings]]
+name = "MOQ_PUBLISH"
+class_name = "MoqPublishContainer"
+
 # ── #91 B2 — StreamBridgeContainer DO migration. Applied as a delta after the live v3 tag (migrations run in
 # array order). Its [[containers]] + [[durable_objects.bindings]] are declared above (binding order is
 # irrelevant; only migration tag order is). v4 MUST stay ahead of v5 below.
@@ -416,6 +484,12 @@ new_sqlite_classes = ["StreamBridgeContainer"]
 [[migrations]]
 tag = "v5"
 new_sqlite_classes = ["ZoomRtmsBridgeDO"]
+
+# ── #314 — MoqPublishContainer migration. The NEW highest/last tag: it applies after v5 (array order). Keep any
+# future migration strictly after this block, or wrangler silently skips it (class not configured → 10061).
+[[migrations]]
+tag = "v6"
+new_sqlite_classes = ["MoqPublishContainer"]
 
 [[unsafe.bindings]]
 type = "plain_text"
@@ -484,18 +558,76 @@ RT_ADAPTER_MAX_ATTEMPTS = "14"
 # would make the canary's SFU push media at the prod worker (foreign session/token -> create-adapter 503). Pin
 # it to the canary's OWN workers.dev host so the SFU dials the SAME worker that signed the capability token.
 RECORDER_PUBLIC_WSS = "wss://wave-realtime-edge-canary.jakefineman.workers.dev/v1/realtime/recorder"
+# #81 step-4 barge-in tuning, restated for canary/prod FIDELITY (named envs do NOT inherit top-level [vars]).
+# Read ONLY by the voice-agent TTS path (speak() pacing), which cannot run here: VOICE_AGENT_PROVIDER is
+# deliberately NOT set on the canary, so voiceAgentEnabled(env)=false and /v1/realtime/agents/* still falls
+# through to the honest 501 catch-all. This value is therefore INERT — it is here so that IF Jake names the
+# canary voice-agent crossing, the canary rehearses prod's tuned 30ms lead instead of the code default 150.
+AGENT_TTS_LEAD_MS = "30"
+
+# ── 4b — the three DEFAULT-OFF guards, restated EXPLICITLY as "0". ──
+# Behaviourally these are no-ops: absent and "0" mean the same thing to the code. They are written down
+# because absent and "0" do NOT mean the same thing to a READER. Every one of these is ◆-gated in prod, so
+# a blank where a guard should be is indistinguishable from an oversight — and the next person "closing the
+# canary/prod gap" would close it by copying prod's value. Stated as "0", the canary's position is a decision.
+EGRESS_ROUTER_ENABLED = "0"      # INERT — arming is a ◆ Jake crossing (#75; the ARM slice wires the RoomDO)
+EGRESS_DEST_MGMT_ENABLED = "0"   # INERT — arming is a ◆ Jake crossing (needs DEST_KEY_ENCRYPTION_KEY)
+E3N_AUTORECORD_ENABLED = "0"     # INERT — arming is a ◆ Jake crossing (needs retention #7 + the VOD meter SKU)
+
+# CONTAINER_HEALTH_ALARM_ENABLED (#234) — armed to match prod. READ-ONLY by construction: one authenticated
+# GET of the container-applications list per */15 cron tick, no mutation of anything, and inert without
+# CF_API_TOKEN/CF_ACCOUNT_ID. It watches the `active > 0 && healthy == 0` wedge signature that once took out
+# stream bridging account-wide while every other telemetry reading stayed green. Safe on a canary precisely
+# because it only ever reads. NOTE: the list it polls is ACCOUNT-WIDE, so canary and prod now observe the
+# same state independently — a second opinion on the same signal, not a second source of truth.
+CONTAINER_HEALTH_ALARM_ENABLED = "1"
+
+# NOT restated here: WHIP_SWEEP_ENABLED. It is prod-armed "1", and 4b as filed lists it as a no-crossing
+# restatement — but it EMITS BILLING. The sweeper bills WHIP sessions the SFU reports GONE, and the canary
+# already points GATEWAY_BASE_URL at the PROD gateway (api.wave.online) with the real WAVE_SERVICE_TOKEN.
+# Arming it here means canary test traffic writes real usage rows against prod. That is a metering decision,
+# not a fidelity restatement, so it is held for Jake — see the note on RT_RESIDENCY below for the same shape.
 
 # Canary recordings bucket — a DISTINCT bucket so canary recordings never mix with prod. Created in the deploy
 # step (`wrangler r2 bucket create wave-realtime-recordings-canary`); --dry-run tolerates a not-yet-existing
-# bucket. RT_RESIDENCY is unset, so RT_RECORDINGS_ENAM/EU are NOT needed (and not restated) on the canary.
+# bucket. RT_RESIDENCY is unset ON THE CANARY, so RT_RECORDINGS_ENAM/EU/APAC/SAM are NOT needed (and not
+# restated) here. Read that precisely: RT_RESIDENCY = "1" IS armed at the TOP LEVEL (line ~63, #127) — it is
+# unset here only because named envs do NOT inherit top-level [vars]. `wrangler deploy --env canary` therefore
+# WARNS that the four residency buckets are missing; that warning is EXPECTED and must be left unfixed.
+# Restating those buckets (or the flag) would arm multi-region storage on a canary — a Jake-named ◆ crossing.
+# test/wrangler-inert.test.ts asserts the canary never sets RT_RESIDENCY, which is what keeps this true.
 [[env.canary.r2_buckets]]
 binding = "RT_RECORDINGS"
 bucket_name = "wave-realtime-recordings-canary"
 
-# meetingId→org map — restated (same namespace id is fine; canary shares the lookup map).
+# meetingId→org map — MUST be a DISTINCT namespace from the top-level (prod) binding above: this same
+# binding now also backs the #278 egress kill-switch/cost-guard registry (egress-killswitch.ts), so sharing
+# the prod id here would let canary egress arm/disarm mutate PROD kill-switch + concurrency-cap state.
+# CREATED 2026-08-13 as `wave-realtime-edge-canary-RT_MEETING_ORG` — and it is DISTINCT from the prod id
+# above (canary 8a1adad9…, prod 4acd6ec7…), which is the property this whole comment exists to protect.
+# Minted through the governed path, NOT by hand: wave-foundation's `provision-kv-namespace.yml`
+# (workflow_dispatch, run 31731783720). That workflow exists because minting needs a CF token with
+# `Workers KV Storage:Edit`, which the Doppler wave/prd token does not carry and which a PUBLIC repo's CI
+# cannot reach — the reason this line sat as a literal `TODO-` placeholder long enough that the first
+# person to actually use the canary hit it (wave-av/claude-workstation#2888). Re-dispatching is safe: a
+# second run REUSED this same id rather than minting a duplicate (run 31731858205), and >1 namespace
+# sharing a title is refused outright rather than resolved arbitrarily.
+# Inert-for-now note: canary does NOT currently arm routed egress with a cost guard (RT_MEETING_ORG is not
+# read by any canary-only code path beyond the pre-existing WHIP/meeting-lookup reuse below) — but the
+# split is now real rather than pending, per the #278 review.
 [[env.canary.kv_namespaces]]
 binding = "RT_MEETING_ORG"
-id = "4acd6ec7b04546ba8767f2353d5394e8"
+id = "8a1adad98b304866b33770cdded9a7ee"
+
+# FOUNDATION_VERSION — restated because wrangler does NOT inherit `unsafe` into an [env.*] block; without
+# this, `deploy --env canary` warns `Please add "unsafe" to "env.canary"` and the canary worker ships WITHOUT
+# a binding prod has. A canary whose bindings differ from prod is not a rehearsal of prod, which is the only
+# thing a canary is for — so this is restated for FIDELITY, not because the value matters. Keep in lockstep
+# with the top-level [[unsafe.bindings]] block.
+[[env.canary.unsafe.bindings]]
+type = "plain_text"
+name = "FOUNDATION_VERSION"
+text = "scaffold"
 
 # ROOM DO — restated so the canary worker boots (room.ts RoomDO; migrations v1 inherited from top level).
 [[env.canary.durable_objects.bindings]]
@@ -511,3 +643,39 @@ max_instances = 3
 [[env.canary.durable_objects.bindings]]
 name = "RECORDER"
 class_name = "RecorderContainer"
+
+# ── #81 AGENT_SESSION DO — restated for canary/prod FIDELITY. SHIPS FULLY INERT. ──
+# `wrangler deploy --env canary` (run 31735320178) warned AGENT_SESSION was a top-level binding absent from
+# env.canary, because durable_objects config is NOT inherited by named envs. A canary whose bindings differ
+# from prod is not a rehearsal of prod, so it is restated here — the same reason FOUNDATION_VERSION is.
+# INERT, and here is the exact mechanism: the /v1/realtime/agents/* dispatch + egress routes are gated by
+# voiceAgentEnabled(env), which requires VOICE_AGENT_PROVIDER="wave". That var is deliberately NOT set on the
+# canary (arming it in any live env is a Jake-named ◆ crossing — see the top-level note at line ~231), so this
+# binding resolves the class and nothing more; an agents request still falls through to the honest 501
+# catch-all in worker.ts. Binding a DO does not construct it — no instance exists until a route reaches it.
+# No container, no image build, no new secret: AgentSessionDO is a plain SQLite-backed DO, and migration v3
+# (new_sqlite_classes = ["AgentSessionDO"]) is top-level, which named envs DO inherit — so it resolves here.
+[[env.canary.durable_objects.bindings]]
+name = "AGENT_SESSION"
+class_name = "AgentSessionDO"
+
+# ── 4c (PARTIAL) — ZOOM_RTMS_BRIDGE DO. Bound; both of its flags deliberately withheld. ──
+# Same zero-cost shape as AGENT_SESSION above: ZoomRtmsBridgeDO is a plain SQLite-backed DO, and its
+# migration v5 (new_sqlite_classes = ["ZoomRtmsBridgeDO"]) is top-level, which named envs DO inherit.
+#
+# cw#2888 files 4c as "the DO + WAVE_ZOOM_RTMS + WAVE_RTMS_PER_PARTICIPANT, as one unit, owner: agent".
+# Landing only the binding SPLITS that unit on purpose, because the unit as filed cannot be agent-owned:
+#
+#   1. WAVE_ZOOM_RTMS's own comment (line ~210) reads "Arming this flag in a live env is a Jake-named ◆
+#      crossing". Its receiver is HMAC-verified and fail-closed, but the flag is still ◆ by declaration.
+#   2. WAVE_RTMS_PER_PARTICIPANT fans out through the MoqPublishContainer DO (MOQ_PUBLISH) — which is NOT
+#      bound on this canary and belongs to slice 4d, the parked container/spend decision. Arming it here
+#      would point a live code path at a binding that does not exist: EXACTLY the "boots, then fails at the
+#      first call into a missing DO" failure that #2888 was written to prevent. 4c is not independent of 4d.
+#
+# Binding without arming is the safe direction of that coupling. A bound-but-unreached DO is inert; a flag
+# armed against a missing DO is a latent 500. With both flags absent, POST /zoom/rtms still falls through to
+# the honest 501 catch-all, and this binding only means the class resolves if Jake ever names the crossing.
+[[env.canary.durable_objects.bindings]]
+name = "ZOOM_RTMS_BRIDGE"
+class_name = "ZoomRtmsBridgeDO"

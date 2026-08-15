@@ -27,6 +27,10 @@ export { RoomDO } from "./room";
 // MoqContainer). INERT: the `[[containers]] RECORDER` block in wrangler.toml stays COMMENTED (Path A attach is
 // a Jake-named ◆); exported here so the class is in scope when the ◆ uncomments the binding.
 export { RecorderContainer } from "./encoders/recorder-container";
+// #314 slice g-prep — per-participant MoQ publish container DO class (moq-forward-target.ts reaches it via
+// `getContainer(env.MOQ_PUBLISH, ...)`). INERT: the `[[containers]] MOQ_PUBLISH` block in wrangler.toml stays
+// COMMENTED (arming is a Jake-named ◆); exported here so the class is in scope when the ◆ uncomments the binding.
+export { MoqPublishContainer } from "./encoders/moq-publish-container";
 export { StreamBridgeContainer } from "./stream-bridge-container"; // #91 B2 — inert (binding COMMENTED until ◆)
 // F (#55) — per-protocol Plane-2 direct-ingest republisher container classes. INERT: each [[containers]] +
 // [[durable_objects.bindings]] block stays COMMENTED in wrangler.toml until that leg's ◆ go-live. Exporting the

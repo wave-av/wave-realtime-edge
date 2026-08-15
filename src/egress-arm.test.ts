@@ -14,9 +14,15 @@
  * are `frame.bytes`.
  */
 import { describe, it, expect, vi } from "vitest";
-import { buildRoutedEgressConsumer, routedEgressArmed, type RoutedEgressArmEnv } from "./egress-arm.js";
+import {
+  buildRoutedEgressConsumer,
+  routedEgressArmed,
+  startRoutedEgressGuarded,
+  type RoutedEgressArmEnv,
+} from "./egress-arm.js";
 import type { EgressJob } from "./egress-router.js";
-import type { TapFrame } from "./media-tap.js";
+import { MediaTap, type TapFrame } from "./media-tap.js";
+import { MemoryKillswitchStore, activateKillSwitch, listArmed, registerArmed } from "./egress-killswitch.js";
 
 const COMPOSITE_JOB: EgressJob = {
   needsCompositing: true,
@@ -120,5 +126,75 @@ describe("buildRoutedEgressConsumer (inert until flag+tap armed)", () => {
     const consumer = buildRoutedEgressConsumer(COMPOSITE_JOB, ARMED_ENV, vi.fn());
     expect(consumer.selector).toEqual({ kinds: ["video"] });
     expect(consumer.id).toBe("egress:routed-arm");
+  });
+});
+
+// ── #278 cost-governance: startRoutedEgressGuarded ──────────────────────────────────────────────────────────
+
+describe("startRoutedEgressGuarded (#278 cap + kill-switch gate)", () => {
+  it("returns null (not armed) when the router/tap flags are off, without touching the store", async () => {
+    const store = new MemoryKillswitchStore();
+    const tap = new MediaTap();
+    const handle = await startRoutedEgressGuarded(tap, COMPOSITE_JOB, {}, vi.fn(), {
+      store,
+      orgId: "org1",
+      streamId: "s1",
+    });
+    expect(handle).toBeNull();
+    expect(await listArmed(store)).toHaveLength(0);
+  });
+
+  it("arms, registers the stream, and returns a live handle under the cap", async () => {
+    const store = new MemoryKillswitchStore();
+    const tap = new MediaTap();
+    const handle = await startRoutedEgressGuarded(tap, COMPOSITE_JOB, ARMED_ENV, vi.fn(async () => new Response()), {
+      store,
+      orgId: "org1",
+      streamId: "s1",
+      limits: { perOrg: 1, global: 1 },
+    });
+    expect(handle).not.toBeNull();
+    const armed = await listArmed(store);
+    expect(armed).toEqual([{ streamId: "s1", orgId: "org1", armedAt: expect.any(Number) }]);
+  });
+
+  it("rejects a new arm once the per-org cap is reached", async () => {
+    const store = new MemoryKillswitchStore();
+    await registerArmed(store, "org1", "existing");
+    const tap = new MediaTap();
+    const handle = await startRoutedEgressGuarded(tap, COMPOSITE_JOB, ARMED_ENV, vi.fn(), {
+      store,
+      orgId: "org1",
+      streamId: "s2",
+      limits: { perOrg: 1, global: 10 },
+    });
+    expect(handle).toBeNull();
+    expect(await listArmed(store)).toHaveLength(1); // rejected arm never registers
+  });
+
+  it("rejects every new arm once the kill switch is active", async () => {
+    const store = new MemoryKillswitchStore();
+    await activateKillSwitch(store, vi.fn());
+    const tap = new MediaTap();
+    const handle = await startRoutedEgressGuarded(tap, COMPOSITE_JOB, ARMED_ENV, vi.fn(), {
+      store,
+      orgId: "org1",
+      streamId: "s1",
+    });
+    expect(handle).toBeNull();
+  });
+
+  it("closing the returned handle deregisters the stream from the armed registry", async () => {
+    const store = new MemoryKillswitchStore();
+    const tap = new MediaTap();
+    const handle = await startRoutedEgressGuarded(tap, COMPOSITE_JOB, ARMED_ENV, vi.fn(async () => new Response()), {
+      store,
+      orgId: "org1",
+      streamId: "s1",
+    });
+    expect(await listArmed(store)).toHaveLength(1);
+    handle?.close();
+    await new Promise((r) => setTimeout(r, 0)); // let the fire-and-forget registerDisarmed settle
+    expect(await listArmed(store)).toHaveLength(0);
   });
 });

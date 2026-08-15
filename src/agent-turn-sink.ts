@@ -124,7 +124,7 @@ export interface RoomTurnLoopInputs {
 export function buildRoomTurnLoopDriver(inputs: RoomTurnLoopInputs): TurnLoopDriver | null {
   if (!voiceAgentEnabled(inputs.env)) return null;
   const org = inputs.org ?? inputs.config.org;
-  const deps = buildTurnDeps(inputs.env, inputs.media, inputs.fetchImpl ?? fetch, org);
+  const deps = buildTurnDeps(inputs.env, inputs.media, inputs.fetchImpl ?? fetch, org, inputs.config.agentId);
   const tools = toolAllowlistFromEnv(inputs.env); // step 5: agent-least-privilege allowlist (env-driven)
   const core = new TurnTakingCore(deps, inputs.config, {
     framing: inputs.env.AGENT_INGEST_FRAMING,
@@ -135,6 +135,13 @@ export function buildRoomTurnLoopDriver(inputs: RoomTurnLoopInputs): TurnLoopDri
   return {
     onFrame: (pcm) => core.onFrame(pcm),
     close: () => {
+      try {
+        // E0-P2: flush the FINAL idle DO slice (last turn → room-end) before releasing the socket. Sessions
+        // usually END idle, so without this the tail — often the largest single idle window — never gets a row.
+        core.closeSession();
+      } catch {
+        /* best-effort — teardown never throws */
+      }
       try {
         inputs.media.ingestSocket()?.close?.();
       } catch {

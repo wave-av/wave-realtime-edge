@@ -26,9 +26,12 @@
  */
 import {
   RtmsBridgeCore,
+  MoqTrackSink,
   type RtmsBridgeDeps,
   type RtmsSocket,
   type BridgeTarget,
+  type ParticipantSink,
+  type MoqForwardWriter,
 } from "./rtms-bridge-core.js";
 import {
   zoomRtmsEnabled,
@@ -39,16 +42,23 @@ import {
 import { createIngestAdapter, type IngestFraming } from "./agent-ingest-adapter.js";
 import type { IngestSocket } from "./agent-session.js";
 import { mintRecorderToken, verifyRecorderToken } from "./encoders/recorder-auth.js";
+import { createMoqForwardTarget, type MoqForwardTargetEnv } from "./encoders/moq-forward-target.js";
 import { SAFE_SEGMENT, ZOOM_RTMS_INGEST_ROUTE } from "./dispatch-helpers.js";
 
 /** Env the ZoomRtmsBridgeDO reads. INERT unless WAVE_ZOOM_RTMS is truthy. All creds referenced, not valued. */
-export interface ZoomRtmsBridgeDoEnv {
+export interface ZoomRtmsBridgeDoEnv extends MoqForwardTargetEnv {
   WAVE_ZOOM_RTMS?: string | boolean; // truthy arms; absent/"0"/false → fully inert
   // #88 M2 — independent flag for the VIDEO ingest leg (RTMS video frame → SFU video track push), still
   // gated by WAVE_ZOOM_RTMS being on too. Absent/"0"/false → audio-only, byte-identical to pre-video. The
   // DO does not yet mint a video target or accept a live video-ingest-sink socket (◆ follow-up slice) —
   // this only threads the flag into RtmsBridgeCore so its handshake/pump wiring is exercised.
   WAVE_RTMS_VIDEO?: string | boolean;
+  // #RTMS-fanout — independent flag for the per-participant demux + multi-protocol sink fan-out
+  // (RtmsBridgeCore's perParticipantEnabled), still gated by WAVE_ZOOM_RTMS being on too. Absent/"0"/false
+  // → audio/video stay on the single mixed track, byte-identical to today. The DO does not yet wire a real
+  // `sinks()` implementation (minting a per-participant CF-SFU track, or a MoQ/NDI forwarder) — that's a ◆
+  // follow-up slice; this only threads the flag into RtmsBridgeCore so its demux/fan-out wiring is exercised.
+  WAVE_RTMS_PER_PARTICIPANT?: string | boolean;
   ZOOM_APPS_CLIENT_ID?: string; // General-app Client ID — the RTMS handshake clientId (fails closed if unset)
   ZOOM_APPS_CLIENT_SECRET?: string; // signs the RTMS handshake — never logged/returned
   CF_CALLS_APP_ID?: string; // CF Realtime SFU app id (createIngestAdapter) — unset → fails closed
@@ -65,6 +75,18 @@ export function rtmsVideoEnabled(env: { WAVE_RTMS_VIDEO?: string | boolean }): b
   const v = env.WAVE_RTMS_VIDEO;
   return v === true || v === "1" || v === "true";
 }
+
+/** Truthy-flag check for the per-participant demux + sink fan-out (mirrors zoomRtmsEnabled's pattern). */
+export function rtmsPerParticipantEnabled(env: { WAVE_RTMS_PER_PARTICIPANT?: string | boolean }): boolean {
+  const v = env.WAVE_RTMS_PER_PARTICIPANT;
+  return v === true || v === "1" || v === "true";
+}
+
+/** #RTMS-fanout — allowlist for a Zoom RTMS userId before it drives a per-participant track name/map-key.
+ *  Mirrors rtms-bridge-core.ts's private SAFE_RTMS_USER_ID exactly (Corridor guardrail: re-check at every
+ *  boundary that turns an untrusted value into a resource name — the DO receives an already-sanitized id
+ *  from core's `sinks(userId)` call, but this is defense-in-depth, never trust-the-caller). */
+const SAFE_RTMS_USER_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 /** The publish-target record stored in RT_MEETING_ORG under the meeting_uuid key. */
 interface MeetingTargetRecord {
@@ -87,6 +109,18 @@ export class ZoomRtmsBridgeDO {
   private readonly env: ZoomRtmsBridgeDoEnv;
   private core: RtmsBridgeCore | null = null;
   private ingest: IngestSocket | null = null;
+  // #RTMS-fanout WAVE_RTMS_PER_PARTICIPANT — per-track state, only ever populated when the flag is on
+  // (buildDeps().sinks() is the sole writer). Flag off ⇒ these stay empty and `ingest` above is the
+  // only slot in play — byte-identical to pre-fanout behavior.
+  private meetingUuid: string | null = null; // set once startBridge resolves a target
+  private resolvedOrg: string | null = null; // set once resolveTarget validates the KV record
+  private target: BridgeTarget | null = null; // set once startBridge resolves a target
+  private readonly ingestByTrack = new Map<string, IngestSocket>(); // trackName -> the SFU's inbound socket
+  private readonly requestedParticipantTracks = new Set<string>(); // trackName -> createIngest already fired
+  // #314 Slice 1 — the ONE persistent multiplexed MoQ-container WS for this meeting (lazily built, shared by
+  // every participant's MoqTrackSink). `undefined` = not yet resolved; `null` = resolved inert (flag off, no
+  // MOQ_PUBLISH binding, or invalid org/meetingUuid); an object = the live forwarder. See getMoqTarget().
+  private moqTarget: MoqForwardWriter | null | undefined = undefined;
 
   constructor(_state: DurableObjectStateLike, env?: ZoomRtmsBridgeDoEnv) {
     this.env = env ?? {};
@@ -100,7 +134,14 @@ export class ZoomRtmsBridgeDO {
     // The SFU dials IN (WebSocket upgrade) to PULL our published PCM — perform the upgrade HERE so THIS
     // DO owns the live socket RtmsBridgeCore.pumpAudio sends on (mirrors AgentSessionDO's ingest leg).
     if ((request.headers.get("Upgrade") ?? "").toLowerCase() === "websocket") {
-      return this.acceptIngest();
+      // #RTMS-fanout: when the SFU dials back a PER-PARTICIPANT track (path carries the 4-segment
+      // ZOOM_RTMS_INGEST_ROUTE shape — see maybeHandleZoomRtmsIngest's forward, which now preserves the
+      // path instead of collapsing it to a bare "/ingest"), route that socket into ingestByTrack keyed by
+      // the track segment. A bare "/ingest" dial (today's single-track path, and every existing test) has
+      // no match here → trackName stays null → the legacy `this.ingest` slot, byte-identical to before.
+      const m = new URL(request.url).pathname.match(ZOOM_RTMS_INGEST_ROUTE);
+      const trackName = m ? m[4] : null;
+      return this.acceptIngest(trackName);
     }
     const path = new URL(request.url).pathname.replace(/^\/+/, "");
     try {
@@ -123,8 +164,14 @@ export class ZoomRtmsBridgeDO {
     }
   }
 
-  /** Accept the SFU's ingest WS upgrade and hold the server socket as the PCM sink (mirrors AgentSessionDO). */
-  private acceptIngest(): Response {
+  /**
+   * Accept the SFU's ingest WS upgrade and hold the server socket as the PCM sink (mirrors AgentSessionDO).
+   * `trackName` is null for the legacy single-track dial (or when it matches the mixed target's own track
+   * name) → held in `this.ingest`; any OTHER track name (a per-participant track minted by `sinks()`) is
+   * held in `ingestByTrack` keyed by that name instead. Both slots use the identical accept/sink/cleanup
+   * shape — only WHERE the socket is stored differs.
+   */
+  private acceptIngest(trackName: string | null): Response {
     const WSP = (globalThis as unknown as { WebSocketPair?: new () => Record<string, WebSocket> }).WebSocketPair;
     if (!WSP) {
       return Response.json({ error: "REALTIME_NOT_CONFIGURED", message: "WebSocketPair unavailable" }, { status: 503 });
@@ -148,13 +195,22 @@ export class ZoomRtmsBridgeDO {
         }
       },
     };
-    this.ingest = sink;
-    const clear = (): void => {
-      if (this.ingest === sink) this.ingest = null;
-    };
+    const isMixed = !trackName || trackName === this.target?.trackName;
+    let clear: () => void;
+    if (isMixed) {
+      this.ingest = sink;
+      clear = (): void => {
+        if (this.ingest === sink) this.ingest = null;
+      };
+    } else {
+      this.ingestByTrack.set(trackName, sink);
+      clear = (): void => {
+        if (this.ingestByTrack.get(trackName) === sink) this.ingestByTrack.delete(trackName);
+      };
+    }
     server.addEventListener("close", clear);
     server.addEventListener("error", clear);
-    console.log(JSON.stringify({ msg: "zoom-rtms-ingest-open" }));
+    console.log(JSON.stringify({ msg: "zoom-rtms-ingest-open", trackName: trackName ?? "(mixed)" }));
     try {
       return new Response(null, { status: 101, webSocket: client } as ResponseInit & { webSocket: WebSocket });
     } catch {
@@ -178,12 +234,17 @@ export class ZoomRtmsBridgeDO {
       console.log(JSON.stringify({ msg: "zoom-rtms-no-room-mapping", meetingUuid: event.meetingUuid }));
       return false;
     }
+    // #RTMS-fanout — stash so buildDeps().sinks()/ensureParticipantTrack can mint a per-user track/endpoint
+    // later, lazily, without re-resolving the KV mapping per participant.
+    this.meetingUuid = event.meetingUuid;
+    this.target = target;
     this.core = new RtmsBridgeCore(this.buildDeps(target), {
       clientId: this.env.ZOOM_APPS_CLIENT_ID,
       clientSecret: this.env.ZOOM_APPS_CLIENT_SECRET,
       target,
       framing: this.env.AGENT_INGEST_FRAMING,
       videoEnabled: rtmsVideoEnabled(this.env),
+      perParticipantEnabled: rtmsPerParticipantEnabled(this.env),
     });
     await this.core.start(event);
     return true;
@@ -204,6 +265,7 @@ export class ZoomRtmsBridgeDO {
       rec = null;
     }
     if (!rec || !SAFE_SEGMENT.test(rec.org ?? "") || !SAFE_SEGMENT.test(rec.sessionId ?? "")) return null;
+    this.resolvedOrg = rec.org; // #RTMS-fanout — needed later to mint per-participant endpoints
     const trackName = rec.trackName && SAFE_SEGMENT.test(rec.trackName) ? rec.trackName : `zoom-${meetingUuid}`;
     if (!SAFE_SEGMENT.test(trackName)) return null;
     const baseWss = (this.env.AGENT_PUBLIC_WSS ?? "wss://rt.wave.online").replace(/\/+$/, "");
@@ -225,9 +287,108 @@ export class ZoomRtmsBridgeDO {
       connect: (url, onMessage, onClose) => this.connectZoomLeg(url, onMessage, onClose),
       createIngest: (tracks) => createIngestAdapter({ fetchImpl }, { appId: target.appId, bearer: target.bearer, tracks }),
       ingestSocket: () => this.ingest,
+      // #RTMS-fanout WAVE_RTMS_PER_PARTICIPANT — always wired (core only calls it when perParticipantEnabled
+      // AND a valid userId was parsed, per rtms-bridge-core.ts); flag off ⇒ never invoked, inert.
+      sinks: (userId) => this.buildParticipantSinks(userId),
       now: () => Date.now(),
       log: (msg, fields) => console.log(JSON.stringify({ msg, ...fields })),
     };
+  }
+
+  /**
+   * #RTMS-fanout — RtmsBridgeDeps.sinks(userId): called by core ONCE per newly-seen (sanitized) participant,
+   * SYNCHRONOUSLY (the result is cached in core's participants map). Since minting a real SFU ingest track
+   * is async (an HTTP round-trip), this returns a sink IMMEDIATELY that lazily re-reads `ingestByTrack` on
+   * every audio()/video() call — exactly the same "drop until the socket connects" contract the mixed path
+   * already has via `deps.ingestSocket()`. The async createIngest kick-off is fired here (best-effort,
+   * logged on failure, never thrown into core's synchronous call).
+   *
+   * ◆ LIVE-INFRA-GATED: the SFU actually dialing BACK the per-participant endpoint (the other half of the
+   * round-trip — see acceptIngest's per-track routing) is proven here only via an INJECTED upgrade request
+   * in tests; the real CF Realtime SFU behavior for N concurrent inbound dials on one DO is unverified
+   * against live infra (same class of gap the module header already documents for the outbound Zoom dial).
+   */
+  private buildParticipantSinks(userId: string | null): ParticipantSink[] {
+    if (!userId || !SAFE_RTMS_USER_ID.test(userId) || !this.target || !this.meetingUuid) return [];
+    const trackName = `zoom-${this.meetingUuid}-${userId}`;
+    this.ensureParticipantTrack(trackName).catch((e) => {
+      console.log(JSON.stringify({ msg: "zoom-rtms-participant-track-error", trackName, message: (e as Error)?.message ?? "unknown" }));
+    });
+    const self = this;
+    const sink: ParticipantSink = {
+      audio(frame: Uint8Array): void {
+        self.ingestByTrack.get(trackName)?.send(frame);
+      },
+      video(frame: Uint8Array): void {
+        self.ingestByTrack.get(trackName)?.send(frame);
+      },
+      close(): void {
+        self.ingestByTrack.get(trackName)?.close?.();
+        self.ingestByTrack.delete(trackName);
+        self.requestedParticipantTracks.delete(trackName);
+      },
+    };
+    const sinks: ParticipantSink[] = [sink];
+    // #314 Slice 1 — an ADDITIONAL container-egress sink, on top of (never instead of) the SFU-track sink
+    // above. Only ever added when getMoqTarget() resolves live (flag on AND MOQ_PUBLISH bound AND a valid
+    // namespace) — otherwise this is a no-op and `sinks` stays exactly the single-entry array it is today.
+    const moq = this.getMoqTarget();
+    if (moq) sinks.push(new MoqTrackSink((msg, fields) => console.log(JSON.stringify({ msg, ...fields })), userId, moq));
+    return sinks;
+  }
+
+  /**
+   * #314 Slice 1 — lazily resolve (once per DO instance) the ONE MoqForwardWriter every participant's
+   * MoqTrackSink shares for this meeting. Resolves to `null` (cached, never retried) when
+   * WAVE_RTMS_PER_PARTICIPANT is off, MOQ_PUBLISH is unbound, or org/meetingUuid haven't been resolved yet
+   * (resolveTarget hasn't run) — INERT by default: with no `[[containers]] MOQ_PUBLISH` binding provisioned,
+   * this always returns null and MoqTrackSink stays the log-only stub it was before #314.
+   */
+  private getMoqTarget(): MoqForwardWriter | null {
+    if (this.moqTarget !== undefined) return this.moqTarget;
+    if (!rtmsPerParticipantEnabled(this.env) || !this.env.MOQ_PUBLISH || !this.resolvedOrg || !this.meetingUuid) {
+      this.moqTarget = null;
+      return null;
+    }
+    this.moqTarget = createMoqForwardTarget(this.env, this.resolvedOrg, this.meetingUuid, (msg, fields) =>
+      console.log(JSON.stringify({ msg, ...fields })),
+    );
+    return this.moqTarget;
+  }
+
+  /**
+   * #RTMS-fanout — lazily mint the per-participant CF Realtime ingest adapter (mirrors resolveTarget's
+   * endpoint-building for the mixed track, but keyed to `zoom-${meetingUuid}-${userId}`). Idempotent per
+   * trackName (a Set guards against a duplicate createIngest call on every frame); a failure clears the
+   * guard so the NEXT frame for that participant retries, rather than permanently wedging the participant.
+   */
+  private async ensureParticipantTrack(trackName: string): Promise<void> {
+    if (this.requestedParticipantTracks.has(trackName)) return;
+    this.requestedParticipantTracks.add(trackName);
+    const target = this.target;
+    if (!target || !this.meetingUuid || !this.resolvedOrg) return;
+    try {
+      const baseWss = (this.env.AGENT_PUBLIC_WSS ?? "wss://rt.wave.online").replace(/\/+$/, "");
+      const secret = this.env.WAVE_INTERNAL_SECRET;
+      const seg = (s: string): string => encodeURIComponent(s);
+      const token = secret ? await mintRecorderToken(secret, this.resolvedOrg, target.sessionId, trackName) : "";
+      const endpoint =
+        `${baseWss}/zoom/rtms/ingest/${seg(this.meetingUuid)}/${seg(this.resolvedOrg)}/${seg(target.sessionId)}/${seg(trackName)}` +
+        (token ? `?t=${seg(token)}` : "");
+      const fetchImpl = this.env.__zoomFetch ?? fetch;
+      await createIngestAdapter(
+        { fetchImpl },
+        {
+          appId: target.appId,
+          bearer: target.bearer,
+          tracks: [{ location: "local", sessionId: target.sessionId, trackName, endpoint, inputCodec: "pcm", mode: "buffer" }],
+        },
+      );
+      console.log(JSON.stringify({ msg: "zoom-rtms-participant-track-created", trackName }));
+    } catch (e) {
+      this.requestedParticipantTracks.delete(trackName); // allow a later frame to retry
+      console.log(JSON.stringify({ msg: "zoom-rtms-participant-track-error", trackName, message: (e as Error)?.message ?? "unknown" }));
+    }
   }
 
   /**
@@ -269,7 +430,32 @@ export class ZoomRtmsBridgeDO {
 interface ZoomRtmsDispatchEnv {
   WAVE_ZOOM_RTMS?: string | boolean;
   WAVE_INTERNAL_SECRET?: string;
+  WAVE_ORG?: string;
   ZOOM_RTMS_BRIDGE?: DurableObjectNamespace;
+  RT_MEETING_ORG?: { get(key: string, type: "json"): Promise<unknown>; put(key: string, value: string): Promise<void> };
+}
+
+/**
+ * #314-unblock — idempotently populate RT_MEETING_ORG[meetingUuid] on a verified rtms_started webhook, so
+ * resolveTarget() (which fails CLOSED to null on a missing/malformed record) has something to dial into.
+ * NEVER clobbers an existing operator-provisioned mapping (only writes when absent). Never throws — a KV
+ * hiccup here must not block the /start POST that follows; log a non-secret error and move on.
+ */
+async function populateMeetingOrg(env: ZoomRtmsDispatchEnv, meetingUuid: string): Promise<void> {
+  const kv = env.RT_MEETING_ORG;
+  if (!kv) return;
+  try {
+    const existing = await kv.get(meetingUuid, "json");
+    if (existing) return; // never clobber an existing mapping
+    const rawOrg = env.WAVE_ORG ?? "default";
+    const org = SAFE_SEGMENT.test(rawOrg) ? rawOrg : "default";
+    const safe = (s: string): string => `zoom-${s}`.replace(/[^A-Za-z0-9_:.-]/g, "").slice(0, 128);
+    const sessionId = safe(meetingUuid);
+    const trackName = safe(meetingUuid);
+    await kv.put(meetingUuid, JSON.stringify({ org, sessionId, trackName }));
+  } catch (e) {
+    console.log(JSON.stringify({ msg: "zoom-rtms-meeting-org-populate-error", meetingUuid, message: (e as Error)?.message ?? "unknown" }));
+  }
 }
 
 /**
@@ -282,6 +468,7 @@ export function zoomRtmsSeams(env: ZoomRtmsDispatchEnv): { onRtmsStarted?: OnRtm
   if (!bridge) return {};
   return {
     onRtmsStarted: async (ev): Promise<void> => {
+      await populateMeetingOrg(env, ev.meetingUuid);
       await bridge.get(bridge.idFromName(ev.meetingUuid)).fetch(new Request("https://zoom-rtms/start", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -323,5 +510,9 @@ export async function maybeHandleZoomRtmsIngest(
     return Response.json({ error: "UPGRADE_REQUIRED", message: "zoom rtms ingest route requires a WebSocket upgrade" }, { status: 426 });
   }
   // Preserve the Upgrade header + WS-upgrade intent across the stub boundary; relay the DO's 101 + client.
-  return env.ZOOM_RTMS_BRIDGE.get(env.ZOOM_RTMS_BRIDGE.idFromName(zmid)).fetch(new Request("https://zoom-rtms/ingest", request));
+  // #RTMS-fanout: keep the 4-segment path (not a bare "/ingest") so the DO can re-match ZOOM_RTMS_INGEST_ROUTE
+  // and route this socket to the right per-participant track slot (see acceptIngest). The ?t= token was
+  // already verified above — dropped here, it's not needed past this boundary.
+  const forwardUrl = `https://zoom-rtms/zoom/rtms/ingest/${encodeURIComponent(zmid)}/${encodeURIComponent(zorg)}/${encodeURIComponent(zsession)}/${encodeURIComponent(ztrack)}`;
+  return env.ZOOM_RTMS_BRIDGE.get(env.ZOOM_RTMS_BRIDGE.idFromName(zmid)).fetch(new Request(forwardUrl, request));
 }
