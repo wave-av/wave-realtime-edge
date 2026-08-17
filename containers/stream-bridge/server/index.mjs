@@ -127,7 +127,7 @@ const server = createServer(async (req, res) => {
     // Fail-LOUD: a relay that can't come up returns 5xx so B1's reconcile re-dispatches (§9.5).
     active = null;
     log("bridge-error", { url: req.url, message: String(err?.message || err).slice(0, 300) });
-    return send(502, { error: String(err?.message || err).slice(0, 300) });
+    return send(502, { error: "internal error" });
   }
 });
 
