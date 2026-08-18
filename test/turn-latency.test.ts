@@ -8,6 +8,11 @@ describe("p50p95", () => {
     expect(p50).toBe(30);
     expect(p95).toBe(50);
   });
+  it("uses the lower value at even-sized rank boundaries", () => {
+    const values = Array.from({ length: 30 }, (_, i) => i + 1);
+    expect(p50p95(values)).toEqual({ p50: 15, p95: 29, n: 30 });
+    expect(p50p95(values.slice(0, 20))).toEqual({ p50: 10, p95: 19, n: 20 });
+  });
   it("empty → zeros", () => {
     expect(p50p95([])).toEqual({ p50: 0, p95: 0, n: 0 });
   });
