@@ -136,11 +136,11 @@ export class SpeechSession {
     // one chunk later, so counting at completion would under-report exactly the turns that waste the most.
     this.ttsCharsSubmitted += text.length;
     try {
-      let firstAudio = false;
+      let firstAudio = false; // Callback is invoked after the first successful on-wire send.
       for await (const pcm of this.deps.synthesize(text)) {
         if (this.opts.isAborted()) return this.endSpeak(text, pcmBytesOut, true); // barge-in: stop publishing the now-stale reply mid-stream
         if (!sock || pcm.length === 0) continue;
-        if (!firstAudio) { firstAudio = true; onFirstAudio?.(); } // E1 harness: TTS-first-audio-byte
+        
         for (const chunk of chunkPcm(pcm)) {
           if (this.opts.isAborted()) return this.endSpeak(text, pcmBytesOut, true); // barge-in between chunks → go silent immediately (don't send more)
           // playoutStartMs anchors the pacing window to the FIRST frame of the TURN, not of this sentence — with a
@@ -173,6 +173,7 @@ export class SpeechSession {
           // START-of-chunk sample index and CONTINUES ACROSS SENTENCES (D1) — one utterance, one timeline.
           const wire = encodeIngestFrame(chunk, { sequenceNumber: seq, timestamp: this.tsTicks }, this.opts.framing);
           sock.send(wire);
+            if (!firstAudio) { firstAudio = true; onFirstAudio?.(); } // E1 harness: TTS-first-audio-byte
           if (this.firstAudioMs < 0) this.firstAudioMs = this.deps.now(); // TTFA receipt: first frame ON THE WIRE
           pcmBytesOut += chunk.length;
           this.pcmBytesOut += chunk.length;
