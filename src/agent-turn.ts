@@ -42,6 +42,7 @@ import {
 import { decodePacket } from "./encoders/container-adapter.js";
 import { type IngestFraming } from "./agent-ingest-adapter.js";
 import { SpeechSession, streamSpeakSentences, type StreamSpeakAcc } from "./agent-turn-speech.js";
+import { LatencyCollector, type TurnHopMarks } from "./turn-latency.js";
 import { SentenceChunker } from "./sentence-chunker.js";
 import { meterFinishedTurn, meterAbandonedTurn, meterSessionClose } from "./agent-turn-meter.js";
 import { TurnCogsLedger } from "./voice-cogs-ledger.js";
@@ -220,6 +221,10 @@ export class TurnTakingCore {
   private committed = false;
   /** E0-P2 — the session's COGS ledger (DO wall-clock + STT submitted audio). Lives in its own module. */
   private readonly cogs: TurnCogsLedger;
+  /** E1 Task 7 measurement harness: per-turn hop marks (speech-end → STT → LLM → TTS). Additive — the
+   *  core's flow is unchanged; the marks only timestamp the hop boundaries and record a sample. */
+  private readonly latency = new LatencyCollector();
+  private currentMarks?: TurnHopMarks;
   /** E0-P2 — vendor rates, if provisioned. Absent ⇒ the COGS receipt reports `unpriced` rather than a guess. */
   private readonly cogsRates?: VoiceCogsRates;
 
@@ -288,12 +293,14 @@ export class TurnTakingCore {
       // turn). Now we accumulate while the user talks and run exactly ONE batch STT per utterance, after silence.
       // Frames keep advancing the VAD above; nothing else happens until the hangover trips speech-end.
       if (vadEvent !== "speech-end") return; // still speaking, or steady silence → accumulate only
+      this.currentMarks = { turnId: `t${this.turnSeq}`, speechEndMs: this.deps.now() }; // E1 harness: hop 0
       this.deps.log("agent-vad-endpoint", { ...this.idFields(), rms: Math.round(this.vad.lastFrameRms) });
       stage = "stt";
       const pcm = concat(this.utterance);
       this.cogs.recordStt(pcm.length); // E0-P2: what the STT vendor bills is the buffer we POST, padding included
       this.resetUtterance(); // the utterance ended at speech-end — consume it regardless of the STT outcome
       const stt = await this.deps.transcribe(pcm);
+      if (this.currentMarks) this.currentMarks.sttFinalMs = this.deps.now(); // E1 harness: hop 1 (the named risk)
       if (!stt.isFinal) return; // a future STREAMING STT may emit partials behind this same seam; v1 batch ⇒ final
       const userText = stt.transcript.trim();
       if (userText.length === 0) return; // silence / nothing recognized → no turn
@@ -460,7 +467,21 @@ export class TurnTakingCore {
         const who = { org, room, agentId, ledger: this.cogs, rates: this.cogsRates };
         meterAbandonedTurn(this.deps, this.idFields(), who, { turnId, startMs, speech: turnSpeech });
       }
+      // E1 harness: record this turn's hop marks. Every 30 turns, log the p50/p95 distribution (the
+      // Done-check names it) so the numbers land in the agent-turn logs without any extra plumbing.
+      if (this.currentMarks) {
+        this.latency.record(this.currentMarks);
+        if (this.latency.count() % 30 === 0) {
+          this.deps.log("agent-turn-latency", { ...this.idFields(), distribution: this.latency.distribution() });
+        }
+        this.currentMarks = undefined;
+      }
     }
+  }
+
+  /** E1 Task 7: the accumulated per-hop latency distribution (p50/p95 over the recorded turns). */
+  distribution(): { hop: "stt" | "llm" | "tts" | "total"; p50: number; p95: number; n: number }[] {
+    return this.latency.distribution();
   }
 
   /**
