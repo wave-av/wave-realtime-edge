@@ -370,7 +370,7 @@ export class TurnTakingCore {
           const acc: StreamSpeakAcc = { assistant: "", spoken: "", toolUses: [], aborted: false };
           const chunker = new SentenceChunker();
           try {
-            await streamSpeakSentences(this.deps.complete([...working], toolDefs), speech, chunker, acc, () => this.aborted);
+            await streamSpeakSentences(this.deps.complete([...working], toolDefs), speech, chunker, acc, () => this.aborted, () => { if (this.currentMarks) this.currentMarks.llmFirstTokenMs = this.deps.now(); }, () => { if (this.currentMarks) this.currentMarks.ttsFirstAudioMs = this.deps.now(); });
           } catch (e) {
             // HONEST FAILURE (#344 semantics): the turn FAILED, but audio already on the wire cannot be unheard.
             // Commit exactly what was spoken so the next turn's history matches what the listener heard, then
@@ -406,7 +406,7 @@ export class TurnTakingCore {
           this.committed = true;
           stage = "tts";
           const tail = chunker.flush(); // the trailing partial sentence the boundary policy held back
-          if (tail.length > 0 && (await speech.speak(tail)) < 0) return; // aborted mid-tail: history already valid
+          if (tail.length > 0 && (await speech.speak(tail, () => { if (this.currentMarks) this.currentMarks.ttsFirstAudioMs = this.deps.now(); })) < 0) return; // aborted mid-tail: history already valid
           metered = true;
           await this.logMeter(userText, assistant, toolsUsed, turnId, startMs, speech);
           return;
@@ -431,7 +431,7 @@ export class TurnTakingCore {
           this.committed = true;
           stage = "tts";
           const speech = (turnSpeech = this.openSpeech());
-          const pcmBytesOut = await speech.speak(assistant);
+          const pcmBytesOut = await speech.speak(assistant, () => { if (this.currentMarks) this.currentMarks.ttsFirstAudioMs = this.deps.now(); });
           if (pcmBytesOut < 0) return; // aborted mid-TTS (already committed history is valid + alternating)
           metered = true;
           await this.logMeter(userText, assistant, toolsUsed, turnId, startMs, speech);
