@@ -115,7 +115,7 @@ export class SpeechSession {
    * echoFrame send path). Returns the PCM bytes published FOR THIS PIECE, or -1 if a barge-in aborted mid-stream
    * (the agent goes silent). Honors abort at every await. Safe to call repeatedly — the media clock continues.
    */
-  async speak(text: string): Promise<number> {
+  async speak(text: string, onFirstAudio?: () => void): Promise<number> {
     let pcmBytesOut = 0;
     const sock = this.deps.ingestSocket();
     // Observability (#29): the agent has a reply to speak but the SFU never dialed our /ingest endpoint (no live
@@ -136,9 +136,11 @@ export class SpeechSession {
     // one chunk later, so counting at completion would under-report exactly the turns that waste the most.
     this.ttsCharsSubmitted += text.length;
     try {
+      let firstAudio = false;
       for await (const pcm of this.deps.synthesize(text)) {
         if (this.opts.isAborted()) return this.endSpeak(text, pcmBytesOut, true); // barge-in: stop publishing the now-stale reply mid-stream
         if (!sock || pcm.length === 0) continue;
+        if (!firstAudio) { firstAudio = true; onFirstAudio?.(); } // E1 harness: TTS-first-audio-byte
         for (const chunk of chunkPcm(pcm)) {
           if (this.opts.isAborted()) return this.endSpeak(text, pcmBytesOut, true); // barge-in between chunks → go silent immediately (don't send more)
           // playoutStartMs anchors the pacing window to the FIRST frame of the TURN, not of this sentence — with a
@@ -229,7 +231,10 @@ export async function streamSpeakSentences(
   chunker: SentenceChunker,
   acc: StreamSpeakAcc,
   isAborted: () => boolean,
+  onFirstToken?: () => void,
+  onFirstAudio?: () => void,
 ): Promise<void> {
+  let sawText = false;
   for await (const evt of events) {
     if (isAborted()) {
       acc.aborted = true;
@@ -239,13 +244,14 @@ export async function streamSpeakSentences(
       acc.toolUses.push({ id: evt.id, name: evt.name, input: evt.input });
       continue; // defensive: a tool_use here means the caller mis-gated; stop speaking, let it handle them
     }
+    if (!sawText) { sawText = true; onFirstToken?.(); } // E1 harness: LLM-first-token
     acc.assistant += evt.text;
     if (acc.toolUses.length > 0) continue; // never speak text that belongs to a tool-calling turn
     for (const sentence of chunker.push(evt.text)) {
       const bytesBefore = session.pcmBytesOut;
       let n: number;
       try {
-        n = await session.speak(sentence);
+        n = await session.speak(sentence, onFirstAudio);
       } catch (e) {
         acc.errorStage = "tts"; // the SPEECH lane died (synthesize/send), not the LLM stream — attribute honestly
         // Same rule as barge-in: audio that reached the wire before the throw was HEARD → acc stays honest.
