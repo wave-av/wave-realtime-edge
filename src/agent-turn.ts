@@ -72,6 +72,7 @@ import {
   transcribeViaProvider,
   type FetchLike,
 } from "./agent-turn-providers.js";
+import { streamingTranscribe } from "./agent-stt-streaming.js";
 
 // ── Public contracts (the injectable-deps seam) ──────────────────────────────────────────────────────────────
 
@@ -681,6 +682,13 @@ export interface AgentTurnEnv extends AgentSessionEnv, VadEnv, VoiceMeterEnv {
   VOICE_AGENT_TOOLS?: string;
   /** Step-5 gateway tool-exec path override (var). Default /v1/internal/tools/exec (TODO #81: pin with gateway). */
   VOICE_AGENT_TOOL_EXEC_PATH?: string;
+  /**
+   * Streaming STT flag (var). When "true" or "1", uses Deepgram WebSocket streaming STT
+   * instead of the batch gateway-fronted path. Default OFF (byte-identical batch path).
+   */
+  VOICE_AGENT_STREAMING_STT?: string;
+  /** Deepgram API key (secret; server-side ONLY). Required when VOICE_AGENT_STREAMING_STT is enabled. */
+  DEEPGRAM_API_KEY?: string;
 }
 
 /**
@@ -725,6 +733,13 @@ export function buildTurnDeps(
   return {
     ...media,
     async transcribe(pcm: Uint8Array): Promise<SttResult> {
+      // Streaming STT path (Deepgram WebSocket) — behind env flag, default OFF.
+      // When armed, the adapter opens a WebSocket to Deepgram, streams PCM incrementally,
+      // and resolves the final transcript with lower time-to-final than batch.
+      if (env.VOICE_AGENT_STREAMING_STT === "true" || env.VOICE_AGENT_STREAMING_STT === "1") {
+        return streamingTranscribe(pcm, env);
+      }
+      // Batch path (byte-identical to current) — the proven gateway-fronted transcribe spoke.
       const base = env.VOICE_AGENT_STT_BASE ?? env.WAVE_GATEWAY_BASE;
       const token = env.VOICE_AGENT_STT_TOKEN ?? env.WAVE_GATEWAY_TOKEN;
       if (!base || !token) {
