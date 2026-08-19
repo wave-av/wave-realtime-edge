@@ -365,13 +365,14 @@ export class TurnTakingCore {
         // Stream this iteration: collect text (only the FINAL no-tool iteration's text is spoken) + tool_use blocks.
         let assistant = "";
         const toolUses: ToolUse[] = [];
+          let sawText = false;
         if (eager) {
           // ── D1 sentence-streaming path (the ONLY iteration — no tools are advertised, so there is no loop) ──
           const speech = (turnSpeech = this.openSpeech());
           const acc: StreamSpeakAcc = { assistant: "", spoken: "", toolUses: [], aborted: false };
           const chunker = new SentenceChunker();
           try {
-            await streamSpeakSentences(this.deps.complete([...working], toolDefs), speech, chunker, acc, () => this.aborted, () => { if (this.currentMarks) this.currentMarks.llmFirstTokenMs = this.deps.now(); }, () => { if (this.currentMarks) this.currentMarks.ttsFirstAudioMs = this.deps.now(); });
+            await streamSpeakSentences(this.deps.complete([...working], toolDefs), speech, chunker, acc, () => this.aborted, () => { if (this.currentMarks) this.currentMarks.llmFirstTokenMs = this.deps.now(); }, () => { if (this.currentMarks && this.currentMarks.ttsFirstAudioMs === undefined) this.currentMarks.ttsFirstAudioMs = this.deps.now(); });
           } catch (e) {
             // HONEST FAILURE (#344 semantics): the turn FAILED, but audio already on the wire cannot be unheard.
             // Commit exactly what was spoken so the next turn's history matches what the listener heard, then
@@ -407,14 +408,20 @@ export class TurnTakingCore {
           this.committed = true;
           stage = "tts";
           const tail = chunker.flush(); // the trailing partial sentence the boundary policy held back
-          if (tail.length > 0 && (await speech.speak(tail, () => { if (this.currentMarks) this.currentMarks.ttsFirstAudioMs = this.deps.now(); })) < 0) return; // aborted mid-tail: history already valid
+          if (tail.length > 0 && (await speech.speak(tail, () => { if (this.currentMarks && this.currentMarks.ttsFirstAudioMs === undefined) this.currentMarks.ttsFirstAudioMs = this.deps.now(); })) < 0) return; // aborted mid-tail: history already valid
           metered = true;
           await this.logMeter(userText, assistant, toolsUsed, turnId, startMs, speech);
           return;
         }
         for await (const evt of this.deps.complete([...working], toolDefs)) {
           if (this.aborted) break; // step-4 barge-in: cancel the in-flight stream
-          if (evt.type === "text") assistant += evt.text;
+          if (evt.type === "text") {
+              if (!sawText) {
+                sawText = true;
+                if (this.currentMarks && this.currentMarks.llmFirstTokenMs === undefined) this.currentMarks.llmFirstTokenMs = this.deps.now();
+              }
+              assistant += evt.text;
+            }
           else toolUses.push({ id: evt.id, name: evt.name, input: evt.input });
         }
         if (this.aborted) return;
@@ -432,7 +439,7 @@ export class TurnTakingCore {
           this.committed = true;
           stage = "tts";
           const speech = (turnSpeech = this.openSpeech());
-          const pcmBytesOut = await speech.speak(assistant, () => { if (this.currentMarks) this.currentMarks.ttsFirstAudioMs = this.deps.now(); });
+          const pcmBytesOut = await speech.speak(assistant, () => { if (this.currentMarks && this.currentMarks.ttsFirstAudioMs === undefined) this.currentMarks.ttsFirstAudioMs = this.deps.now(); });
           if (pcmBytesOut < 0) return; // aborted mid-TTS (already committed history is valid + alternating)
           metered = true;
           await this.logMeter(userText, assistant, toolsUsed, turnId, startMs, speech);
