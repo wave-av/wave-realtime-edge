@@ -97,6 +97,15 @@ export const VIDEO_CODECS = /** @type {Record<string, CodecEntry>} */ ({
     container: "mp4",
     encoders: [hw("prores_videotoolbox", "videotoolbox"), sw("prores_ks"), sw("prores")],
   },
+  // MLVC — learned-codec RESERVED SEAM (ffmpeg9-lei E17-P2 / R71). Not an ffmpeg encoder: the runtime is
+  // the E18 container (ONNX Runtime + msrtc_rans), so `encoders` stays EMPTY until E18 ships its shim —
+  // selection then finds nothing available and the seam is inert by construction. The verdict (R71)
+  // scopes it: the low-bitrate tier (VMAF 83-87), not the high-quality ladder.
+  mlvc: {
+    media: "video",
+    container: "mkv",
+    encoders: [],
+  },
 });
 
 /**
