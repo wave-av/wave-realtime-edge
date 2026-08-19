@@ -79,8 +79,9 @@ describe("streamingTranscribe", () => {
       }),
     });
 
+    
     const result = await resultP;
-    expect(result).toEqual({ isFinal: true, transcript: "hello world" });
+      expect(result).toEqual({ isFinal: true, transcript: "hello world" });
   });
 
   it("throws when DEEPGRAM_API_KEY is missing", async () => {
@@ -102,7 +103,8 @@ describe("streamingTranscribe", () => {
     ws.onopen?.();
 
     // Should have sent 2 chunks
-    expect(ws.sent).toHaveLength(2);
+    expect(ws.sent).toHaveLength(3);
+      expect(ws.sent[2]).toBe(JSON.stringify({ type: "CloseStream" }));
     expect((ws.sent[0] as Uint8Array).length).toBe(4096);
     expect((ws.sent[1] as Uint8Array).length).toBe(4096);
 
@@ -139,8 +141,8 @@ describe("streamingTranscribe", () => {
     // Socket closes without is_final (e.g. server-side close after processing)
     ws.onclose?.({ code: 1000, reason: "done" });
 
-    const result = await resultP;
-    expect(result).toEqual({ isFinal: true, transcript: "partial" });
+    
+    await expect(resultP).rejects.toThrow("closed before final result");
   });
 
   it("rejects on WebSocket error", async () => {
@@ -172,7 +174,8 @@ describe("streamingTranscribe", () => {
       }),
     });
 
+    
     const result = await resultP;
-    expect(result).toEqual({ isFinal: true, transcript: "" });
+      expect(result).toEqual({ isFinal: true, transcript: "" });
   });
 });

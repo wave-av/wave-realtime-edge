@@ -69,7 +69,7 @@ export async function streamingTranscribe(
     // The CF Workers runtime exposes the standard browser WebSocket constructor for outbound
     // connections from DOs. The @cloudflare/workers-types package only types the hibernation
     // (server-side) WebSocket; we bridge via the OutboundWebSocket interface above.
-    const ws = new (globalThis.WebSocket as unknown as new (url: string) => OutboundWebSocket)(url);
+    const ws = new (globalThis.WebSocket as unknown as new (url: string, protocols?: string | string[]) => OutboundWebSocket)(url, ["token", apiKey]);
     let settled = false;
     let transcript = "";
 
@@ -91,7 +91,7 @@ export async function streamingTranscribe(
         ws.send(pcm.slice(off, off + CHUNK_SIZE));
       }
       // Signal end-of-audio so Deepgram flushes the final transcript.
-      ws.close(1000, "done");
+      ws.send(JSON.stringify({ type: "CloseStream" }));
     };
 
     ws.onmessage = (ev) => {
@@ -129,12 +129,12 @@ export async function streamingTranscribe(
     };
 
     ws.onclose = () => {
-      // Fallback: if the socket closed without an is_final (network issue, server-side close),
-      // treat the last accumulated transcript as final — better than failing the turn.
-      if (!settled) {
+      // Reject closures that do not carry a validated final result.
+        
+            if (!settled) {
         settled = true;
         clearTimeout(timeout);
-        resolve({ isFinal: true, transcript });
+        reject(new AgentSessionError("STT_UPSTREAM", "Deepgram WebSocket closed before final result", 502));
       }
     };
   });
