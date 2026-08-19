@@ -44,7 +44,7 @@ export function hopLatencies(m: TurnHopMarks): TurnHopLatency {
 export function p50p95(nums: number[]): { p50: number; p95: number; n: number } {
   if (nums.length === 0) return { p50: 0, p95: 0, n: 0 };
   const sorted = [...nums].sort((a, b) => a - b);
-  const q = (p: number) => sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))];
+  const q = (p: number) => sorted[Math.max(0, Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1))];
   return { p50: q(50), p95: q(95), n: sorted.length };
 }
 
