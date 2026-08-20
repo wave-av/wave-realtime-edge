@@ -469,7 +469,11 @@ export class AgentSessionDO {
     const bearer = env.CF_CALLS_APP_SECRET ?? "";
     const appId = env.CF_CALLS_APP_ID ?? "";
     return {
-      createEgress: (tracks) => createWebsocketAdapter({ fetchImpl }, { appId, bearer, tracks }),
+      // The egress subscribe races the client's publish: the "mic" track may not be registered on the SFU
+      // session yet when the bind fires, so createWebsocketAdapter would return not_found_track_error on its
+      // single attempt and 502 the whole bind. Retry on that signal (trackNotReady) until the track appears —
+      // the adapter's own retry path, only armed here (default maxAttempts=1 = no retry).
+      createEgress: (tracks) => createWebsocketAdapter({ fetchImpl, retry: { maxAttempts: 12, delayMs: (a) => Math.min(500 * a, 2000) } }, { appId, bearer, tracks }),
       createIngest: (tracks) => createIngestAdapter({ fetchImpl }, { appId, bearer, tracks }),
       ingestSocket: () => this.ingest,
       now: () => Date.now(),
