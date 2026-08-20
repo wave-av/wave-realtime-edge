@@ -21,6 +21,21 @@ import type { AgentTurnEnv, LlmMessage } from "./agent-turn.js";
 import type { ToolDefinition, CompletionEvent } from "./agent-tools.js";
 import type { FetchLike } from "./agent-turn-providers.js";
 
+/**
+ * Which inference backend the voice agent's LLM call routes to through the gateway's governed proxy
+ * (`x-wave-inference-backend`, agent-spokes.ts:286). "anthropic" (default) is the Anthropic Messages path —
+ * byte-identical to today. The GPU backends (ollama fleet / RunPod / OpenRouter / SSD-streamed) are our own
+ * capacity or an allowlisted third party, reached with an OpenAI-compatible body/stream instead.
+ */
+export type LlmBackend = "anthropic" | "ollama" | "runpod" | "openrouter" | "ssd-stream";
+
+/** Resolve the voice agent's LLM backend from env. Empty/unknown → "anthropic" (the default plane). */
+export function resolveLlmBackend(env: { VOICE_AGENT_LLM_BACKEND?: string }): LlmBackend {
+  const b = (env.VOICE_AGENT_LLM_BACKEND ?? "").trim().toLowerCase();
+  if (b === "ollama" || b === "runpod" || b === "openrouter" || b === "ssd-stream") return b;
+  return "anthropic";
+}
+
 /** Default Claude model routed through the gateway. Sonnet = the sensible voice default (latency/cost); a larger
  *  model (e.g. Opus) is selectable via VOICE_AGENT_LLM_MODEL per the design's Opus/Sonnet choice.
  *  #118 flip (2026-07-03): migrated sonnet-4-6 → sonnet-5, the supported sonnet tier. Measured A/B on the
@@ -84,17 +99,33 @@ export function buildGatewayLlmRequest(
     );
   }
   const model = env.VOICE_AGENT_LLM_MODEL ?? DEFAULT_VOICE_LLM_MODEL;
+  const backend = resolveLlmBackend(env);
   const system = messages.find((m) => m.role === "system")?.content;
   const turns = messages.filter((m) => m.role !== "system");
-  const body: Record<string, unknown> = {
-    model,
-    max_tokens: GATEWAY_LLM_MAX_TOKENS,
-    stream: true,
-    system,
-    messages: turns,
-  };
-  // agent-least-privilege: advertise ONLY the allowlisted tools (omit the field entirely when there are none).
-  if (tools.length > 0) body.tools = tools;
+  let body: Record<string, unknown>;
+  if (backend === "anthropic") {
+    // Anthropic Messages shape: system hoisted OUT of messages; tools in Anthropic `tools` shape.
+    body = {
+      model,
+      max_tokens: GATEWAY_LLM_MAX_TOKENS,
+      stream: true,
+      system,
+      messages: turns,
+    };
+    // agent-least-privilege: advertise ONLY the allowlisted tools (omit the field entirely when there are none).
+    if (tools.length > 0) body.tools = tools;
+  } else {
+    // OpenAI-compatible shape (ollama fleet / RunPod / OpenRouter / SSD-stream): the system prompt is a MESSAGE
+    // role, not a top-level field. Tools are DROPPED on this plane — the fleet model runs text-only (the Anthropic
+    // tool_use wire is not present here; a follow-up converts the allowlist to OpenAI function-calling).
+    const openAiMessages = messages.map((m) => ({ role: m.role, content: m.content }));
+    body = {
+      model,
+      max_tokens: GATEWAY_LLM_MAX_TOKENS,
+      stream: true,
+      messages: openAiMessages,
+    };
+  }
   const serialized = JSON.stringify(body);
   // The gateway measures the DECODED body (`const raw = await req.text()`), so measure the same string. A
   // multi-byte transcript makes this conservative in our favour — it never under-counts against the gate.
@@ -111,6 +142,9 @@ export function buildGatewayLlmRequest(
     accept: "text/event-stream", // forwarded verbatim to Anthropic (agent-spokes.ts:365) — this is what streams
     "x-wave-org": org, // REQUIRED tenant attribution + metering (agent-spokes.ts:275)
   };
+  // A non-Anthropic backend is NAMED explicitly (agent-spokes.ts:286) so the gateway routes it to the ollama
+  // fleet / RunPod / OpenRouter instead of the default Anthropic plane. Omitted for the default (never guessed).
+  if (backend !== "anthropic") headers["x-wave-inference-backend"] = backend;
   // #25 per-agent attribution: the gateway reads x-wave-agent (agent-budget.ts:98) into usage blob[2]. Omitted
   // when unknown — absent is legal ("" attribution), only a MISSING org is a 400.
   if (agentId) headers["x-wave-agent"] = agentId.slice(0, 128); // gateway truncates at 128 (agent-budget.ts:99)
@@ -149,7 +183,7 @@ export async function* streamGatewayLlm(
       502,
     );
   }
-  yield* parseAnthropicStream(res.body);
+  yield* resolveLlmBackend(env) === "anthropic" ? parseAnthropicStream(res.body) : parseOpenAiStream(res.body);
 }
 
 /** Extract the gateway's `{ok:false,reason}` marker from a failed response — always drains/releases the body. */
@@ -222,6 +256,24 @@ export async function* parseAnthropicStream(body: ReadableStream<Uint8Array>): A
         `gateway LLM stream error: ${evt.error?.type ?? "unknown"}`,
         502,
       );
+    }
+  }
+}
+
+/**
+ * Parse the OpenAI-compatible streaming envelope (ollama fleet / RunPod / OpenRouter) into CompletionEvents.
+ * The GPU backends are OpenAI-shape: `data: {"choices":[{"delta":{"content":"…"}}]}` deltas, ending in
+ * `data: [DONE]`. Tool-calling is NOT on this plane (the edge drops tools for the GPU path), so only text
+ * deltas are read — a `delta.role`/`delta.tool_calls` line is skipped, never mis-parsed as text.
+ * Per-event fail-soft (a malformed event is skipped, never kills the stream).
+ */
+export async function* parseOpenAiStream(body: ReadableStream<Uint8Array>): AsyncIterable<CompletionEvent> {
+  for await (const raw of sseEvents(body)) {
+    const choices = (raw as { choices?: { delta?: { content?: unknown } }[] }).choices;
+    if (!Array.isArray(choices)) continue;
+    for (const c of choices) {
+      const text = c?.delta?.content;
+      if (typeof text === "string" && text.length > 0) yield { type: "text", text };
     }
   }
 }
