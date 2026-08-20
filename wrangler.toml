@@ -256,12 +256,13 @@ VOICE_AGENT_PROVIDER = "wave"
 
 # ── Voice-agent LLM backend + model (gateway governed proxy `x-wave-inference-backend`) ──
 # "anthropic" (default) = Claude via the Anthropic Messages API; "ollama" = our local fleet
-# (ollama.wave.online), "runpod"/"openrouter"/"ssd-stream" = the GPU planes. Routed to "ollama" so the voice
-# agent runs on our OWN capacity instead of the Anthropic account (billing-failure — the governed gateway's
-# model-normalization.ts: every claude call returns llm_upstream until that account is paid). Model is what the
-# chosen backend serves — the fleet has qwen3.8:27b-chat / gpt-oss:120b / deepseek-v4-pro:cloud (ollama list).
-VOICE_AGENT_LLM_BACKEND = "ollama"
-VOICE_AGENT_LLM_MODEL = "qwen3.8:27b-chat"
+# (ollama.wave.online), "openrouter" = allowlisted third-party models, "runpod"/"ssd-stream" = the GPU planes.
+# Routed to "openrouter" because BOTH other options are currently down: the Anthropic account is billing-failed
+# (every claude call returns llm_upstream) and the ollama fleet behind CF Access times out from the gateway
+# (llm_unreachable). OpenRouter is always-on + the key is provisioned; qwen3.7-flash is the low-latency pick for
+# a voice agent (allowlisted in the governed gateway). Switch back to "ollama"/"anthropic" once either is healthy.
+VOICE_AGENT_LLM_BACKEND = "openrouter"
+VOICE_AGENT_LLM_MODEL = "qwen/qwen3.7-flash"
 
 # E0-P2 vendor COGS rates (voice-cogs.ts voiceCogsRatesFromEnv) — the published vendor list prices used to
 # price each turn's cost internally (ttsUsdPerChar = ElevenLabs Business v2 ~$0.05/1k chars; sttUsdPerAudioMinute
