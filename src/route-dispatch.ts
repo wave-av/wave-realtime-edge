@@ -69,6 +69,7 @@ import {
 	AGENT_DISPATCH_INTENTS,
 	AGENT_EGRESS_ROUTE,
 	AGENT_INGEST_ROUTE,
+	AGENT_TTS_ROUTE,
 	PRESENCE_ROUTE,
 	presenceEnabled,
 	INGRESS_ROUTE,
@@ -716,6 +717,30 @@ export async function dispatch(
 			// Pass the original request as init so the Upgrade header + the WS-upgrade intent are preserved
 			// across the stub boundary (the DO returns the 101 + webSocket client we relay back).
 			return stub.fetch(new Request(`https://agent/ingest?sessionId=${encodeURIComponent(asession)}&trackName=${encodeURIComponent(atrack)}`, request));
+		}
+
+		// 4) TTS playout WS: the CLIENT dials IN to receive the agent's TTS PCM directly (the direct-playback
+		// path — bypasses the broken SFU ingest). Same capability-token auth as ingest (the ?t= the client
+		// carries, OR the gateway-trust seal); the upgrade is forwarded to the SAME `${org}:${room}`
+		// AgentSessionDO, which adds the socket to its broadcast sink set so speak() fans the TTS PCM to it.
+		const atMatch = url.pathname.match(AGENT_TTS_ROUTE);
+		if (atMatch) {
+			const [, aorg, aroom, asession, atrack] = atMatch;
+			if (![aorg, aroom, asession, atrack].every((s) => SAFE_SEGMENT.test(s)) || !env.AGENT_SESSION) {
+				return Response.json({ error: "BAD_REQUEST", message: "invalid agent tts path or no AGENT_SESSION binding" }, { status: 400 });
+			}
+			const tok = url.searchParams.get("t");
+			const tokenOk = !!tok && !!env.WAVE_INTERNAL_SECRET && (await verifyRecorderToken(env.WAVE_INTERNAL_SECRET, aorg, asession, atrack, tok));
+			if (!tokenOk) {
+				const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
+				if (denied) return denied;
+			}
+			if ((request.headers.get("Upgrade") ?? "").toLowerCase() !== "websocket") {
+				return Response.json({ error: "UPGRADE_REQUIRED", message: "agent tts route requires a WebSocket upgrade" }, { status: 426 });
+			}
+			const id = env.AGENT_SESSION.idFromName(`${aorg}:${aroom}`);
+			const stub = env.AGENT_SESSION.get(id);
+			return stub.fetch(new Request(`https://agent/tts?sessionId=${encodeURIComponent(asession)}&trackName=${encodeURIComponent(atrack)}`, request));
 		}
 	}
 
