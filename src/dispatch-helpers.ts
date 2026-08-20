@@ -165,6 +165,11 @@ export const AGENT_EGRESS_ROUTE = /^\/v1\/realtime\/agents\/egress\/([^/]+)\/([^
 /** Task #81 — agent INGEST WS (SFU dials IN to PULL the agent's PCM): /v1/realtime/agents/ingest/:org/:room/:sessionId/:trackName.
  *  Symmetric to AGENT_EGRESS_ROUTE, but the upgrade is FORWARDED to the `${org}:${room}` AgentSessionDO so the DO owns the durable socket. */
 export const AGENT_INGEST_ROUTE = /^\/v1\/realtime\/agents\/ingest\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
+/** Task #81 — agent TTS playout WS the CLIENT dials to receive the agent's TTS PCM directly (the direct-playback
+ *  path that bypasses the broken SFU ingest): /v1/realtime/agents/tts/:org/:room/:sessionId/:trackName.
+ *  Same capability-token auth as ingest; the upgrade is FORWARDED to the `${org}:${room}` AgentSessionDO, which
+ *  adds the socket to its broadcast sink set so speak() fans the TTS PCM to it. */
+export const AGENT_TTS_ROUTE = /^\/v1\/realtime\/agents\/tts\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
 /** #88 M2 — Zoom RTMS ingest WS (the SFU dials IN to PULL the bridged Zoom audio):
  *  /zoom/rtms/ingest/:meetingUuid/:org/:sessionId/:trackName. The upgrade is FORWARDED to the
  *  idFromName(meetingUuid) ZoomRtmsBridgeDO (the same DO the verified rtms_started started), which owns the

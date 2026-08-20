@@ -324,6 +324,8 @@ export class AgentSessionDO {
   private readonly env: AgentTurnEnv;
   private readonly state: DurableObjectStateLike;
   private ingest: IngestSocket | null = null;
+  /** Direct-playback client sockets: the browser dials the TTS route and we fan speak() PCM out to each. */
+  private ttsClients: WebSocket[] = [];
   /** Step-3 turn-taking core, armed on bind when the provider is WAVE (replaces echo as the live behavior). */
   private turn: TurnTakingCore | null = null;
 
@@ -405,6 +407,41 @@ export class AgentSessionDO {
         return new Response(null, { status: 200, webSocket: client } as ResponseInit & { webSocket: WebSocket });
       }
     }
+    // The agent TTS playout WS: the CLIENT dials IN to receive the agent's TTS PCM directly (the direct-playback
+    // path — bypasses the broken SFU ingest). We accept the socket here (native hibernation-safe) + add it to the
+    // broadcast sink set so speak() fans the TTS PCM to it. One socket = one listener; removed on close/error.
+    if (path === "tts" && (request.headers.get("Upgrade") ?? "").toLowerCase() === "websocket") {
+      const WSP = (globalThis as unknown as { WebSocketPair?: new () => Record<string, WebSocket> }).WebSocketPair;
+      if (!WSP) {
+        return Response.json({ error: "REALTIME_NOT_CONFIGURED", message: "WebSocketPair unavailable" }, { status: 503 });
+      }
+      const pair = new WSP();
+      const client = (pair as unknown as Record<string, WebSocket>)[0];
+      const server = (pair as unknown as Record<string, WebSocket>)[1];
+      if (this.state.acceptWebSocket) {
+        this.state.acceptWebSocket(server);
+      } else {
+        server.accept();
+      }
+      try {
+        (server as unknown as { binaryType?: string }).binaryType = "arraybuffer";
+      } catch {
+        /* binaryType not settable on some runtimes — we only SEND on this socket, so it's non-fatal */
+      }
+      this.ttsClients.push(server);
+      const remove = (): void => {
+        const i = this.ttsClients.indexOf(server);
+        if (i >= 0) this.ttsClients.splice(i, 1);
+      };
+      server.addEventListener("close", remove);
+      server.addEventListener("error", remove);
+      console.log(JSON.stringify({ msg: "agent-tts-open", bound: this.core.bound?.roomId ?? null, clients: this.ttsClients.length }));
+      try {
+        return new Response(null, { status: 101, webSocket: client } as ResponseInit & { webSocket: WebSocket });
+      } catch {
+        return new Response(null, { status: 200, webSocket: client } as ResponseInit & { webSocket: WebSocket });
+      }
+    }
     try {
       if (path === "bind" && request.method === "POST") {
         const body = (await request.json().catch(() => ({}))) as { config?: AgentSessionConfig };
@@ -421,6 +458,14 @@ export class AgentSessionDO {
         const ingestToken = secret
           ? await mintRecorderToken(secret, bound.org, bound.participantSessionId, bound.agentTrackName!)
           : undefined;
+        // The TTS-playback token the CLIENT carries on its direct-playback dial (a browser can't send
+        // x-wave-internal). Bound to the AGENT track (same as ingest) so the TTS route verifies it consistently.
+        const ttsToken = secret
+          ? await mintRecorderToken(secret, bound.org, bound.participantSessionId, bound.agentTrackName!)
+          : undefined;
+        const ttsEndpoint = ttsToken
+          ? `${baseWss.replace(/\/+$/, "")}/v1/realtime/agents/tts/${encodeURIComponent(bound.org)}/${encodeURIComponent(bound.roomId)}/${encodeURIComponent(bound.participantSessionId)}/${encodeURIComponent(bound.agentTrackName!)}?t=${encodeURIComponent(ttsToken)}`
+          : undefined;
         const { egress, ingest } = await this.core.openAdapters({ baseWss, egressToken, ingestToken });
         this.armTurnTaking(bound); // step 3: arm the turn core for this binding (replaces echo on frames)
         return Response.json(
@@ -432,6 +477,9 @@ export class AgentSessionDO {
             // The session the agent track is published on (CF's own, returned by the ingest adapter) — a consumer
             // (the room participant / harness) pulls `agentTrackName` from HERE, not participantSessionId (#29).
             agentSessionId: ingest.publishedSessionId ?? bound.participantSessionId,
+            // The direct-playback endpoint the CLIENT dials to receive the agent's TTS PCM (bypasses the broken
+            // SFU ingest). Pre-built with the capability token so the browser needs no other auth.
+            ttsEndpoint,
           },
           { status: 200 },
         );
@@ -490,10 +538,47 @@ export class AgentSessionDO {
       // the adapter's own retry path, only armed here (default maxAttempts=1 = no retry).
       createEgress: (tracks) => createWebsocketAdapter({ fetchImpl, retry: { maxAttempts: 12, delayMs: (a) => Math.min(500 * a, 2000) } }, { appId, bearer, tracks }),
       createIngest: (tracks) => createIngestAdapter({ fetchImpl }, { appId, bearer, tracks }),
-      ingestSocket: () => this.ingest,
+      ingestSocket: () => this.broadcastSink(),
       now: () => Date.now(),
       delay: (ms) => new Promise<void>((r) => setTimeout(r, ms)),
       log: (msg, fields) => console.log(JSON.stringify({ msg, ...fields })),
+    };
+  }
+
+  /**
+   * The publish sink speak() sends the agent's TTS PCM through: fans out to the SFU ingest socket (if the SFU
+   * ever connects) AND to every connected direct-playback client socket (the TTS route). Reads the current socket
+   * set at SEND time so a client that connects mid-turn is picked up. Returns null only when NO sink exists
+   * (nothing to play to) — the speak() no-ingest observability then still fires correctly.
+   */
+  private broadcastSink(): IngestSocket | null {
+    if (!this.ingest && this.ttsClients.length === 0) return null;
+    const self = this;
+    return {
+      send: (d) => {
+        const ing = self.ingest;
+        if (ing) {
+          try {
+            ing.send(d);
+          } catch {
+            /* media safety — a dead SFU socket is cleared on its close event */
+          }
+        }
+        for (const c of self.ttsClients) {
+          try {
+            c.send(d);
+          } catch {
+            /* a dead client socket is removed on its close event */
+          }
+        }
+      },
+      close: () => {
+        try {
+          self.ingest?.close?.();
+        } catch {
+          /* best-effort */
+        }
+      },
     };
   }
 }

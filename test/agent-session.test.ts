@@ -217,3 +217,71 @@ describe("AgentSessionDO ingest WS wiring — the DO owns the publish socket", (
     expect(await verifyRecorderToken("seal", "org1", SESSION, "agent-a1", egTok)).toBe(false);
   });
 });
+
+describe("AgentSessionDO TTS playout WS — the direct-playback path (bypass the broken SFU ingest)", () => {
+  let ttsServer: FakeTtsWS;
+  class FakeTtsWS {
+    binaryType = "blob";
+    sent: Uint8Array[] = [];
+    accept() {}
+    addEventListener() {}
+    send(d: ArrayBufferView | ArrayBuffer) { this.sent.push(new Uint8Array(d as ArrayBuffer)); }
+    close() {}
+  }
+  beforeAll(() => {
+    (globalThis as unknown as { WebSocketPair: unknown }).WebSocketPair = class {
+      0 = new FakeTtsWS();
+      1 = (ttsServer = new FakeTtsWS());
+    } as unknown;
+  });
+
+  const mkState = () => ({ storage: { get: async () => undefined, put: async () => {} } }) as never;
+
+  it("accepts a TTS client socket and fans echo frames out to it (direct playout)", async () => {
+    const session = new AgentSessionDO(mkState(), { VOICE_AGENT_PROVIDER: "wave" } as never);
+    // 1) The client dials the TTS WS → the DO accepts the upgrade + registers the server socket in ttsClients.
+    const up = await session.fetch(new Request("https://agent/tts", { headers: { Upgrade: "websocket" } }));
+    expect(up.status).toBeLessThan(400);
+    // 2) An egress frame arrives (not bound → the echo harness runs) → the PCM fans out to BOTH the (absent)
+    //    ingest sink AND the registered TTS client socket. Before this, the broadcast sink returned null with no
+    //    ingest socket and every outbound frame was dropped.
+    const pcm = new Uint8Array([9, 8, 7, 6]);
+    const frame = encodeIngestFrame(pcm, { sequenceNumber: 3, timestamp: 9600 }, "packet");
+    await session.fetch(new Request("https://agent/echo-frame", { method: "POST", body: frame }));
+    expect(ttsServer.sent.length).toBe(1);
+    expect(Array.from(decodePacket(ttsServer.sent[0]).payload)).toEqual([9, 8, 7, 6]);
+  });
+
+  it("returns 503 when WebSocketPair is unavailable on the tts path (config-no-silent-noop)", async () => {
+    const saved = (globalThis as unknown as { WebSocketPair: unknown }).WebSocketPair;
+    (globalThis as unknown as { WebSocketPair: unknown }).WebSocketPair = undefined;
+    const session = new AgentSessionDO(mkState(), { VOICE_AGENT_PROVIDER: "wave" } as never);
+    const res = await session.fetch(new Request("https://agent/tts", { headers: { Upgrade: "websocket" } }));
+    expect(res.status).toBe(503);
+    (globalThis as unknown as { WebSocketPair: unknown }).WebSocketPair = saved;
+  });
+
+  it("bind returns a ttsEndpoint whose capability token verifies against the agent track", async () => {
+    const fakeFetch = async (_url: string, init: RequestInit) =>
+      new Response(JSON.stringify({ adapterId: "x", tracks: [] }), { status: 200 });
+    const env = {
+      VOICE_AGENT_PROVIDER: "wave",
+      WAVE_INTERNAL_SECRET: "seal",
+      CF_CALLS_APP_ID: "0123456789abcdef0123456789abcdef",
+      CF_CALLS_APP_SECRET: "bearer",
+      __agentFetch: fakeFetch,
+    };
+    const session = new AgentSessionDO(mkState(), env as never);
+    const res = await session.fetch(new Request("https://agent/bind", {
+      method: "POST",
+      body: JSON.stringify({ config: { roomId: "room1", org: "org1", agentId: "a1", participantSessionId: SESSION, participantTrackName: "mic" } }),
+    }));
+    const body = (await res.json()) as { ttsEndpoint?: string };
+    expect(typeof body.ttsEndpoint).toBe("string");
+    const u = new URL(body.ttsEndpoint!);
+    expect(u.pathname).toContain("/v1/realtime/agents/tts/org1/room1/");
+    const tok = u.searchParams.get("t") ?? "";
+    expect(tok).not.toBe("");
+    expect(await verifyRecorderToken("seal", "org1", SESSION, "agent-a1", tok)).toBe(true);
+  });
+});
