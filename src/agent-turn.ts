@@ -304,6 +304,7 @@ export class TurnTakingCore {
       if (this.currentMarks) this.currentMarks.sttFinalMs = this.deps.now(); // E1 harness: hop 1 (the named risk)
       if (!stt.isFinal) return; // a future STREAMING STT may emit partials behind this same seam; v1 batch ⇒ final
       const userText = stt.transcript.trim();
+      this.deps.log("agent-stt-result", { len: userText.length, transcript: userText.slice(0, 80), pcmBytes: pcm.length, rms: Math.round(this.vad.lastFrameRms) });
       if (userText.length === 0) return; // silence / nothing recognized → no turn
       await this.runTurn(userText);
     } catch (e) {
