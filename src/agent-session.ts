@@ -49,6 +49,7 @@ import {
 } from "./agent-ingest-adapter.js";
 import { TurnTakingCore, buildTurnDeps, toolAllowlistFromEnv, ttsLeadMsFromEnv, type AgentTurnEnv } from "./agent-turn.js";
 import { vadConfigFromEnv } from "./agent-vad.js";
+import { voiceCogsRatesFromEnv } from "./voice-cogs.js";
 import { mintRecorderToken } from "./encoders/recorder-auth.js";
 
 /** The flag value that arms the WAVE voice agent. Anything else → fully inert. */
@@ -468,6 +469,7 @@ export class AgentSessionDO {
         vad: vadConfigFromEnv(this.env), // step 4: barge-in VAD thresholds (env-overridable, sensible defaults)
         ttsLeadMs: ttsLeadMsFromEnv(this.env), // step 4: real-time TTS pacing → interruptible playout (barge-in)
         tools, // step 5: only these tools are advertised to the model + executable (others refused)
+        cogsRates: voiceCogsRatesFromEnv(this.env), // E0-P2: vendor COGS rates (absent ⇒ reported unpriced)
       });
       media.log("agent-turn-armed", { org: bound.org, room: bound.roomId, agentId: bound.agentId });
     } catch (e) {
