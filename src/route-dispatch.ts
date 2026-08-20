@@ -648,6 +648,7 @@ export async function dispatch(
 			}
 			const tok = url.searchParams.get("t");
 			const tokenOk = !!tok && !!env.WAVE_INTERNAL_SECRET && (await verifyRecorderToken(env.WAVE_INTERNAL_SECRET, aorg, asession, atrack, tok));
+			console.log(JSON.stringify({ msg: "agent-egress-dial", tokenOk, hasTok: !!tok, upgrade: (request.headers.get("Upgrade") ?? "").toLowerCase(), track: atrack }));
 			if (!tokenOk) {
 				const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
 				if (denied) return denied;
@@ -702,6 +703,7 @@ export async function dispatch(
 			}
 			const tok = url.searchParams.get("t");
 			const tokenOk = !!tok && !!env.WAVE_INTERNAL_SECRET && (await verifyRecorderToken(env.WAVE_INTERNAL_SECRET, aorg, asession, atrack, tok));
+			console.log(JSON.stringify({ msg: "agent-ingest-dial", tokenOk, hasTok: !!tok, upgrade: (request.headers.get("Upgrade") ?? "").toLowerCase(), track: atrack }));
 			if (!tokenOk) {
 				const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
 				if (denied) return denied;
