@@ -46,7 +46,7 @@ import { LatencyCollector, type TurnHopMarks } from "./turn-latency.js";
 import { SentenceChunker } from "./sentence-chunker.js";
 import { meterFinishedTurn, meterAbandonedTurn, meterSessionClose } from "./agent-turn-meter.js";
 import { TurnCogsLedger } from "./voice-cogs-ledger.js";
-import type { VoiceCogsRates } from "./voice-cogs.js";
+import type { VoiceCogsRates, VoiceCogsRatesEnv } from "./voice-cogs.js";
 import { Vad, vadConfigFromEnv, type VadConfig, type VadEnv } from "./agent-vad.js";
 import {
   ToolAllowlist,
@@ -652,7 +652,7 @@ function concat(chunks: Uint8Array[]): Uint8Array {
  * Doppler at deploy. INERT until provisioned: a missing cred fails its stage CLOSED (logged, turn abandoned),
  * it never crashes the DO. Extends AgentSessionEnv so the DO env is one shape.
  */
-export interface AgentTurnEnv extends AgentSessionEnv, VadEnv, VoiceMeterEnv {
+export interface AgentTurnEnv extends AgentSessionEnv, VadEnv, VoiceMeterEnv, VoiceCogsRatesEnv {
   /** WAVE gateway origin for the LLM proxy (var; not a secret). e.g. https://api.wave.online */
   WAVE_GATEWAY_BASE?: string;
   /** Internal service-to-service bearer for the gateway LLM proxy (secret; deploy-time, never logged). */
