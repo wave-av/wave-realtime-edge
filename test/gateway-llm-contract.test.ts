@@ -198,7 +198,7 @@ describe("#81 gateway LLM response envelope — Anthropic SSE passthrough", () =
 // ─────────────────────────── NON-ANTHROPIC (GPU) BACKEND ───────────────────────────
 // VOICE_AGENT_LLM_BACKEND=ollama routes the turn through the gateway's GPU plane (agent-spokes.ts:286 selects
 // the backend; forwardToBackend forwards an OpenAI-compatible body and streams OpenAI SSE back). This is the
-// route-around for the Anthropic account's billing-failure (wave-gateway model-normalization.ts).
+// route-around for the Anthropic account's billing-failure (the governed gateway's model-normalization.ts).
 describe("#81 gateway LLM — non-Anthropic (GPU) backend", () => {
   it("routes ollama via x-wave-inference-backend + OpenAI-shape body (system as a message role)", () => {
     const env = { ...ENV, VOICE_AGENT_LLM_BACKEND: "ollama", VOICE_AGENT_LLM_MODEL: "qwen3.8:27b-chat" };
