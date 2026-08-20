@@ -276,6 +276,10 @@ export class AgentSessionError extends Error {
 
 interface DurableObjectStateLike {
   storage: { get<T>(key: string): Promise<T | undefined>; put<T>(key: string, value: T): Promise<void> };
+  /** Native hibernation-safe WS acceptance (the CF reference + room.ts use this; the stateless WebSocketPair
+   *  does NOT survive a DO eviction or register the socket with the runtime). Optional so tests can omit it. */
+  acceptWebSocket?(ws: WebSocket, tags?: string[]): void;
+  getWebSockets?(tag?: string): WebSocket[];
 }
 
 /** Env the AgentSessionDO reads. INERT unless VOICE_AGENT_PROVIDER==="wave". All creds referenced, not valued. */
@@ -317,11 +321,13 @@ export interface AgentSessionEnv {
 export class AgentSessionDO {
   private readonly core: AgentSessionCore;
   private readonly env: AgentTurnEnv;
+  private readonly state: DurableObjectStateLike;
   private ingest: IngestSocket | null = null;
   /** Step-3 turn-taking core, armed on bind when the provider is WAVE (replaces echo as the live behavior). */
   private turn: TurnTakingCore | null = null;
 
   constructor(_state: DurableObjectStateLike, env?: AgentTurnEnv) {
+    this.state = _state;
     this.env = env ?? {};
     this.core = new AgentSessionCore(this.buildMediaDeps(), { framing: this.env.AGENT_INGEST_FRAMING });
   }
@@ -359,7 +365,14 @@ export class AgentSessionDO {
       const pair = new WSP();
       const client = (pair as unknown as Record<string, WebSocket>)[0];
       const server = (pair as unknown as Record<string, WebSocket>)[1];
-      server.accept();
+      // Native hibernation-safe acceptance (the CF reference + room.ts path): registers the socket with the
+      // DO runtime so it survives eviction + the SFU's dial-in stays bound. Falls back to the stateless
+      // WebSocketPair.accept() only when the DO runtime is absent (unit tests) — never in prod.
+      if (this.state.acceptWebSocket) {
+        this.state.acceptWebSocket(server);
+      } else {
+        server.accept();
+      }
       try {
         (server as unknown as { binaryType?: string }).binaryType = "arraybuffer";
       } catch {
