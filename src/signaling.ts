@@ -269,19 +269,28 @@ export class Signaling {
    * session into THIS participant's session. Subscribe grant is enforced. The SFU may return an offer
    * with `requiresImmediateRenegotiation` — the client answers it via renegotiate().
    */
-  async subscribeTrack(ctx: SignalContext, req: { trackName: string }): Promise<NegotiateResult> {
+  async subscribeTrack(ctx: SignalContext, req: { trackName: string; sessionId?: string }): Promise<NegotiateResult> {
     this.assertCtx(ctx);
     const subscriber = await this.requireParticipant(ctx);
     if (!subscriber.permissions.canSubscribe) {
       throw new SignalError("FORBIDDEN", "participant may not subscribe", 403);
     }
-    const tracks = await this.room.listTracks();
-    const published = tracks.find((t) => t.trackName === req.trackName);
-    if (!published) {
-      throw new SignalError("TRACK_NOT_FOUND", `no published track named ${req.trackName}`, 404);
+    // An explicit sessionId pulls the track DIRECTLY from that SFU session (the voice-agent ingest
+    // publishes the agent track on the SFU's OWN generated session, returned as agentSessionId in the
+    // bind response — NOT the room's pushTracks registry). Without it, fall back to the room registry.
+    let sessionId = req.sessionId;
+    let trackName = req.trackName;
+    if (!sessionId) {
+      const tracks = await this.room.listTracks();
+      const published = tracks.find((t) => t.trackName === req.trackName);
+      if (!published) {
+        throw new SignalError("TRACK_NOT_FOUND", `no published track named ${req.trackName}`, 404);
+      }
+      sessionId = published.sessionId;
+      trackName = published.trackName;
     }
     return this.sfu.pullTracks(subscriber.sessionId, [
-      { location: "remote", sessionId: published.sessionId, trackName: published.trackName },
+      { location: "remote", sessionId, trackName },
     ]);
   }
 

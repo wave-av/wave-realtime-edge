@@ -759,7 +759,10 @@ export class RoomDO {
         }
         case "subscribe":
           return Response.json(
-            await signaling.subscribeTrack(ctx!, { trackName: String(body.trackName ?? "") }),
+            await signaling.subscribeTrack(ctx!, {
+              trackName: String(body.trackName ?? ""),
+              sessionId: typeof body.sessionId === "string" ? body.sessionId : undefined,
+            }),
             { status: 200 },
           );
         case "renegotiate":
