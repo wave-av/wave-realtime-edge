@@ -194,3 +194,45 @@ describe("#81 gateway LLM response envelope — Anthropic SSE passthrough", () =
     });
   });
 });
+
+// ─────────────────────────── NON-ANTHROPIC (GPU) BACKEND ───────────────────────────
+// VOICE_AGENT_LLM_BACKEND=ollama routes the turn through the gateway's GPU plane (agent-spokes.ts:286 selects
+// the backend; forwardToBackend forwards an OpenAI-compatible body and streams OpenAI SSE back). This is the
+// route-around for the Anthropic account's billing-failure (the governed gateway's model-normalization.ts).
+describe("#81 gateway LLM — non-Anthropic (GPU) backend", () => {
+  it("routes ollama via x-wave-inference-backend + OpenAI-shape body (system as a message role)", () => {
+    const env = { ...ENV, VOICE_AGENT_LLM_BACKEND: "ollama", VOICE_AGENT_LLM_MODEL: "qwen3.8:27b-chat" };
+    const req = buildGatewayLlmRequest(env, "org_acme", "", MSGS);
+    expect(req.headers["x-wave-inference-backend"]).toBe("ollama");
+    const body = JSON.parse(req.body);
+    expect(body.model).toBe("qwen3.8:27b-chat");
+    expect(body.system).toBeUndefined(); // no top-level system on the OpenAI plane
+    expect(body.messages).toEqual([
+      { role: "system", content: "sys" },
+      { role: "user", content: "hi" },
+    ]);
+    expect(body.tools).toBeUndefined(); // tools dropped on the GPU plane (text-only)
+  });
+
+  it("an unknown backend falls back to anthropic (never guessed)", () => {
+    const env = { ...ENV, VOICE_AGENT_LLM_BACKEND: "definitely-not-a-backend" };
+    const req = buildGatewayLlmRequest(env, "org_acme", "", MSGS);
+    expect(req.headers["x-wave-inference-backend"]).toBeUndefined();
+    expect(JSON.parse(req.body).system).toBe("sys"); // Anthropic shape restored
+  });
+
+  it("parses OpenAI SSE deltas into text events (the GPU stream, not Anthropic content_block_delta)", async () => {
+    const fetchImpl = vi.fn(async () =>
+      gatewaySse([
+        { choices: [{ delta: { content: "Hel" }, index: 0 }] },
+        { choices: [{ delta: { content: "lo" }, index: 0 }] },
+        { choices: [{ delta: {}, finish_reason: "stop", index: 0 }] },
+      ]),
+    );
+    const env = { ...ENV, VOICE_AGENT_LLM_BACKEND: "ollama" };
+    expect(await collect(streamGatewayLlm(fetchImpl, env, "org_acme", MSGS))).toEqual([
+      { type: "text", text: "Hel" },
+      { type: "text", text: "lo" },
+    ]);
+  });
+});

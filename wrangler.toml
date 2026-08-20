@@ -254,6 +254,15 @@ WAVE_REALTIME_EVENTS_EMIT = "1"
 # activate on an explicit agent bind (POST /v1/realtime/agents/bind); live rooms are unaffected until bound.
 VOICE_AGENT_PROVIDER = "wave"
 
+# ── Voice-agent LLM backend + model (gateway governed proxy `x-wave-inference-backend`) ──
+# "anthropic" (default) = Claude via the Anthropic Messages API; "ollama" = our local fleet
+# (ollama.wave.online), "runpod"/"openrouter"/"ssd-stream" = the GPU planes. Routed to "ollama" so the voice
+# agent runs on our OWN capacity instead of the Anthropic account (billing-failure — the governed gateway's
+# model-normalization.ts: every claude call returns llm_upstream until that account is paid). Model is what the
+# chosen backend serves — the fleet has qwen3.8:27b-chat / gpt-oss:120b / deepseek-v4-pro:cloud (ollama list).
+VOICE_AGENT_LLM_BACKEND = "ollama"
+VOICE_AGENT_LLM_MODEL = "qwen3.8:27b-chat"
+
 # E0-P2 vendor COGS rates (voice-cogs.ts voiceCogsRatesFromEnv) — the published vendor list prices used to
 # price each turn's cost internally (ttsUsdPerChar = ElevenLabs Business v2 ~$0.05/1k chars; sttUsdPerAudioMinute
 # = Deepgram nova ~$0.0043/min; doUsdPerWallMinute = CF DO wall-clock). Non-secret (public list prices). Absent

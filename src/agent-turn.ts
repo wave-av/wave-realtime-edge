@@ -659,6 +659,9 @@ export interface AgentTurnEnv extends AgentSessionEnv, VadEnv, VoiceMeterEnv, Vo
   WAVE_GATEWAY_TOKEN?: string;
   /** Claude model id routed through the gateway (Opus/Sonnet per design). Defaults to a sensible Sonnet. */
   VOICE_AGENT_LLM_MODEL?: string;
+  /** LLM backend routed through the gateway (`x-wave-inference-backend`, agent-spokes.ts:286). Defaults
+   *  "anthropic"; "ollama"|"runpod"|"openrouter"|"ssd-stream" route to an OpenAI-compatible GPU plane. */
+  VOICE_AGENT_LLM_BACKEND?: string;
   /** LLM proxy path on the gateway (var). Default /v1/internal/messages (the service-token-gated internal route). */
   VOICE_AGENT_LLM_PATH?: string;
   /** ElevenLabs API key (secret; server-side ONLY, never client, never logged). */
