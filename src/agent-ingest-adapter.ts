@@ -105,20 +105,27 @@ export async function createIngestAdapter(
   }
   const base = (params.sfuApiBase ?? DEFAULT_SFU_API_BASE).replace(/\/+$/, "");
   const doFetch = deps.fetchImpl ?? fetch;
-  const res = await doFetch(`${base}/apps/${params.appId}/adapters/websocket/new`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${params.bearer}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ tracks: params.tracks }),
-  });
+  let res: Response | null = null;
   let json: unknown = null;
-  try {
-    json = await res.json();
-  } catch {
-    json = null;
+  // Retry a transient create failure (the SFU's adapter API intermittently 502s under load) — bounded + fast,
+  // mirroring the egress adapter's retry so a flaky create can't 502 the whole bind.
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    res = await doFetch(`${base}/apps/${params.appId}/adapters/websocket/new`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${params.bearer}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ tracks: params.tracks }),
+    });
+    try {
+      json = await res.json();
+    } catch {
+      json = null;
+    }
+    if (res.ok) break;
+    console.warn(`sfu-ingest-adapter status=${res.status} ok=${res.ok} attempt=${attempt}`); // observability only — never the token
+    if (attempt < 4) await new Promise((r) => setTimeout(r, 250 * attempt));
   }
-  if (!res.ok) {
-    console.warn(`sfu-ingest-adapter status=${res.status} ok=${res.ok}`); // observability only — never the token
-    throw new SfuAdapterError("UPSTREAM", `create ingest adapter returned ${res.status}`, 502);
+  if (!res || !res.ok) {
+    throw new SfuAdapterError("UPSTREAM", `create ingest adapter returned ${res?.status ?? 0}`, 502);
   }
   const obj = json && typeof json === "object" ? (json as Record<string, unknown>) : {};
   // CF nests the created track under `tracks[0]` ({adapterId, trackName, endpoint, sessionId}); the top-level
