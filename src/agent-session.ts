@@ -319,6 +319,9 @@ export interface AgentSessionEnv {
  * shell + a typed control-plane fetch() for bind/info, so the binding + migration deploy and the next step
  * only adds socket plumbing — NOT a stub that fakes media.
  */
+const MAX_TTS_CLIENTS_PER_ROOM = 32;
+const TTS_SOCKET_TAG = "agent-tts";
+
 export class AgentSessionDO {
   private readonly core: AgentSessionCore;
   private readonly env: AgentTurnEnv;
@@ -372,7 +375,7 @@ export class AgentSessionDO {
       // DO runtime so it survives eviction + the SFU's dial-in stays bound. Falls back to the stateless
       // WebSocketPair.accept() only when the DO runtime is absent (unit tests) — never in prod.
       if (this.state.acceptWebSocket) {
-        this.state.acceptWebSocket(server);
+        this.state.acceptWebSocket(server, [TTS_SOCKET_TAG]);
       } else {
         server.accept();
       }
@@ -411,6 +414,11 @@ export class AgentSessionDO {
     // path — bypasses the broken SFU ingest). We accept the socket here (native hibernation-safe) + add it to the
     // broadcast sink set so speak() fans the TTS PCM to it. One socket = one listener; removed on close/error.
     if (path === "tts" && (request.headers.get("Upgrade") ?? "").toLowerCase() === "websocket") {
+      const liveTtsClients = this.state.getWebSockets?.(TTS_SOCKET_TAG) ?? this.ttsClients;
+      if (liveTtsClients.length >= MAX_TTS_CLIENTS_PER_ROOM) {
+        console.warn(JSON.stringify({ msg: "agent-tts-capacity", max: MAX_TTS_CLIENTS_PER_ROOM }));
+        return Response.json({ error: "TTS_CLIENT_LIMIT", message: "too many TTS listeners" }, { status: 429 });
+      }
       const WSP = (globalThis as unknown as { WebSocketPair?: new () => Record<string, WebSocket> }).WebSocketPair;
       if (!WSP) {
         return Response.json({ error: "REALTIME_NOT_CONFIGURED", message: "WebSocketPair unavailable" }, { status: 503 });
@@ -419,7 +427,7 @@ export class AgentSessionDO {
       const client = (pair as unknown as Record<string, WebSocket>)[0];
       const server = (pair as unknown as Record<string, WebSocket>)[1];
       if (this.state.acceptWebSocket) {
-        this.state.acceptWebSocket(server);
+        this.state.acceptWebSocket(server, [TTS_SOCKET_TAG]);
       } else {
         server.accept();
       }
@@ -552,7 +560,8 @@ export class AgentSessionDO {
    * (nothing to play to) — the speak() no-ingest observability then still fires correctly.
    */
   private broadcastSink(): IngestSocket | null {
-    if (!this.ingest && this.ttsClients.length === 0) return null;
+    const ttsClients = this.state.getWebSockets?.(TTS_SOCKET_TAG) ?? this.ttsClients;
+      if (!this.ingest && ttsClients.length === 0) return null;
     const self = this;
     return {
       send: (d) => {
@@ -568,7 +577,13 @@ export class AgentSessionDO {
           try {
             c.send(d);
           } catch {
-            /* a dead client socket is removed on its close event */
+            const i = self.ttsClients.indexOf(c);
+              if (i >= 0) self.ttsClients.splice(i, 1);
+              try {
+                c.close();
+              } catch {
+                /* best-effort */
+              }
           }
         }
       },
