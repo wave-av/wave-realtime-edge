@@ -267,10 +267,11 @@ VOICE_AGENT_LLM_MODEL = "qwen/qwen3.7-flash"
 # (trades a little quality for first-audio speed). 0 restores max quality.
 VOICE_AGENT_TTS_LATENCY = "3"
 
-# Streaming STT (E1 task 4): DEEPGRAM WS path FAILS LIVE ("Deepgram WebSocket error" on every turn — 22/22
-# turns 2026-08-20), so it is DISABLED until the WS handshake is fixed (see agent-stt-streaming.ts). "true"
-# arms it; anything else/absent → the batch gateway-fronted path (which works).
-VOICE_AGENT_STREAMING_STT = "true"
+# Streaming STT (E1 task 4): the Deepgram WS path FAILS LIVE ("Deepgram WebSocket error" even WITH the
+# subprotocol auth fix, 2026-08-21) — the CF Workers outbound WS subprotocol is not reaching Deepgram's
+# handshake. DISABLED until the WS handshake is truly fixed; the batch gateway-fronted path is the PROVEN
+# one (the live browser conversation used it). "true" arms it; else → batch.
+VOICE_AGENT_STREAMING_STT = "false"
 
 # E0-P2 vendor COGS rates (voice-cogs.ts voiceCogsRatesFromEnv) — the published vendor list prices used to
 # price each turn's cost internally (ttsUsdPerChar = ElevenLabs Business v2 ~$0.05/1k chars; sttUsdPerAudioMinute
