@@ -81,6 +81,7 @@ import {
 	SAFE_ORG,
 } from "./dispatch-helpers";
 import { maybeHandleRecorderWs } from "./recorder-ws-route";
+import { maybeHandleTranscriptRead } from "./transcript-route";
 
 // Re-export Env so worker.ts (the only external consumer of this module) keeps importing it from here unchanged.
 export type { Env } from "./dispatch-helpers";
@@ -231,6 +232,12 @@ export async function dispatch(
 	// this router under the file-size gate. Gateway-trust ONLY (it mints tokens); shares RECORDER_INGEST_ENABLED.
 	const recDispatch = await maybeHandleRecorderDispatch(request, url, env);
 	if (recDispatch) return recDispatch;
+
+	// ── Voice-agent transcript retrieval — GET /v1/realtime/agents/transcripts/:org[/:room/:session] ──
+	// Read + list the transcript JSON the AgentSessionDO persists to RT_RECORDINGS (history/finalize intents).
+	// Same gateway-trust chokepoint as the recorder routes. Leaf module keeps this router under the file-size gate.
+	const transcriptRead = await maybeHandleTranscriptRead(request, url, env);
+	if (transcriptRead) return transcriptRead;
 
 	// ── P5 CF-Calls SFU control plane — POST /v1/realtime/rooms/:room/:intent ──
 	// Routed through the Room DO (per-org isolation: the DO id is keyed `${org}:${room}`), which runs the
