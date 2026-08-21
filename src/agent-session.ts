@@ -401,6 +401,10 @@ export class AgentSessionDO {
       this.ingest = sink;
       const clear = (): void => {
         if (this.ingest === sink) this.ingest = null;
+        // Session-end recording (E1 close-hook): when the SFU drops the ingest sink, the room's media
+        // is over — persist the transcript so a session that is never read still records. Overwrite-safe
+        // (same `transcript:{org}:{room}:{session}.json` key) and best-effort (never fails the close path).
+        void this.persistTranscript();
       };
       server.addEventListener("close", clear);
       server.addEventListener("error", clear);
