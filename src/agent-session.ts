@@ -578,14 +578,17 @@ export class AgentSessionDO {
    *  is the only socket that RECEIVES (the ingest + TTS sockets are send-only), so every binary frame here is
    *  a headless-mic PCM frame. Fail-safe: a defect must never crash the socket. */
   webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
+    console.log(JSON.stringify({ msg: "agent-audio-in-msg", str: typeof message === "string", len: typeof message === "string" ? message.length : message.byteLength, tracked: this.audioInSockets.has(ws), armed: !!this.turn }));
     if (!this.audioInSockets.has(ws) || typeof message === "string") return;
     try {
       const buf = new Uint8Array(message);
       if (buf.length === 0) return;
       const r = this.turn ? this.turn.onFrame(buf) : this.core.echoFrame(buf);
-      if (r && typeof (r as Promise<void>).then === "function") void (r as Promise<void>).catch(() => {});
-    } catch {
-      /* fail-safe — a decode/turn defect must never crash the socket */
+      if (r && typeof (r as Promise<void>).then === "function") void (r as Promise<void>).catch((e) => {
+        console.log(JSON.stringify({ msg: "agent-audio-in-onframe-error", error: (e as Error)?.message ?? "unknown" }));
+      });
+    } catch (e) {
+      console.log(JSON.stringify({ msg: "agent-audio-in-throw", error: (e as Error)?.message ?? "unknown" }));
     }
   }
 
