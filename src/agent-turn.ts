@@ -473,6 +473,7 @@ export class TurnTakingCore {
       // Done-check names it) so the numbers land in the agent-turn logs without any extra plumbing.
       if (this.currentMarks) {
         this.latency.record(this.currentMarks);
+        this.deps.log("agent-turn-hop", { ...this.idFields(), ...this.currentMarks });
         if (this.latency.count() % 30 === 0) {
           this.deps.log("agent-turn-latency", { ...this.idFields(), distribution: this.latency.distribution() });
         }
