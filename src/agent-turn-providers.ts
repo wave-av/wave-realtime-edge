@@ -92,7 +92,8 @@ export async function* streamElevenLabs(
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voice}/stream?output_format=${ELEVENLABS_OUTPUT_FORMAT}`;
   // optimize_streaming_latency (0-4, ElevenLabs) trades synthesis quality for first-audio latency — a voice
   // agent wants low latency, so default 3. Env-tunable (VOICE_AGENT_TTS_LATENCY), clamped to 0-4.
-  const latency = parseInt(env.VOICE_AGENT_TTS_LATENCY ?? "3", 10);
+  const rawLatency = Number(env.VOICE_AGENT_TTS_LATENCY ?? 3);
+    const latency = Number.isFinite(rawLatency) ? Math.min(4, Math.max(0, Math.trunc(rawLatency))) : 3;
   const res = await fetchImpl(url, {
     method: "POST",
     headers: {
@@ -100,7 +101,7 @@ export async function* streamElevenLabs(
       "xi-api-key": env.ELEVENLABS_API_KEY!, // server-side secret — never logged
       accept: "audio/pcm",
     },
-    body: JSON.stringify({ text, model_id: "eleven_flash_v2_5", optimize_streaming_latency: Number.isFinite(latency) && latency >= 0 && latency <= 4 ? latency : 3 }),
+    body: JSON.stringify({ text, model_id: "eleven_flash_v2_5", optimize_streaming_latency: latency }),
   });
   if (!res.ok || !res.body) {
     await res.body?.cancel().catch(() => {}); // release the body — an un-drained Response deadlocks the DO's fetch pool
