@@ -294,6 +294,8 @@ export interface AgentSessionEnv {
   AGENT_INGEST_FRAMING?: IngestFraming;
   /** Step-4 barge-in: TTS send-ahead lead (ms) for real-time pacing → interruptible playout (default 150). */
   AGENT_TTS_LEAD_MS?: string | number;
+  /** ElevenLabs optimize_streaming_latency (0-4): higher = lower first-audio latency. Default 3. */
+  VOICE_AGENT_TTS_LATENCY?: string;
   /** Step-3: the agent persona / system prompt for turn-taking (var; default in buildTurnSystemPrompt). */
   VOICE_AGENT_SYSTEM_PROMPT?: string;
   /** test-only: injected adapter-create fetch (defaults to global fetch). Never a wire input. */

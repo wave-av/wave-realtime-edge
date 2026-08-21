@@ -669,8 +669,6 @@ export interface AgentTurnEnv extends AgentSessionEnv, VadEnv, VoiceMeterEnv, Vo
   ELEVENLABS_API_KEY?: string;
   /** ElevenLabs voice id for the agent persona (var). */
   ELEVENLABS_VOICE_ID?: string;
-  /** ElevenLabs optimize_streaming_latency (0-4): higher = lower first-audio latency, lower quality. Default 3. */
-  VOICE_AGENT_TTS_LATENCY?: string;
   /**
    * STT gateway base (var). The WAVE transcribe spoke is reached THROUGH the gateway (metering-governed).
    * Defaults to WAVE_GATEWAY_BASE when unset (one gateway origin serves both LLM + STT). e.g. https://api.wave.online
