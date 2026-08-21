@@ -139,3 +139,24 @@ describe("tts WS route (flag on)", () => {
     expect(ns.seen.forwards[0].url).toContain("/tts");
   });
 });
+
+describe("audio-in WS route (flag on)", () => {
+  const base = { VOICE_AGENT_PROVIDER: "wave" };
+  it("426 when not a websocket upgrade", async () => {
+    const res = await worker.fetch(new Request("https://rt/v1/realtime/agents/audio-in/org1/r1/sess_abc12345/mic"), { ...base, AGENT_SESSION: stubAgentNs() } as never, ctx);
+    expect(res.status).toBe(426);
+  });
+  it("401 with neither a token nor the internal header when the secret is set", async () => {
+    const res = await worker.fetch(new Request("https://rt/v1/realtime/agents/audio-in/org1/r1/sess_abc12345/mic", { headers: { Upgrade: "websocket" } }), { ...base, WAVE_INTERNAL_SECRET: "s", AGENT_SESSION: stubAgentNs() } as never, ctx);
+    expect(res.status).toBe(401);
+  });
+  it("forwards the upgrade to the DO keyed org:room (same DO as bind + egress + ingest + tts)", async () => {
+    const ns = stubAgentNs();
+    const secret = "s";
+    const tok = await mintRecorderToken(secret, "org1", "sess_abc12345", "mic");
+    const res = await worker.fetch(new Request(`https://rt/v1/realtime/agents/audio-in/org1/r1/sess_abc12345/mic?t=${tok}`, { headers: { Upgrade: "websocket" } }), { ...base, WAVE_INTERNAL_SECRET: secret, AGENT_SESSION: ns } as never, ctx);
+    expect(res.status).toBeLessThan(400);
+    expect(ns.seen.name).toBe("org1:r1");
+    expect(ns.seen.forwards[0].url).toContain("/audio-in");
+  });
+});
