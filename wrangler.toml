@@ -267,10 +267,11 @@ VOICE_AGENT_LLM_MODEL = "qwen/qwen3.7-flash"
 # (trades a little quality for first-audio speed). 0 restores max quality.
 VOICE_AGENT_TTS_LATENCY = "3"
 
-# Streaming STT (E1 task 4): Deepgram WS, auth via the `token` QUERY PARAM (the server-side form — the
-# browser subprotocol 401'd every turn). Re-armed with the query-param fix (2026-08-21). "true" arms it;
-# anything else/absent → the batch gateway-fronted path.
-VOICE_AGENT_STREAMING_STT = "true"
+# Streaming STT (E1 task 4): KNOWN-OPEN — the Deepgram WS from the CF Workers DO fails with "Deepgram
+# WebSocket error" under BOTH auth forms (subprotocol AND the token query param, both tried live). This is
+# a CF Workers DO outbound-WS limitation, not an auth bug. DISABLED: the batch gateway-fronted STT is the
+# PROVEN path (the live browser + headless CLI conversations both use it). "true" arms the broken path.
+VOICE_AGENT_STREAMING_STT = "false"
 
 # E0-P2 vendor COGS rates (voice-cogs.ts voiceCogsRatesFromEnv) — the published vendor list prices used to
 # price each turn's cost internally (ttsUsdPerChar = ElevenLabs Business v2 ~$0.05/1k chars; sttUsdPerAudioMinute
