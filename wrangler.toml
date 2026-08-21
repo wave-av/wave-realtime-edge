@@ -263,6 +263,9 @@ VOICE_AGENT_PROVIDER = "wave"
 # a voice agent (allowlisted in the governed gateway). Switch back to "ollama"/"anthropic" once either is healthy.
 VOICE_AGENT_LLM_BACKEND = "openrouter"
 VOICE_AGENT_LLM_MODEL = "qwen/qwen3.7-flash"
+# ElevenLabs optimize_streaming_latency (0-4): 3 = minimum-latency synthesis for a snappy voice agent
+# (trades a little quality for first-audio speed). 0 restores max quality.
+VOICE_AGENT_TTS_LATENCY = "3"
 
 # E0-P2 vendor COGS rates (voice-cogs.ts voiceCogsRatesFromEnv) — the published vendor list prices used to
 # price each turn's cost internally (ttsUsdPerChar = ElevenLabs Business v2 ~$0.05/1k chars; sttUsdPerAudioMinute
