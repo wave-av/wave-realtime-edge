@@ -547,7 +547,13 @@ export class AgentSessionDO {
         return Response.json({ bound: this.core.bound, timings: this.core.timingSamples() }, { status: 200 });
       }
       if (path === "history" && request.method === "GET") {
-        // The conversation transcript (system + alternating user/assistant). A core product surface:
+        const requestedSessionId = new URL(request.url).searchParams.get("sessionId") ?? "";
+          const requestedBound = this.core.bound;
+          if (!requestedBound) return Response.json({ error: "NOT_BOUND", message: "agent session is not bound" }, { status: 409 });
+          if (requestedSessionId && requestedSessionId !== requestedBound.participantSessionId) {
+            return Response.json({ error: "NOT_FOUND", message: "requested session does not match bound session" }, { status: 404 });
+          }
+          // The conversation transcript (system + alternating user/assistant). A core product surface:
         // every voice-agent session must OFFER its transcript, not just speak it. `this.turn` is null
         // until armed, so an unarmed/echo session honestly returns an empty history. Returns the SAME
         // TranscriptResult shape the R2 retention uses and the console's getTranscript expects.
