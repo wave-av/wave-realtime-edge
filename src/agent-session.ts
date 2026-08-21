@@ -277,6 +277,7 @@ export class AgentSessionError extends Error {
 
 interface DurableObjectStateLike {
   storage: { get<T>(key: string): Promise<T | undefined>; put<T>(key: string, value: T): Promise<void> };
+  waitUntil?(p: Promise<unknown>): void;
   /** Native hibernation-safe WS acceptance (the CF reference + room.ts use this; the stateless WebSocketPair
    *  does NOT survive a DO eviction or register the socket with the runtime). Optional so tests can omit it. */
   acceptWebSocket?(ws: WebSocket, tags?: string[]): void;
@@ -499,7 +500,7 @@ export class AgentSessionDO {
         const bound = this.core.bound;
         if (this.env.RT_RECORDINGS && bound && history.length > 0) {
           const key = `transcript:${bound.org}:${bound.roomId}:${bound.participantSessionId}.json`;
-          void this.env.RT_RECORDINGS.put(
+          const retention = this.env.RT_RECORDINGS.put(
             key,
             JSON.stringify({
               org: bound.org,
@@ -508,9 +509,12 @@ export class AgentSessionDO {
               recordedAt: Date.now(),
               messages: history,
             }),
-          ).catch(() => {
+          ).catch((e) => {
             // transcript retention is best-effort — never fail the read over a bucket write
+            console.warn(`agent-transcript-retention failed key=${key}: ${(e as Error)?.message ?? e}`);
           });
+          if (this.state.waitUntil) this.state.waitUntil(retention);
+          else void retention;
         }
         return Response.json({ history }, { status: 200 });
       }
