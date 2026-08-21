@@ -473,6 +473,9 @@ export class TurnTakingCore {
       // Done-check names it) so the numbers land in the agent-turn logs without any extra plumbing.
       if (this.currentMarks) {
         this.latency.record(this.currentMarks);
+        // Per-turn hop marks (E1 measurement): speechEnd → STT-final → LLM-first-token → TTS-first-audio,
+        // so a single turn's ttfa breakdown is attributable without waiting for the 30-turn distribution.
+        this.deps.log("agent-turn-hop", { ...this.idFields(), ...this.currentMarks });
         if (this.latency.count() % 30 === 0) {
           this.deps.log("agent-turn-latency", { ...this.idFields(), distribution: this.latency.distribution() });
         }
