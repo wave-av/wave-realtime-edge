@@ -494,25 +494,15 @@ export class AgentSessionDO {
         // every voice-agent session must OFFER its transcript, not just speak it. `this.turn` is null
         // until armed, so an unarmed/echo session honestly returns an empty history.
         const history = this.turn ? this.turn.history() : [];
-        // Record the transcript on read (best-effort, fire-and-forget) so every OFFERED transcript is also
-        // RETAINED. Keyed `transcript:{org}:{room}:{session}.json` in the same R2 bucket the recordings use.
-        const bound = this.core.bound;
-        if (this.env.RT_RECORDINGS && bound && history.length > 0) {
-          const key = `transcript:${bound.org}:${bound.roomId}:${bound.participantSessionId}.json`;
-          void this.env.RT_RECORDINGS.put(
-            key,
-            JSON.stringify({
-              org: bound.org,
-              roomId: bound.roomId,
-              sessionId: bound.participantSessionId,
-              recordedAt: Date.now(),
-              messages: history,
-            }),
-          ).catch(() => {
-            // transcript retention is best-effort — never fail the read over a bucket write
-          });
-        }
+        void this.persistTranscript(); // record on read (best-effort; the read never blocks on the write)
         return Response.json({ history }, { status: 200 });
+      }
+      if (path === "finalize" && request.method === "POST") {
+        // Persist the transcript at SESSION END (the worker calls this when the room/session closes), so
+        // every recorded session is retained even if its history was never explicitly read. Returns whether
+        // a non-empty transcript was actually written.
+        const recorded = await this.persistTranscript();
+        return Response.json({ ok: true, recorded }, { status: 200 });
       }
       return Response.json({ error: "BAD_REQUEST", message: `unknown agent intent: ${path}` }, { status: 400 });
     } catch (e) {
@@ -525,6 +515,29 @@ export class AgentSessionDO {
   /** Feed one decoded egress WS frame: a real turn when armed (step 3), else the echo harness (fallback). */
   echoFrame(frame: Uint8Array): Promise<void> {
     return this.turn ? this.turn.onFrame(frame) : this.core.echoFrame(frame);
+  }
+
+  /**
+   * Persist the session transcript to R2 (`transcript:{org}:{room}:{session}.json`). Best-effort — a bucket
+   * write never fails the caller. Returns true only when a non-empty transcript was actually written.
+   */
+  private persistTranscript(): Promise<boolean> {
+    const bound = this.core.bound;
+    const history = this.turn ? this.turn.history() : [];
+    if (!this.env.RT_RECORDINGS || !bound || history.length === 0) return Promise.resolve(false);
+    const key = `transcript:${bound.org}:${bound.roomId}:${bound.participantSessionId}.json`;
+    return this.env.RT_RECORDINGS.put(
+      key,
+      JSON.stringify({
+        org: bound.org,
+        roomId: bound.roomId,
+        sessionId: bound.participantSessionId,
+        recordedAt: Date.now(),
+        messages: history,
+      }),
+    )
+      .then(() => true)
+      .catch(() => false);
   }
 
   /**
