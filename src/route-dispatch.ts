@@ -70,6 +70,7 @@ import {
 	AGENT_EGRESS_ROUTE,
 	AGENT_INGEST_ROUTE,
 	AGENT_TTS_ROUTE,
+	AGENT_AUDIO_IN_ROUTE,
 	PRESENCE_ROUTE,
 	presenceEnabled,
 	INGRESS_ROUTE,
@@ -748,6 +749,30 @@ export async function dispatch(
 			const id = env.AGENT_SESSION.idFromName(`${aorg}:${aroom}`);
 			const stub = env.AGENT_SESSION.get(id);
 			return stub.fetch(new Request(`https://agent/tts?sessionId=${encodeURIComponent(asession)}&trackName=${encodeURIComponent(atrack)}`, request));
+		}
+
+		// 5) Audio-IN WS: a NON-browser client (local CLI / on-prem / cloud) dials IN to STREAM the
+		// participant's PCM to the agent — the headless "mic" that replaces the SFU egress leg. Same
+		// capability-token auth; the upgrade is forwarded to the `${org}:${room}` AgentSessionDO, which
+		// feeds each binary frame into the turn loop.
+		const ainMatch = url.pathname.match(AGENT_AUDIO_IN_ROUTE);
+		if (ainMatch) {
+			const [, aorg, aroom, asession, atrack] = ainMatch;
+			if (![aorg, aroom, asession, atrack].every((s) => SAFE_SEGMENT.test(s)) || !env.AGENT_SESSION) {
+				return Response.json({ error: "BAD_REQUEST", message: "invalid agent audio-in path or no AGENT_SESSION binding" }, { status: 400 });
+			}
+			const tok = url.searchParams.get("t");
+			const tokenOk = !!tok && !!env.WAVE_INTERNAL_SECRET && (await verifyRecorderToken(env.WAVE_INTERNAL_SECRET, aorg, asession, atrack, tok));
+			if (!tokenOk) {
+				const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
+				if (denied) return denied;
+			}
+			if ((request.headers.get("Upgrade") ?? "").toLowerCase() !== "websocket") {
+				return Response.json({ error: "UPGRADE_REQUIRED", message: "agent audio-in route requires a WebSocket upgrade" }, { status: 426 });
+			}
+			const id = env.AGENT_SESSION.idFromName(`${aorg}:${aroom}`);
+			const stub = env.AGENT_SESSION.get(id);
+			return stub.fetch(new Request(`https://agent/audio-in?sessionId=${encodeURIComponent(asession)}&trackName=${encodeURIComponent(atrack)}`, request));
 		}
 	}
 

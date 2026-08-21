@@ -450,6 +450,45 @@ export class AgentSessionDO {
         return new Response(null, { status: 200, webSocket: client } as ResponseInit & { webSocket: WebSocket });
       }
     }
+    // The agent audio-IN WS: a NON-browser client (local CLI / on-prem / cloud) dials IN to STREAM the
+    // participant's PCM — the headless "mic" that replaces the SFU egress leg. Each binary frame is fed into
+    // the turn loop (onFrame / echoFrame) exactly as the echo-frame POST path does. Native hibernation-safe.
+    if (path === "audio-in" && (request.headers.get("Upgrade") ?? "").toLowerCase() === "websocket") {
+      const WSP = (globalThis as unknown as { WebSocketPair?: new () => Record<string, WebSocket> }).WebSocketPair;
+      if (!WSP) {
+        return Response.json({ error: "REALTIME_NOT_CONFIGURED", message: "WebSocketPair unavailable" }, { status: 503 });
+      }
+      const pair = new WSP();
+      const client = (pair as unknown as Record<string, WebSocket>)[0];
+      const server = (pair as unknown as Record<string, WebSocket>)[1];
+      if (this.state.acceptWebSocket) {
+        this.state.acceptWebSocket(server);
+      } else {
+        server.accept();
+      }
+      try {
+        (server as unknown as { binaryType?: string }).binaryType = "arraybuffer";
+      } catch {
+        /* binaryType not settable on some runtimes — the Blob branch below still catches it */
+      }
+      const feed = (data: unknown): void => {
+        if (data instanceof ArrayBuffer) {
+          const buf = new Uint8Array(data);
+          if (buf.length === 0) return;
+          const r = this.turn ? this.turn.onFrame(buf) : this.core.echoFrame(buf);
+          if (r && typeof (r as Promise<void>).then === "function") void (r as Promise<void>).catch(() => {});
+        } else if (typeof Blob !== "undefined" && data instanceof Blob) {
+          void (data as Blob).arrayBuffer().then((ab) => feed(ab)).catch(() => {});
+        }
+      };
+      server.addEventListener("message", (ev: MessageEvent) => feed(ev.data));
+      console.log(JSON.stringify({ msg: "agent-audio-in-open", bound: this.core.bound?.roomId ?? null }));
+      try {
+        return new Response(null, { status: 101, webSocket: client } as ResponseInit & { webSocket: WebSocket });
+      } catch {
+        return new Response(null, { status: 200, webSocket: client } as ResponseInit & { webSocket: WebSocket });
+      }
+    }
     try {
       if (path === "bind" && request.method === "POST") {
         const body = (await request.json().catch(() => ({}))) as { config?: AgentSessionConfig };
