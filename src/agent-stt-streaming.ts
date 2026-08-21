@@ -69,7 +69,13 @@ export async function streamingTranscribe(
     // The CF Workers runtime exposes the standard browser WebSocket constructor for outbound
     // connections from DOs. The @cloudflare/workers-types package only types the hibernation
     // (server-side) WebSocket; we bridge via the OutboundWebSocket interface above.
-    const ws = new (globalThis.WebSocket as unknown as new (url: string) => OutboundWebSocket)(url);
+    // Deepgram browser-style auth: the API key rides the WebSocket SUBPROTOCOL (["token", key]) — a WS client
+    // cannot set headers, and the URL has no token param. Without it Deepgram 401s the handshake → onerror →
+    // the live "Deepgram WebSocket error" that disabled this path (22/22 turns, 2026-08-20).
+    const ws = new (globalThis.WebSocket as unknown as new (url: string, protocols?: string[]) => OutboundWebSocket)(
+      url,
+      ["token", apiKey],
+    );
     let settled = false;
     let transcript = "";
 
