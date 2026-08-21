@@ -513,6 +513,14 @@ export class AgentSessionDO {
         const ttsEndpoint = ttsToken
           ? `${baseWss.replace(/\/+$/, "")}/v1/realtime/agents/tts/${encodeURIComponent(bound.org)}/${encodeURIComponent(bound.roomId)}/${encodeURIComponent(bound.participantSessionId)}/${encodeURIComponent(bound.agentTrackName!)}?t=${encodeURIComponent(ttsToken)}`
           : undefined;
+        // The audio-IN endpoint the CLIENT dials to STREAM the participant's PCM to the agent (the headless
+        // "mic" — a non-browser client replaces the SFU egress leg). Bound to the PARTICIPANT track.
+        const audioInToken = secret
+          ? await mintRecorderToken(secret, bound.org, bound.participantSessionId, bound.participantTrackName)
+          : undefined;
+        const audioInEndpoint = audioInToken
+          ? `${baseWss.replace(/\/+$/, "")}/v1/realtime/agents/audio-in/${encodeURIComponent(bound.org)}/${encodeURIComponent(bound.roomId)}/${encodeURIComponent(bound.participantSessionId)}/${encodeURIComponent(bound.participantTrackName)}?t=${encodeURIComponent(audioInToken)}`
+          : undefined;
         const { egress, ingest } = await this.core.openAdapters({ baseWss, egressToken, ingestToken });
         this.armTurnTaking(bound); // step 3: arm the turn core for this binding (replaces echo on frames)
         return Response.json(
@@ -527,6 +535,8 @@ export class AgentSessionDO {
             // The direct-playback endpoint the CLIENT dials to receive the agent's TTS PCM (bypasses the broken
             // SFU ingest). Pre-built with the capability token so the browser needs no other auth.
             ttsEndpoint,
+            // The audio-IN endpoint a NON-browser client dials to STREAM the participant's PCM (headless mic).
+            audioInEndpoint,
           },
           { status: 200 },
         );
