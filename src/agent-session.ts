@@ -336,6 +336,7 @@ export class AgentSessionDO {
   private ttsClients: WebSocket[] = [];
   /** Audio-in sockets (the headless "mic"): the runtime delivers their frames to webSocketMessage(). */
   private audioInSockets = new Set<WebSocket>();
+    private audioInFed = new Map<WebSocket, number>();
   /** Step-3 turn-taking core, armed on bind when the provider is WAVE (replaces echo as the live behavior). */
   private turn: TurnTakingCore | null = null;
 
@@ -480,6 +481,11 @@ export class AgentSessionDO {
       // Hibernation: the runtime delivers this socket's frames to webSocketMessage(), NOT addEventListener("message")
       // (which is a no-op on an acceptWebSocket'd socket). Track it so webSocketMessage can route the frames.
       this.audioInSockets.add(server);
+        try {
+          (server as unknown as { serializeAttachment?: (value: unknown) => void }).serializeAttachment?.({ kind: "audio-in" });
+        } catch {
+          /* attachment support is unavailable in some test/runtime shims */
+        };
       console.log(JSON.stringify({ msg: "agent-audio-in-open", bound: this.core.bound?.roomId ?? null }));
       try {
         return new Response(null, { status: 101, webSocket: client } as ResponseInit & { webSocket: WebSocket });
@@ -578,12 +584,17 @@ export class AgentSessionDO {
    *  is the only socket that RECEIVES (the ingest + TTS sockets are send-only), so every binary frame here is
    *  a headless-mic PCM frame. Fail-safe: a defect must never crash the socket. */
   webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
-    if (!this.audioInSockets.has(ws) || typeof message === "string") return;
+    const attachment = (ws as unknown as { deserializeAttachment?: () => unknown }).deserializeAttachment?.();
+      const isAudioIn = this.audioInSockets.has(ws) || (attachment as { kind?: string } | null)?.kind === "audio-in";
+      if (!isAudioIn || typeof message === "string") return;
     try {
       const buf = new Uint8Array(message);
       if (buf.length === 0) return;
+        const fed = (this.audioInFed.get(ws) ?? 0) + 1;
+        this.audioInFed.set(ws, fed);
+        if (fed === 1) console.log(JSON.stringify({ msg: "agent-audio-in-first-frame", len: buf.length, bound: !!this.core.bound, armed: !!this.turn }));
       const r = this.turn ? this.turn.onFrame(buf) : this.core.echoFrame(buf);
-      if (r && typeof (r as Promise<void>).then === "function") void (r as Promise<void>).catch(() => {});
+      if (r && typeof (r as Promise<void>).then === "function") void (r as Promise<void>).catch((error) => console.log(JSON.stringify({ msg: "agent-audio-in-frame-error", error: (error as Error)?.message ?? "unknown" })));
     } catch {
       /* fail-safe — a decode/turn defect must never crash the socket */
     }
@@ -591,11 +602,15 @@ export class AgentSessionDO {
 
   /** Hibernation handler — drop a closed audio-in socket from the tracked set. */
   webSocketClose(ws: WebSocket): void {
-    this.audioInSockets.delete(ws);
+    console.log(JSON.stringify({ msg: "agent-audio-in-close", fed: this.audioInFed.get(ws) ?? 0 }));
+      this.audioInFed.delete(ws);
+      this.audioInSockets.delete(ws);
   }
 
   webSocketError(ws: WebSocket): void {
-    this.audioInSockets.delete(ws);
+    console.log(JSON.stringify({ msg: "agent-audio-in-close", fed: this.audioInFed.get(ws) ?? 0 }));
+      this.audioInFed.delete(ws);
+      this.audioInSockets.delete(ws);
   }
 
   /**
