@@ -178,7 +178,7 @@ export const AGENT_AUDIO_IN_ROUTE = /^\/v1\/realtime\/agents\/audio-in\/([^/]+)\
 /** Task #81 — the retained conversation TRANSCRIPT: GET /v1/realtime/agents/transcripts/:org/:room/:session.
  *  The AgentSessionDO records each offered transcript to R2 (keyed `transcript:{org}:{room}:{session}.json`),
  *  and this route reads that object back. The console's "Show transcript" calls it. */
-export const AGENT_TRANSCRIPTS_ROUTE = /^\/v1\/realtime\/agents\/transcripts\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
+
 /** #88 M2 — Zoom RTMS ingest WS (the SFU dials IN to PULL the bridged Zoom audio):
  *  /zoom/rtms/ingest/:meetingUuid/:org/:sessionId/:trackName. The upgrade is FORWARDED to the
  *  idFromName(meetingUuid) ZoomRtmsBridgeDO (the same DO the verified rtms_started started), which owns the

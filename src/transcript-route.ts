@@ -27,7 +27,14 @@ export async function maybeHandleTranscriptRead(request: Request, url: URL, env:
   }
   if (room && session) {
     const obj = await env.RT_RECORDINGS.get(`transcript:${org}:${room}:${session}.json`);
-    if (!obj) return Response.json({ error: "NOT_FOUND", message: "no transcript for that session" }, { status: 404 });
+    if (!obj) {
+      if (!env.AGENT_SESSION) {
+        return Response.json({ error: "TRANSCRIPT_UNAVAILABLE", message: "agent session binding not configured" }, { status: 503 });
+      }
+      const id = env.AGENT_SESSION.idFromName(`${org}:${room}`);
+      const stub = env.AGENT_SESSION.get(id);
+      return stub.fetch(new Request(`https://agent/history?sessionId=${encodeURIComponent(session)}`, { method: "GET" }));
+    }
     return new Response(await obj.text(), { status: 200, headers: { "content-type": "application/json" } });
   }
   const listed = await env.RT_RECORDINGS.list({ prefix: `transcript:${org}:`, limit: 100 });
