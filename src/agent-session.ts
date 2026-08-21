@@ -298,6 +298,8 @@ export interface AgentSessionEnv {
   VOICE_AGENT_SYSTEM_PROMPT?: string;
   /** test-only: injected adapter-create fetch (defaults to global fetch). Never a wire input. */
   __agentFetch?: typeof fetch;
+  /** R2 bucket for the session transcript (recorded on read so every offered transcript is also retained). */
+  RT_RECORDINGS?: R2Bucket;
   // ── HONEST EXTENSION POINTS (later #81 steps — NOT stubbed to pretend they work) ──
   // STT:        streaming STT provider creds (step 3). NOT present → no transcription (echo-only today).
   // LLM:        WAVE gateway base + service token for Opus/Sonnet (step 3, design §L1 LOCKED).
@@ -486,6 +488,31 @@ export class AgentSessionDO {
       }
       if (path === "info" && request.method === "GET") {
         return Response.json({ bound: this.core.bound, timings: this.core.timingSamples() }, { status: 200 });
+      }
+      if (path === "history" && request.method === "GET") {
+        // The conversation transcript (system + alternating user/assistant). A core product surface:
+        // every voice-agent session must OFFER its transcript, not just speak it. `this.turn` is null
+        // until armed, so an unarmed/echo session honestly returns an empty history.
+        const history = this.turn ? this.turn.history() : [];
+        // Record the transcript on read (best-effort, fire-and-forget) so every OFFERED transcript is also
+        // RETAINED. Keyed `transcript:{org}:{room}:{session}.json` in the same R2 bucket the recordings use.
+        const bound = this.core.bound;
+        if (this.env.RT_RECORDINGS && bound && history.length > 0) {
+          const key = `transcript:${bound.org}:${bound.roomId}:${bound.participantSessionId}.json`;
+          void this.env.RT_RECORDINGS.put(
+            key,
+            JSON.stringify({
+              org: bound.org,
+              roomId: bound.roomId,
+              sessionId: bound.participantSessionId,
+              recordedAt: Date.now(),
+              messages: history,
+            }),
+          ).catch(() => {
+            // transcript retention is best-effort — never fail the read over a bucket write
+          });
+        }
+        return Response.json({ history }, { status: 200 });
       }
       return Response.json({ error: "BAD_REQUEST", message: `unknown agent intent: ${path}` }, { status: 400 });
     } catch (e) {
