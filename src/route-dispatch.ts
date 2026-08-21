@@ -587,8 +587,8 @@ export async function dispatch(
 	// route additionally accepts the per-(org,session,track) capability token the SFU appends (it can't send
 	// x-wave-internal). The AgentSessionDO is keyed `${org}:${room}` so dispatch + egress address one DO.
 	if (voiceAgentEnabled(env)) {
-		// 1) Dispatch: POST /v1/realtime/agents/:intent (bind|info) → bind/inspect an AgentSessionDO for a room.
-		const adMatch = request.method === "POST" ? url.pathname.match(AGENT_DISPATCH_ROUTE) : null;
+		// 1) Dispatch: POST .../bind or GET .../info|history → an AgentSessionDO for a room.
+		const adMatch = (request.method === "POST" || request.method === "GET") ? url.pathname.match(AGENT_DISPATCH_ROUTE) : null;
 		if (adMatch && AGENT_DISPATCH_INTENTS.has(adMatch[1])) {
 			const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
 			if (denied) return denied;
@@ -601,13 +601,15 @@ export async function dispatch(
 				return Response.json({ error: "REALTIME_NOT_CONFIGURED", message: "AGENT_SESSION durable object binding is not configured" }, { status: 503 });
 			}
 			let body: Record<string, unknown> = {};
-			try {
-				body = (await request.json()) as Record<string, unknown>;
-			} catch {
-				body = {};
+			if (request.method === "POST") {
+				try {
+					body = (await request.json()) as Record<string, unknown>;
+				} catch {
+					body = {};
+				}
 			}
 			const cfg = (body.config ?? {}) as Partial<AgentSessionConfig>;
-			const room = typeof cfg.roomId === "string" ? cfg.roomId : "";
+			const room = request.method === "GET" ? (url.searchParams.get("roomId") ?? "") : typeof cfg.roomId === "string" ? cfg.roomId : "";
 			const agentId = typeof cfg.agentId === "string" ? cfg.agentId : "";
 			if (adMatch[1] === "bind" && (!SAFE_SEGMENT.test(room) || !SAFE_SEGMENT.test(agentId))) {
 				return Response.json({ error: "BAD_REQUEST", message: "bind requires config.roomId and config.agentId" }, { status: 400 });
@@ -618,7 +620,10 @@ export async function dispatch(
 			const doKey = `${org}:${room}`;
 			const id = env.AGENT_SESSION.idFromName(doKey);
 			const stub = env.AGENT_SESSION.get(id);
-			const method = adMatch[1] === "info" ? "GET" : "POST";
+			if (request.method === "GET" && (!SAFE_SEGMENT.test(room) || !["info", "history"].includes(adMatch[1]))) {
+				return Response.json({ error: "BAD_REQUEST", message: "GET agent history/info requires a valid roomId" }, { status: 400 });
+			}
+			const method = adMatch[1] === "info" || adMatch[1] === "history" ? "GET" : "POST";
 			// #76 P2 (arch A): additionally fold the agent's media-READ onto the room's single MediaTap. When
 			// MEDIA_TAP_ENABLED is armed, tell the SAME-keyed ROOM DO to register an in-process MediaConsumer
 			// for the agent's target track — no 2nd SFU subscription, no cross-DO frame transport. Fire-and-
