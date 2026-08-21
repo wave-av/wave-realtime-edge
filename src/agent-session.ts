@@ -71,6 +71,10 @@ export interface AgentSessionConfig {
   participantTrackName: string;
   /** The track name the agent publishes back (ingest). Defaults to `agent-${agentId}`. */
   agentTrackName?: string;
+  /** Headless mode: a non-browser client (CLI / on-prem / cloud) drives the turn over the audio-in + TTS
+   *  WS instead of the SFU egress/ingest. Skips the SFU adapter create (no real SFU session) — the DO still
+   *  arms the turn core and mints the audio-in + TTS capability tokens. */
+  headless?: boolean;
 }
 
 const SAFE = /^[A-Za-z0-9_:.-]{1,128}$/;
@@ -521,17 +525,21 @@ export class AgentSessionDO {
         const audioInEndpoint = audioInToken
           ? `${baseWss.replace(/\/+$/, "")}/v1/realtime/agents/audio-in/${encodeURIComponent(bound.org)}/${encodeURIComponent(bound.roomId)}/${encodeURIComponent(bound.participantSessionId)}/${encodeURIComponent(bound.participantTrackName)}?t=${encodeURIComponent(audioInToken)}`
           : undefined;
-        const { egress, ingest } = await this.core.openAdapters({ baseWss, egressToken, ingestToken });
+        // Headless: a non-browser client (CLI / on-prem / cloud) drives the turn over the audio-in + TTS WS,
+        // so the SFU adapters are SKIPPED (no real SFU session). The browser path still opens them.
+        const adapters = bound.headless
+          ? { egress: undefined, ingest: undefined }
+          : await this.core.openAdapters({ baseWss, egressToken, ingestToken });
         this.armTurnTaking(bound); // step 3: arm the turn core for this binding (replaces echo on frames)
         return Response.json(
           {
             ok: true,
             bound,
-            egressAdapterId: egress.adapterId,
-            ingestAdapterId: ingest.adapterId,
+            egressAdapterId: adapters.egress?.adapterId,
+            ingestAdapterId: adapters.ingest?.adapterId,
             // The session the agent track is published on (CF's own, returned by the ingest adapter) — a consumer
             // (the room participant / harness) pulls `agentTrackName` from HERE, not participantSessionId (#29).
-            agentSessionId: ingest.publishedSessionId ?? bound.participantSessionId,
+            agentSessionId: adapters.ingest?.publishedSessionId ?? bound.participantSessionId,
             // The direct-playback endpoint the CLIENT dials to receive the agent's TTS PCM (bypasses the broken
             // SFU ingest). Pre-built with the capability token so the browser needs no other auth.
             ttsEndpoint,
