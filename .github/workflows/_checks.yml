@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: false
+          persist-credentials: true # v7 sparse-checkout re-fetches the full tree on PRIVATE repos; the persisted token is required
       - name: Secret scan (fail-closed, allowlist-aware)
         run: |
           # Real-secret patterns. Lines tagged "pragma: allowlist secret" (e.g. test fixtures / regex
@@ -53,7 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: false
+          persist-credentials: true # v7 sparse-checkout re-fetches the full tree on PRIVATE repos; the persisted token is required
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.14"
@@ -113,7 +113,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: false
+          persist-credentials: true # v7 sparse-checkout re-fetches the full tree on PRIVATE repos; the persisted token is required
       - name: URL convention gate
         # Reads only file paths from `git ls-files` (repo-controlled, trusted) and host strings
         # extracted via a CONSTRAINED regex from wrangler.toml (PR-controlled). The regex
