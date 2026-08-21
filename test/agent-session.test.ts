@@ -287,30 +287,29 @@ describe("AgentSessionDO TTS playout WS — the direct-playback path (bypass the
 });
 
 describe("AgentSessionDO audio-in WS — the headless mic (non-browser client)", () => {
-  let messageHandler: ((ev: { data: unknown }) => void) | null = null;
+  let audioServer: FakeAudioWS;
   class FakeAudioWS {
     binaryType = "blob";
     accept() {}
-    addEventListener(ev: string, cb: () => void) { if (ev === "message") messageHandler = cb as never; }
+    addEventListener() {}
     close() {}
   }
   beforeAll(() => {
     (globalThis as unknown as { WebSocketPair: unknown }).WebSocketPair = class {
       0 = new FakeAudioWS();
-      1 = new FakeAudioWS();
+      1 = (audioServer = new FakeAudioWS());
     } as unknown;
   });
   const mkState = () => ({ storage: { get: async () => undefined, put: async () => {} } }) as never;
 
-  it("accepts the audio-in WS and feeds a binary frame into the turn loop without throwing", async () => {
+  it("accepts the audio-in WS and feeds a binary frame into the turn loop via webSocketMessage", async () => {
     const session = new AgentSessionDO(mkState(), { VOICE_AGENT_PROVIDER: "wave" } as never);
     const up = await session.fetch(new Request("https://agent/audio-in", { headers: { Upgrade: "websocket" } }));
     expect(up.status).toBeLessThan(400);
-    expect(messageHandler).toBeTruthy();
-    // Feed a PCM frame → the (unbound) echo harness runs; the broadcast sink has no sink yet so the send is a
-    // no-op, but the frame is consumed fail-safe (never thrown up the WS message path).
+    // The hibernation runtime delivers frames to webSocketMessage (NOT addEventListener) — feed one and assert
+    // it does not throw (the unbound echo harness runs; the broadcast sink has no sink yet so the send is a no-op).
     const frame = encodeIngestFrame(new Uint8Array([1, 2, 3, 4]), { sequenceNumber: 1, timestamp: 1 }, "packet");
-    expect(() => messageHandler!({ data: frame.buffer as ArrayBuffer })).not.toThrow();
+    expect(() => session.webSocketMessage(audioServer as unknown as WebSocket, frame.buffer as ArrayBuffer)).not.toThrow();
   });
 
   it("returns 503 when WebSocketPair is unavailable on the audio-in path (config-no-silent-noop)", async () => {
