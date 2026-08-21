@@ -549,10 +549,21 @@ export class AgentSessionDO {
       if (path === "history" && request.method === "GET") {
         // The conversation transcript (system + alternating user/assistant). A core product surface:
         // every voice-agent session must OFFER its transcript, not just speak it. `this.turn` is null
-        // until armed, so an unarmed/echo session honestly returns an empty history.
+        // until armed, so an unarmed/echo session honestly returns an empty history. Returns the SAME
+        // TranscriptResult shape the R2 retention uses and the console's getTranscript expects.
+        const bound = this.core.bound;
         const history = this.turn ? this.turn.history() : [];
         void this.persistTranscript(); // record on read (best-effort; the read never blocks on the write)
-        return Response.json({ history }, { status: 200 });
+        return Response.json(
+          {
+            org: bound?.org ?? "",
+            roomId: bound?.roomId ?? "",
+            sessionId: bound?.participantSessionId ?? "",
+            recordedAt: Date.now(),
+            messages: history,
+          },
+          { status: 200 },
+        );
       }
       if (path === "finalize" && request.method === "POST") {
         // Persist the transcript at SESSION END (the worker calls this when the room/session closes), so
