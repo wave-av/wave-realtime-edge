@@ -23,7 +23,7 @@ import type { AgentTurnEnv, SttResult, TurnTakingConfig } from "./agent-turn.js"
 
 /** The default agent persona when none is configured (honest, generic — a real persona is set per-agent). */
 export const DEFAULT_SYSTEM_PROMPT =
-  "You are a helpful, concise WAVE voice agent. Reply in short, natural spoken sentences.";
+  "You are a helpful, concise WAVE voice agent. Always reply in English, regardless of the user's language. Reply in short, natural spoken sentences.";
 
 /** The configured persona, or the default. Pure → unit-testable. */
 export function buildTurnSystemPrompt(config: Pick<TurnTakingConfig, "systemPrompt">): string {
