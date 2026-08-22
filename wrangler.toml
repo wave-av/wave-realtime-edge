@@ -300,6 +300,11 @@ VOICE_AGENT_TOOLS = "[{\"name\":\"wave_usage_summary\",\"description\":\"Read th
 # the 300ms target with a small anti-underrun cushion above 20. 0 disables pacing (legacy bulk send).
 AGENT_TTS_LEAD_MS = "30"
 
+# signal-flow E1 observer tap — when "true"/"1", the voice-agent flow emits transition records
+# (stt/result, tts/chunk, upmix/out, frame-encode/out) as JSON lines for the garbled-audio diagnosis.
+AGENT_FLOW_TAP = "true"
+
+
 # ── RT-P1.5 — pluggable recording encoders (design §6). DEFAULT DISARMED / DORMANT. ──
 # RT_RECORD arms recording at all; absent/"0" → selectEncoder() returns the inert DisarmedEncoder (begin →
 # null), so the whole feature is a no-op (config-no-silent-noop: inert, not silently broken). Arming
