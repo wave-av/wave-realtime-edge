@@ -41,6 +41,8 @@ export interface SpeechSessionOptions {
   nextSeq(): number;
   /** org/room/agentId for the structured log. */
   idFields(): Record<string, unknown>;
+  /** flow-tap (signal-flow E1): emit the frame-out transition record when on. */
+  flowTap?: boolean;
 }
 
 /**
@@ -173,6 +175,11 @@ export class SpeechSession {
           // START-of-chunk sample index and CONTINUES ACROSS SENTENCES (D1) — one utterance, one timeline.
           const wire = encodeIngestFrame(chunk, { sequenceNumber: seq, timestamp: this.tsTicks }, this.opts.framing);
           sock.send(wire);
+          // flow-tap (signal-flow E1): the frame-out transition record — seq/ts/bytes names a mis-ordered or
+          // duplicated frame (the garbled/multi-rendition failure mode) right where it leaves the edge.
+          if (this.opts.flowTap) {
+            this.deps.log("flow-tap", { node: "frame-encode", evt: "out", seq, ts: this.tsTicks, bytes: chunk.length });
+          }
           if (this.firstAudioMs < 0) this.firstAudioMs = this.deps.now(); // TTFA receipt: first frame ON THE WIRE
           pcmBytesOut += chunk.length;
           this.pcmBytesOut += chunk.length;

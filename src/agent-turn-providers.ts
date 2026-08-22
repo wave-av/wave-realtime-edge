@@ -18,7 +18,18 @@
  */
 import { AgentSessionError } from "./agent-session.js";
 import { pcmToWav, WAV_MIME } from "./pcm-wav.js";
-import type { AgentTurnEnv, SttResult } from "./agent-turn.js";
+import { flowTap } from "./flow-tap.js";
+import type { AgentTurnEnv, SttResult, TurnTakingConfig } from "./agent-turn.js";
+
+/** The default agent persona when none is configured (honest, generic — a real persona is set per-agent). */
+export const DEFAULT_SYSTEM_PROMPT =
+  "You are a helpful, concise WAVE voice agent. Reply in short, natural spoken sentences.";
+
+/** The configured persona, or the default. Pure → unit-testable. */
+export function buildTurnSystemPrompt(config: Pick<TurnTakingConfig, "systemPrompt">): string {
+  const p = (config.systemPrompt ?? "").trim();
+  return p.length > 0 ? p : DEFAULT_SYSTEM_PROMPT;
+}
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -107,13 +118,17 @@ export async function* streamElevenLabs(
     throw new AgentSessionError("TTS_UPSTREAM", `ElevenLabs returned ${res.status}`, 502);
   }
   const reader = res.body.getReader();
+  flowTap(env, "tts", "start", { chars: text.length });
   // try/finally so a consumer that breaks early (barge-in abort cancels the for-await) releases the underlying
   // body via reader.cancel() — otherwise the abandoned TTS Response leaks and deadlocks the DO's fetch pool.
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (value && value.length > 0) yield value;
+      if (value && value.length > 0) {
+        flowTap(env, "tts", "chunk", { bytes: value.length });
+        yield value;
+      }
     }
   } finally {
     reader.cancel().catch(() => {});
@@ -131,6 +146,7 @@ export async function* streamElevenLabs(
  */
 export async function* upmixMonoToStereo16LE(
   mono: AsyncIterable<Uint8Array>,
+  env?: AgentTurnEnv,
 ): AsyncIterable<Uint8Array> {
   let carry: number | null = null; // pending low byte of a sample split across a chunk boundary
   for await (const chunk of mono) {
@@ -161,6 +177,7 @@ export async function* upmixMonoToStereo16LE(
       out[o++] = hi;
     }
     if (i < chunk.length) carry = chunk[i]!; // odd trailing byte → carry into the next chunk
+    flowTap(env, "upmix", "out", { bytes: out.length });
     yield out;
   }
 }
@@ -210,6 +227,7 @@ export async function transcribeViaProvider(
   const json = (await res.json().catch(() => ({}))) as { text?: unknown; transcript?: unknown };
   const text =
     typeof json.text === "string" ? json.text : typeof json.transcript === "string" ? json.transcript : "";
+  flowTap(env, "stt", "result", { chars: text.length });
   return { isFinal: true, transcript: text };
 }
 

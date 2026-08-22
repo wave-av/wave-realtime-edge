@@ -70,6 +70,8 @@ import {
   streamElevenLabs,
   upmixMonoToStereo16LE,
   transcribeViaProvider,
+  buildTurnSystemPrompt,
+  DEFAULT_SYSTEM_PROMPT,
   type FetchLike,
 } from "./agent-turn-providers.js";
 import { streamingTranscribe } from "./agent-stt-streaming.js";
@@ -134,6 +136,8 @@ export interface AgentTurnDeps {
    * `buildTurnDeps` mirrors src/metering.ts (POST /v1/internal/usage, service token); tests pass a fake.
    */
   emitMeter(usage: VoiceTurnUsage): Promise<void>;
+  /** flow-tap (signal-flow E1): the observer transition records are armed. */
+  flowTap?: boolean;
 }
 
 /** Config to run a turn-taking session for one room/participant (superset of the bind config + the persona). */
@@ -148,8 +152,7 @@ export interface TurnTakingConfig {
 }
 
 /** The default agent persona when none is configured (honest, generic — a real persona is set per-agent). */
-export const DEFAULT_SYSTEM_PROMPT =
-  "You are a helpful, concise WAVE voice agent. Reply in short, natural spoken sentences.";
+export { DEFAULT_SYSTEM_PROMPT, buildTurnSystemPrompt };
 
 /** Step-5 hard default cap on tool-call iterations within ONE turn (anti-runaway). Overridable per-core. */
 export const DEFAULT_MAX_TOOL_ITERATIONS = 5;
@@ -179,12 +182,6 @@ export function ttsLeadMsFromEnv(env: { AGENT_TTS_LEAD_MS?: string | number }): 
  * frames (keep the most recent context for STT + barge-in). Pure constant → unit-testable.
  */
 export const MAX_UTTERANCE_BYTES = 48_000 * 2 * 2 * 15;
-
-/** The configured persona, or the default. Pure → unit-testable. */
-export function buildTurnSystemPrompt(config: Pick<TurnTakingConfig, "systemPrompt">): string {
-  const p = (config.systemPrompt ?? "").trim();
-  return p.length > 0 ? p : DEFAULT_SYSTEM_PROMPT;
-}
 
 /**
  * TurnTakingCore — the pure, testable turn state machine for one agent session. Accumulates participant PCM,
@@ -535,6 +532,7 @@ export class TurnTakingCore {
       isAborted: () => this.aborted,
       nextSeq: () => this.outSeq++,
       idFields: () => this.idFields(),
+      flowTap: this.deps.flowTap,
     });
   }
 
@@ -737,6 +735,7 @@ export function buildTurnDeps(
   // routes attribute + meter usage to the right tenant. Empty only in non-bound test paths.
   return {
     ...media,
+    flowTap: env.AGENT_FLOW_TAP === "true" || env.AGENT_FLOW_TAP === "1",
     async transcribe(pcm: Uint8Array): Promise<SttResult> {
       // Streaming STT path (Deepgram WebSocket) — behind env flag, default OFF.
       // When armed, the adapter opens a WebSocket to Deepgram, streams PCM incrementally,
@@ -773,7 +772,7 @@ export function buildTurnDeps(
       }
       // ElevenLabs pcm_48000 is MONO; CF Realtime buffer-mode ingest wants 48 kHz/16-bit/STEREO interleaved.
       // Upmix (L=R) before publish or the agent's voice plays as endianness-shifted noise. (#30)
-      yield* upmixMonoToStereo16LE(streamElevenLabs(fetchImpl, env, text));
+      yield* upmixMonoToStereo16LE(streamElevenLabs(fetchImpl, env, text), env);
     },
     async emitMeter(usage: VoiceTurnUsage): Promise<void> {
       // Step-7 real usage emit (mirrors metering.ts). INERT until the gateway base + service token are
