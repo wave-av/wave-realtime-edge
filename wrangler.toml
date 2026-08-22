@@ -254,9 +254,6 @@ WAVE_REALTIME_EVENTS_EMIT = "1"
 # activate on an explicit agent bind (POST /v1/realtime/agents/bind); live rooms are unaffected until bound.
 VOICE_AGENT_PROVIDER = "wave"
 
-# Streaming STT (Deepgram WebSocket) — cuts the front-of-turn latency vs the batch transcribe spoke.
-VOICE_AGENT_STREAMING_STT = "true"
-
 # ── Voice-agent LLM backend + model (gateway governed proxy `x-wave-inference-backend`) ──
 # "anthropic" (default) = Claude via the Anthropic Messages API; "ollama" = our local fleet
 # (ollama.wave.online), "openrouter" = allowlisted third-party models, "runpod"/"ssd-stream" = the GPU planes.
