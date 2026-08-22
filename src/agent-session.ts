@@ -341,6 +341,8 @@ export class AgentSessionDO {
   private ingest: IngestSocket | null = null;
   /** FFT-tap frame counter (decimation for the live spectrum — see the echo-frame handler). */
   private fftTapFrame = 0;
+  /** Latest computed spectrum (the FFT tap's output) — served by the spectrum endpoint for the dashboard. */
+  private latestSpectrum: { bins: number[]; at: number } | null = null;
   /** Direct-playback client sockets: the browser dials the TTS route and we fan speak() PCM out to each. */
   private ttsClients: WebSocket[] = [];
   /** Audio-in sockets (the headless "mic"): the runtime delivers their frames to webSocketMessage(). */
@@ -371,6 +373,7 @@ export class AgentSessionDO {
         if ((this.env.AGENT_FFT_TAP === "true" || this.env.AGENT_FFT_TAP === "1") && (this.fftTapFrame = (this.fftTapFrame + 1) & 3) === 0) {
           try {
             const bins = spectrumLogMagnitude(buf, 64);
+            this.latestSpectrum = { bins, at: Date.now() };
             console.log(JSON.stringify({ flow: "voice-agent", node: "fft", evt: "spectrum", bins }));
           } catch {
             /* a tap must never break the live media path */
@@ -564,6 +567,14 @@ export class AgentSessionDO {
       }
       if (path === "info" && request.method === "GET") {
         return Response.json({ bound: this.core.bound, timings: this.core.timingSamples() }, { status: 200 });
+      }
+      if (path === "spectrum" && request.method === "GET") {
+        // The latest FFT spectrum (the audio-signal-plane tap output) — CORS-open so the audio.wave.online
+        // dashboard can poll it. Returns null when no frame has been tapped yet (no live session).
+        return Response.json(this.latestSpectrum ?? { bins: null, at: 0 }, {
+          status: 200,
+          headers: { "access-control-allow-origin": "*" },
+        });
       }
       if (path === "history" && request.method === "GET") {
         // The conversation transcript (system + alternating user/assistant). A core product surface:
