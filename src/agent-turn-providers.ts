@@ -18,6 +18,7 @@
  */
 import { AgentSessionError } from "./agent-session.js";
 import { pcmToWav, WAV_MIME } from "./pcm-wav.js";
+import { flowTap } from "./flow-tap.js";
 import type { AgentTurnEnv, SttResult } from "./agent-turn.js";
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -107,13 +108,17 @@ export async function* streamElevenLabs(
     throw new AgentSessionError("TTS_UPSTREAM", `ElevenLabs returned ${res.status}`, 502);
   }
   const reader = res.body.getReader();
+  flowTap(env, "tts", "start", { chars: text.length });
   // try/finally so a consumer that breaks early (barge-in abort cancels the for-await) releases the underlying
   // body via reader.cancel() — otherwise the abandoned TTS Response leaks and deadlocks the DO's fetch pool.
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (value && value.length > 0) yield value;
+      if (value && value.length > 0) {
+        flowTap(env, "tts", "chunk", { bytes: value.length });
+        yield value;
+      }
     }
   } finally {
     reader.cancel().catch(() => {});
@@ -210,6 +215,7 @@ export async function transcribeViaProvider(
   const json = (await res.json().catch(() => ({}))) as { text?: unknown; transcript?: unknown };
   const text =
     typeof json.text === "string" ? json.text : typeof json.transcript === "string" ? json.transcript : "";
+  flowTap(env, "stt", "result", { chars: text.length });
   return { isFinal: true, transcript: text };
 }
 

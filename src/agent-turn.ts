@@ -73,6 +73,7 @@ import {
   type FetchLike,
 } from "./agent-turn-providers.js";
 import { streamingTranscribe } from "./agent-stt-streaming.js";
+import { flowTap } from "./flow-tap.js";
 
 // ── Public contracts (the injectable-deps seam) ──────────────────────────────────────────────────────────────
 
@@ -218,6 +219,8 @@ export class TurnTakingCore {
   private readonly maxToolIterations: number;
   /** Step-4 barge-in: TTS send-ahead lead (ms). `speak()` paces to this so playout is interruptible (see speak). */
   private readonly ttsLeadMs: number;
+  /** flow-tap (signal-flow E1): the observer tap is on. */
+  private readonly flowTap: boolean;
   /** D1: this turn already spliced its history commit (full OR spoken-prefix). Guarantees at-most-once. */
   private committed = false;
   /** E0-P2 — the session's COGS ledger (DO wall-clock + STT submitted audio). Lives in its own module. */
@@ -243,11 +246,14 @@ export class TurnTakingCore {
       ttsLeadMs?: number;
       /** E0-P2: vendor COGS rates. Omitted ⇒ quantities are measured and reported UNPRICED (never estimated). */
       cogsRates?: VoiceCogsRates;
+      /** flow-tap (signal-flow E1): emit the observer transition records when on. */
+      flowTap?: boolean;
     },
   ) {
     this.deps = deps;
     this.config = config;
     this.framing = opts?.framing ?? "packet";
+    this.flowTap = opts?.flowTap === true;
     this.messages = [{ role: "system", content: buildTurnSystemPrompt(config) }];
     this.vad = new Vad(opts?.vad);
     this.cogs = new TurnCogsLedger(() => this.deps.now());
@@ -535,6 +541,7 @@ export class TurnTakingCore {
       isAborted: () => this.aborted,
       nextSeq: () => this.outSeq++,
       idFields: () => this.idFields(),
+      flowTap: this.flowTap,
     });
   }
 
@@ -773,7 +780,12 @@ export function buildTurnDeps(
       }
       // ElevenLabs pcm_48000 is MONO; CF Realtime buffer-mode ingest wants 48 kHz/16-bit/STEREO interleaved.
       // Upmix (L=R) before publish or the agent's voice plays as endianness-shifted noise. (#30)
-      yield* upmixMonoToStereo16LE(streamElevenLabs(fetchImpl, env, text));
+      const upmixed = upmixMonoToStereo16LE(streamElevenLabs(fetchImpl, env, text));
+      // flow-tap (signal-flow E1): name the upmix output length per chunk — a mono/stereo mismatch is visible here.
+      for await (const pcm of upmixed) {
+        flowTap(env, "upmix", "out", { bytes: pcm.length });
+        yield pcm;
+      }
     },
     async emitMeter(usage: VoiceTurnUsage): Promise<void> {
       // Step-7 real usage emit (mirrors metering.ts). INERT until the gateway base + service token are

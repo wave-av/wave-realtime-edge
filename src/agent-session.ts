@@ -296,6 +296,8 @@ export interface AgentSessionEnv {
   AGENT_PUBLIC_WSS?: string; // our public wss base the SFU dials back to (default rt.wave.online)
   /** Send-side ingest framing override; "packet" (default, modeled) | "raw" (the live spike may select). */
   AGENT_INGEST_FRAMING?: IngestFraming;
+  /** flow-tap (signal-flow E1): when "true"/"1", emit the observer transition records on the voice-agent flow. */
+  AGENT_FLOW_TAP?: string;
   /** Step-4 barge-in: TTS send-ahead lead (ms) for real-time pacing → interruptible playout (default 150). */
   AGENT_TTS_LEAD_MS?: string | number;
   /** ElevenLabs optimize_streaming_latency (0-4): higher = lower first-audio latency. Default 3. */
@@ -650,6 +652,7 @@ export class AgentSessionDO {
         ttsLeadMs: ttsLeadMsFromEnv(this.env), // step 4: real-time TTS pacing → interruptible playout (barge-in)
         tools, // step 5: only these tools are advertised to the model + executable (others refused)
         cogsRates: voiceCogsRatesFromEnv(this.env), // E0-P2: vendor COGS rates (absent ⇒ reported unpriced)
+        flowTap: this.env.AGENT_FLOW_TAP === "true" || this.env.AGENT_FLOW_TAP === "1", // signal-flow E1 observer tap
       });
       media.log("agent-turn-armed", { org: bound.org, room: bound.roomId, agentId: bound.agentId });
     } catch (e) {
