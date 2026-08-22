@@ -304,6 +304,9 @@ AGENT_TTS_LEAD_MS = "30"
 # (stt/result, tts/chunk, upmix/out, frame-encode/out) as JSON lines for the garbled-audio diagnosis.
 AGENT_FLOW_TAP = "true"
 
+# FFT tap (audio-signal-plane E1) — emit the live egress spectrum (node "fft", evt "spectrum", 64 bins)
+AGENT_FFT_TAP = "true"
+
 
 # ── RT-P1.5 — pluggable recording encoders (design §6). DEFAULT DISARMED / DORMANT. ──
 # RT_RECORD arms recording at all; absent/"0" → selectEncoder() returns the inert DisarmedEncoder (begin →
