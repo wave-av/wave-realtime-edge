@@ -31,6 +31,25 @@ export function buildTurnSystemPrompt(config: Pick<TurnTakingConfig, "systemProm
   return p.length > 0 ? p : DEFAULT_SYSTEM_PROMPT;
 }
 
+/**
+ * Normalize the gateway base/token to ONE canonical pair so a single operator-provided set provisions EVERY
+ * gateway path (LLM, STT, tools, metering). The voice runtime introduced `WAVE_GATEWAY_BASE`/`WAVE_GATEWAY_TOKEN`,
+ * but the established edge convention (metering.ts, room.ts) is `GATEWAY_BASE_URL`/`WAVE_SERVICE_TOKEN`. Without
+ * this, setting one pair leaves the other path silently INERT. We fill BOTH names from whichever is set (voice
+ * name wins), so an operator may provision EITHER convention and every path resolves. Pure → unit-testable.
+ */
+export function normalizeGatewayEnv(env: AgentTurnEnv): AgentTurnEnv {
+  const base = env.WAVE_GATEWAY_BASE ?? env.GATEWAY_BASE_URL;
+  const token = env.WAVE_GATEWAY_TOKEN ?? env.WAVE_SERVICE_TOKEN;
+  return {
+    ...env,
+    WAVE_GATEWAY_BASE: base,
+    WAVE_GATEWAY_TOKEN: token,
+    GATEWAY_BASE_URL: env.GATEWAY_BASE_URL ?? base,
+    WAVE_SERVICE_TOKEN: env.WAVE_SERVICE_TOKEN ?? token,
+  };
+}
+
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 // #81 gateway LLM contract — one responsibility, one file (see ./gateway-llm-envelope.ts).
