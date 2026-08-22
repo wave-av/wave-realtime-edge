@@ -19,7 +19,17 @@
 import { AgentSessionError } from "./agent-session.js";
 import { pcmToWav, WAV_MIME } from "./pcm-wav.js";
 import { flowTap } from "./flow-tap.js";
-import type { AgentTurnEnv, SttResult } from "./agent-turn.js";
+import type { AgentTurnEnv, SttResult, TurnTakingConfig } from "./agent-turn.js";
+
+/** The default agent persona when none is configured (honest, generic — a real persona is set per-agent). */
+export const DEFAULT_SYSTEM_PROMPT =
+  "You are a helpful, concise WAVE voice agent. Reply in short, natural spoken sentences.";
+
+/** The configured persona, or the default. Pure → unit-testable. */
+export function buildTurnSystemPrompt(config: Pick<TurnTakingConfig, "systemPrompt">): string {
+  const p = (config.systemPrompt ?? "").trim();
+  return p.length > 0 ? p : DEFAULT_SYSTEM_PROMPT;
+}
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -136,6 +146,7 @@ export async function* streamElevenLabs(
  */
 export async function* upmixMonoToStereo16LE(
   mono: AsyncIterable<Uint8Array>,
+  env?: AgentTurnEnv,
 ): AsyncIterable<Uint8Array> {
   let carry: number | null = null; // pending low byte of a sample split across a chunk boundary
   for await (const chunk of mono) {
@@ -166,6 +177,7 @@ export async function* upmixMonoToStereo16LE(
       out[o++] = hi;
     }
     if (i < chunk.length) carry = chunk[i]!; // odd trailing byte → carry into the next chunk
+    flowTap(env, "upmix", "out", { bytes: out.length });
     yield out;
   }
 }
