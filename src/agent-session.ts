@@ -50,6 +50,7 @@ import {
 import { TurnTakingCore, buildTurnDeps, toolAllowlistFromEnv, ttsLeadMsFromEnv, type AgentTurnEnv } from "./agent-turn.js";
 import { vadConfigFromEnv } from "./agent-vad.js";
 import { voiceCogsRatesFromEnv } from "./voice-cogs.js";
+import { spectrumLogMagnitude } from "./fft.js";
 import { mintRecorderToken } from "./encoders/recorder-auth.js";
 
 /** The flag value that arms the WAVE voice agent. Anything else → fully inert. */
@@ -298,6 +299,8 @@ export interface AgentSessionEnv {
   AGENT_INGEST_FRAMING?: IngestFraming;
   /** flow-tap (signal-flow E1): when "true"/"1", emit the observer transition records on the voice-agent flow. */
   AGENT_FLOW_TAP?: string;
+  /** FFT tap (audio-signal-plane E1): when "true"/"1", emit the live egress spectrum (node "fft", evt "spectrum"). */
+  AGENT_FFT_TAP?: string;
   /** Echo-mute grace after a turn (ms) — drops the mic during the reverberation tail (default 400; 0 disables). */
   AGENT_ECHO_MUTE_MS?: string;
   /** Step-4 barge-in: TTS send-ahead lead (ms) for real-time pacing → interruptible playout (default 150). */
@@ -336,6 +339,8 @@ export class AgentSessionDO {
   private readonly env: AgentTurnEnv;
   private readonly state: DurableObjectStateLike;
   private ingest: IngestSocket | null = null;
+  /** FFT-tap frame counter (decimation for the live spectrum — see the echo-frame handler). */
+  private fftTapFrame = 0;
   /** Direct-playback client sockets: the browser dials the TTS route and we fan speak() PCM out to each. */
   private ttsClients: WebSocket[] = [];
   /** Audio-in sockets (the headless "mic"): the runtime delivers their frames to webSocketMessage(). */
@@ -361,6 +366,16 @@ export class AgentSessionDO {
     if (path === "echo-frame" && request.method === "POST") {
       try {
         const buf = new Uint8Array(await request.arrayBuffer());
+        // FFT tap (wave-audio-signal-plane E1): flag-gated live spectrum of the egress PCM — the Fourier truth
+        // the audio.wave.online dashboard renders. Decimated to every 4th frame (≈12.5 fps) to keep it cheap.
+        if ((this.env.AGENT_FFT_TAP === "true" || this.env.AGENT_FFT_TAP === "1") && (this.fftTapFrame = (this.fftTapFrame + 1) & 3) === 0) {
+          try {
+            const bins = spectrumLogMagnitude(buf, 64);
+            console.log(JSON.stringify({ flow: "voice-agent", node: "fft", evt: "spectrum", bins }));
+          } catch {
+            /* a tap must never break the live media path */
+          }
+        }
         // Step 3: once a turn-taking core is armed (bound under VOICE_AGENT_PROVIDER=wave) frames drive a real
         // conversational turn; until armed (or if turn-taking is unwired) we fall back to the echo harness.
         if (buf.length > 0) await (this.turn ? this.turn.onFrame(buf) : this.core.echoFrame(buf));
