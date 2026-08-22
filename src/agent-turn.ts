@@ -136,7 +136,6 @@ export interface AgentTurnDeps {
    * `buildTurnDeps` mirrors src/metering.ts (POST /v1/internal/usage, service token); tests pass a fake.
    */
   emitMeter(usage: VoiceTurnUsage): Promise<void>;
-  /** flow-tap (signal-flow E1): the observer transition records are armed. */
   flowTap?: boolean;
 }
 
@@ -199,10 +198,7 @@ export class TurnTakingCore {
   /** Running byte total of `utterance` (avoids re-summing on every frame; drives bounded eviction). */
   private utteranceBytes = 0;
   private outSeq = 0;
-  /** Session-wide RTP timestamp (per-channel 48k sample index). Shared by reference with every SpeechSession so
-   *  the SFU's ingest timeline is monotonic ACROSS turns (a per-turn reset replays the new turn's frames over the
-   *  previous turn's buffered audio → "multiple renditions"/garbled). */
-  private readonly tsTicksRef = { value: 0 };
+  private readonly tsTicksRef = { value: 0 }; // session-wide RTP ts, shared into every SpeechSession (monotonic across turns)
   /** Guards against re-entrant turns (a turn is in flight while we await STT/LLM/TTS). */
   private turnInFlight = false;
   /** Set by the step-4 interrupt controller (onUserSpeech / VAD barge-in) to cancel an in-flight turn. */
