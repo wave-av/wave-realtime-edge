@@ -51,6 +51,7 @@ import { TurnTakingCore, buildTurnDeps, toolAllowlistFromEnv, ttsLeadMsFromEnv, 
 import { vadConfigFromEnv } from "./agent-vad.js";
 import { voiceCogsRatesFromEnv } from "./voice-cogs.js";
 import { mintRecorderToken } from "./encoders/recorder-auth.js";
+import { isFlowTapEnabled } from "./flow-tap.js";
 
 /** The flag value that arms the WAVE voice agent. Anything else → fully inert. */
 export const VOICE_AGENT_PROVIDER_WAVE = "wave";
@@ -652,7 +653,7 @@ export class AgentSessionDO {
         ttsLeadMs: ttsLeadMsFromEnv(this.env), // step 4: real-time TTS pacing → interruptible playout (barge-in)
         tools, // step 5: only these tools are advertised to the model + executable (others refused)
         cogsRates: voiceCogsRatesFromEnv(this.env), // E0-P2: vendor COGS rates (absent ⇒ reported unpriced)
-        flowTap: this.env.AGENT_FLOW_TAP === "true" || this.env.AGENT_FLOW_TAP === "1", // signal-flow E1 observer tap
+        flowTap: isFlowTapEnabled(this.env), // signal-flow E1 observer tap
       });
       media.log("agent-turn-armed", { org: bound.org, room: bound.roomId, agentId: bound.agentId });
     } catch (e) {
