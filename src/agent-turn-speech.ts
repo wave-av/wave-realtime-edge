@@ -43,6 +43,10 @@ export interface SpeechSessionOptions {
   idFields(): Record<string, unknown>;
   /** flow-tap (signal-flow E1): emit the frame-out transition record when on. */
   flowTap?: boolean;
+  /** The SESSION-wide RTP timestamp (per-channel 48k sample index) — shared across turns so the SFU's
+   *  timeline is monotonic (a per-turn reset makes the SFU play a new turn's frames overlapped with the
+   *  previous turn's buffered audio → "multiple renditions"/garbled). Owned by the core, mutated here. */
+  tsTicks?: { value: number };
 }
 
 /**
@@ -52,7 +56,6 @@ export interface SpeechSessionOptions {
 export class SpeechSession {
   private playoutStartMs = 0;
   private sentMs = 0;
-  private tsTicks = 0;
   private noIngestLogged = false;
   /** Cumulative PCM bytes published this turn (across every sentence). */
   pcmBytesOut = 0;
@@ -107,10 +110,15 @@ export class SpeechSession {
     return -1;
   }
 
+  /** The session-wide RTP timestamp ref (defaults to a fresh per-session counter when the core does not pass one). */
+  private readonly tsTicks: { value: number };
+
   constructor(
     private readonly deps: SpeechSessionDeps,
     private readonly opts: SpeechSessionOptions,
-  ) {}
+  ) {
+    this.tsTicks = opts.tsTicks ?? { value: 0 };
+  }
 
   /**
    * Speak ONE piece of text (a sentence, or the whole reply) via streaming TTS → the ingest socket (the EXACT
@@ -172,19 +180,20 @@ export class SpeechSession {
           // flushed out-of-band on abort. The keystone is to make the SFU pace by the MEDIA CLOCK: with a real,
           // monotonic timestamp the SFU buffer-mode pull emits in lockstep with the timeline and never runs ahead,
           // so when bargeIn() stops the send the SFU has ~one frame buffered (not an undefined backlog). ts is the
-          // START-of-chunk sample index and CONTINUES ACROSS SENTENCES (D1) — one utterance, one timeline.
-          const wire = encodeIngestFrame(chunk, { sequenceNumber: seq, timestamp: this.tsTicks }, this.opts.framing);
+          // START-of-chunk sample index and CONTINUES ACROSS SENTENCES AND TURNS — one SESSION, one timeline.
+          const ts = this.tsTicks.value;
+          const wire = encodeIngestFrame(chunk, { sequenceNumber: seq, timestamp: ts }, this.opts.framing);
           sock.send(wire);
           // flow-tap (signal-flow E1): the frame-out transition record — seq/ts/bytes names a mis-ordered or
           // duplicated frame (the garbled/multi-rendition failure mode) right where it leaves the edge.
           if (this.opts.flowTap) {
-            this.deps.log("flow-tap", { node: "frame-encode", evt: "out", seq, ts: this.tsTicks, bytes: chunk.length });
+            this.deps.log("flow-tap", { node: "frame-encode", evt: "out", seq, ts, bytes: chunk.length });
           }
           if (this.firstAudioMs < 0) this.firstAudioMs = this.deps.now(); // TTFA receipt: first frame ON THE WIRE
           pcmBytesOut += chunk.length;
           this.pcmBytesOut += chunk.length;
           this.sentMs += chunk.length / TTS_BYTES_PER_MS;
-          this.tsTicks += Math.floor(chunk.length / TTS_BYTES_PER_TS_TICK); // advance the clock by this chunk's samples
+          this.tsTicks.value += Math.floor(chunk.length / TTS_BYTES_PER_TS_TICK); // advance the session clock by this chunk's samples
         }
       }
     } catch (e) {
