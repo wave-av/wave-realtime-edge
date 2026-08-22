@@ -71,7 +71,6 @@ import {
 	AGENT_INGEST_ROUTE,
 	AGENT_TTS_ROUTE,
 	AGENT_AUDIO_IN_ROUTE,
-	AGENT_TRANSCRIPTS_ROUTE,
 	PRESENCE_ROUTE,
 	presenceEnabled,
 	INGRESS_ROUTE,
@@ -774,22 +773,6 @@ export async function dispatch(
 			const id = env.AGENT_SESSION.idFromName(`${aorg}:${aroom}`);
 			const stub = env.AGENT_SESSION.get(id);
 			return stub.fetch(new Request(`https://agent/audio-in?sessionId=${encodeURIComponent(asession)}&trackName=${encodeURIComponent(atrack)}`, request));
-		}
-
-		// 6) Transcript: GET /v1/realtime/agents/transcripts/:org/:room/:session — forwards to the DO's
-		// `history` intent, which records the conversation to R2 (retained) AND returns it. The console's
-		// "Show transcript" calls this. Same gateway-trust auth.
-		const txMatch = url.pathname.match(AGENT_TRANSCRIPTS_ROUTE);
-		if (txMatch && request.method === "GET") {
-			const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
-			if (denied) return denied;
-			const [, aorg, aroom, asession] = txMatch;
-			if (![aorg, aroom, asession].every((s) => SAFE_SEGMENT.test(s)) || !env.AGENT_SESSION) {
-				return Response.json({ error: "BAD_REQUEST", message: "invalid transcript path or no AGENT_SESSION binding" }, { status: 400 });
-			}
-			const id = env.AGENT_SESSION.idFromName(`${aorg}:${aroom}`);
-			const stub = env.AGENT_SESSION.get(id);
-			return stub.fetch(new Request(`https://agent/history?sessionId=${encodeURIComponent(asession)}`, { method: "GET" }));
 		}
 	}
 
