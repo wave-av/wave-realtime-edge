@@ -72,6 +72,7 @@ import {
   transcribeViaProvider,
   buildTurnSystemPrompt,
   DEFAULT_SYSTEM_PROMPT,
+  normalizeGatewayEnv,
   type FetchLike,
 } from "./agent-turn-providers.js";
 import { streamingTranscribe } from "./agent-stt-streaming.js";
@@ -151,7 +152,7 @@ export interface TurnTakingConfig {
 }
 
 /** The default agent persona when none is configured (honest, generic — a real persona is set per-agent). */
-export { DEFAULT_SYSTEM_PROMPT, buildTurnSystemPrompt };
+export { DEFAULT_SYSTEM_PROMPT, buildTurnSystemPrompt, normalizeGatewayEnv };
 
 /** Step-5 hard default cap on tool-call iterations within ONE turn (anti-runaway). Overridable per-core. */
 export const DEFAULT_MAX_TOOL_ITERATIONS = 5;
@@ -201,6 +202,10 @@ export class TurnTakingCore {
   private readonly tsTicksRef = { value: 0 }; // session-wide RTP ts, shared into every SpeechSession (monotonic across turns)
   /** Guards against re-entrant turns (a turn is in flight while we await STT/LLM/TTS). */
   private turnInFlight = false;
+  /** Echo-mute window end (ms) — frames are dropped until this wall-clock (the "agent hears itself" backstop). */
+  private echoMuteUntil = 0;
+  /** Echo-mute grace after a turn (ms) — the reverberation tail before the next STT. Env AGENT_ECHO_MUTE_MS. */
+  private readonly echoMuteMs: number;
   /** Set by the step-4 interrupt controller (onUserSpeech / VAD barge-in) to cancel an in-flight turn. */
   private aborted = false;
   /** Step-4 VAD: detects user speech ONSET on every frame → drives true barge-in while the agent talks. */
@@ -240,6 +245,8 @@ export class TurnTakingCore {
       ttsLeadMs?: number;
       /** E0-P2: vendor COGS rates. Omitted ⇒ quantities are measured and reported UNPRICED (never estimated). */
       cogsRates?: VoiceCogsRates;
+      /** Echo-mute grace after a turn (ms) — the reverberation tail before the next STT (default 400). */
+      echoMuteMs?: number;
     },
   ) {
     this.deps = deps;
@@ -250,6 +257,7 @@ export class TurnTakingCore {
     this.cogs = new TurnCogsLedger(() => this.deps.now());
     this.cogsRates = opts?.cogsRates;
     this.ttsLeadMs = typeof opts?.ttsLeadMs === "number" && opts.ttsLeadMs >= 0 ? Math.floor(opts.ttsLeadMs) : DEFAULT_TTS_LEAD_MS;
+    this.echoMuteMs = typeof opts?.echoMuteMs === "number" && opts.echoMuteMs >= 0 ? Math.floor(opts.echoMuteMs) : 0;
     this.tools = opts?.tools ?? new ToolAllowlist([]);
     this.maxToolIterations =
       typeof opts?.maxToolIterations === "number" && opts.maxToolIterations >= 1
@@ -272,6 +280,12 @@ export class TurnTakingCore {
     try {
       const pkt = decodePacket(frame);
       if (pkt.payload.length === 0) return; // keep-alive / empty
+      // ECHO MUTE (the "agent hears itself" fix): for a short grace window after each turn we DROP the egress audio
+      // so the agent's own TTS (picked up by a mic that hears the speaker) is never transcribed as the next utterance.
+      // This is the code-level echo mitigation — real deployments add WebRTC echo cancellation on the client; this
+      // window is the edge-side backstop for a raw mic+speaker rig. It also eats a fast barge-in inside the window,
+      // which is the documented tradeoff (env-tunable; 0 disables).
+      if (this.deps.now() < this.echoMuteUntil) return;
       // VAD runs on EVERY decoded frame (design §L2.1) — it's the barge-in trigger AND the silence sensor.
       stage = "vad";
       const vadEvent = this.vad.feed(pkt.payload);
@@ -457,6 +471,11 @@ export class TurnTakingCore {
       this.deps.log("agent-turn-error", { stage, ...this.idFields(), message: (e as Error)?.message ?? "unknown" });
     } finally {
       this.turnInFlight = false;
+      // ECHO MUTE: discard the audio accumulated during the turn (the agent's own TTS picked up by the mic) +
+      // hold a short grace so the reverberation tail isn't transcribed as the next user turn. This is the code-
+      // level backstop; real deployments add AEC (WebRTC AEC3) on the client for the full fix.
+      this.resetUtterance();
+      this.echoMuteUntil = this.deps.now() + this.echoMuteMs;
       // E0-P2: EVERY turn closes the ledger exactly once. A turn that died before the clean-completion meter
       // still SUBMITTED characters the vendor bills, so it still gets a COGS receipt (log-only, never a billable
       // emit). Without this, no emitted row could ever carry abortedSpeaks > 0 and the barge-in wastage term
@@ -693,26 +712,6 @@ export interface AgentTurnEnv extends AgentSessionEnv, VadEnv, VoiceMeterEnv, Vo
   VOICE_AGENT_STREAMING_STT?: string;
   /** Deepgram API key (secret; server-side ONLY). Required when VOICE_AGENT_STREAMING_STT is enabled. */
   DEEPGRAM_API_KEY?: string;
-}
-
-/**
- * Normalize the gateway base/token to ONE canonical pair so a single operator-provided set provisions EVERY
- * gateway path (LLM, STT, tools, metering). The voice runtime introduced `WAVE_GATEWAY_BASE`/`WAVE_GATEWAY_TOKEN`,
- * but the established edge convention (metering.ts, room.ts) is `GATEWAY_BASE_URL`/`WAVE_SERVICE_TOKEN`. Without
- * this, setting one pair leaves the other path silently INERT (e.g. LLM works but billing emits nothing) — a
- * config-no-silent-noop trap. We fill BOTH names from whichever is set (voice name wins when both are present),
- * so an operator may provision EITHER convention and every path resolves. Pure → unit-testable.
- */
-export function normalizeGatewayEnv(env: AgentTurnEnv): AgentTurnEnv {
-  const base = env.WAVE_GATEWAY_BASE ?? env.GATEWAY_BASE_URL;
-  const token = env.WAVE_GATEWAY_TOKEN ?? env.WAVE_SERVICE_TOKEN;
-  return {
-    ...env,
-    WAVE_GATEWAY_BASE: base,
-    WAVE_GATEWAY_TOKEN: token,
-    GATEWAY_BASE_URL: env.GATEWAY_BASE_URL ?? base,
-    WAVE_SERVICE_TOKEN: env.WAVE_SERVICE_TOKEN ?? token,
-  };
 }
 
 /**
