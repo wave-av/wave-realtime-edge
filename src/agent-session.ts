@@ -375,6 +375,12 @@ export class AgentSessionDO {
             const bins = spectrumLogMagnitude(buf, 64);
             this.latestSpectrum = { bins, at: Date.now() };
             console.log(JSON.stringify({ flow: "voice-agent", node: "fft", evt: "spectrum", bins }));
+            // Transport the spectrum to the audio showcase (fire-and-forget — never blocks the media path).
+            fetch("https://audio.wave.online/v1/audio/taps/ingest", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ bins, at: this.latestSpectrum.at }),
+            }).catch(() => {});
           } catch {
             /* a tap must never break the live media path */
           }
