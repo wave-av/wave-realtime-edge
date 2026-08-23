@@ -137,3 +137,15 @@ export function cepstrumPitch(pcm: Uint8Array, sampleRate = 48000): number {
   if (bestQ <= 0 || bestV < 0.3) return 0; // no confident peak
   return Math.round(sampleRate / bestQ);
 }
+
+/**
+ * Spectral Wiener denoiser — attenuates each magnitude bin by the Wiener gain (snr²/(snr²+1)) against a
+ * noise-floor estimate. Grounded in Wiener (1949, the optimal linear filter). Mutates `spectrum` in place.
+ */
+export function wienerDenoise(spectrum: Float64Array, noiseFloor: number): void {
+  for (let k = 0; k < spectrum.length; k++) {
+    const snr = spectrum[k]! / (noiseFloor + 1e-9);
+    const gain = (snr * snr) / (snr * snr + 1);
+    spectrum[k] = spectrum[k]! * gain;
+  }
+}
