@@ -50,7 +50,7 @@ import {
 import { TurnTakingCore, buildTurnDeps, toolAllowlistFromEnv, ttsLeadMsFromEnv, type AgentTurnEnv } from "./agent-turn.js";
 import { vadConfigFromEnv } from "./agent-vad.js";
 import { voiceCogsRatesFromEnv } from "./voice-cogs.js";
-import { spectrumLogMagnitude } from "./fft.js";
+import { spectrumLogMagnitude, cepstrumPitch } from "./fft.js";
 import { mintRecorderToken } from "./encoders/recorder-auth.js";
 
 /** The flag value that arms the WAVE voice agent. Anything else → fully inert. */
@@ -373,13 +373,14 @@ export class AgentSessionDO {
         if ((this.env.AGENT_FFT_TAP === "true" || this.env.AGENT_FFT_TAP === "1") && (this.fftTapFrame = (this.fftTapFrame + 1) & 3) === 0) {
           try {
             const bins = spectrumLogMagnitude(buf, 64);
+            const pitch = cepstrumPitch(buf); // cepstral pitch (Bogert–Healy–Tukey) — 0 when unvoiced
             this.latestSpectrum = { bins, at: Date.now() };
-            console.log(JSON.stringify({ flow: "voice-agent", node: "fft", evt: "spectrum", bins }));
+            console.log(JSON.stringify({ flow: "voice-agent", node: "fft", evt: "spectrum", bins, pitch }));
             // Transport the spectrum to the audio showcase (fire-and-forget — never blocks the media path).
             fetch("https://audio.wave.online/v1/audio/taps/ingest", {
               method: "POST",
               headers: { "content-type": "application/json" },
-              body: JSON.stringify({ bins, at: this.latestSpectrum.at }),
+              body: JSON.stringify({ bins, pitch, at: this.latestSpectrum.at }),
             }).catch(() => {});
           } catch {
             /* a tap must never break the live media path */

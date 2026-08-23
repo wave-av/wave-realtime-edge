@@ -73,3 +73,67 @@ export function spectrumLogMagnitude(pcm: Uint8Array, bins = 64): number[] {
   }
   return out;
 }
+
+/** In-place inverse FFT (conjugate → FFT → conjugate → scale). `re`/`im` same power-of-2 length. */
+export function inverseFft(re: Float64Array, im: Float64Array): void {
+  const n = re.length;
+  for (let i = 0; i < n; i++) im[i] = -im[i]!;
+  fft(re, im);
+  for (let i = 0; i < n; i++) {
+    im[i] = -im[i]! / n;
+    re[i] = re[i]! / n;
+  }
+}
+
+/**
+ * Hilbert transform of a real signal (the imaginary part of the analytic signal): zero the negative-frequency
+ * half of the spectrum, then inverse-FFT. Grounded in Hilbert — the analytic signal / instantaneous phase.
+ * Returns the same-length imaginary part (the Hilbert transform), the real part unchanged in `re`.
+ */
+export function hilbert(re: Float64Array, im: Float64Array): void {
+  const n = re.length;
+  fft(re, im);
+  const half = n >> 1;
+  for (let k = 1; k < half; k++) im[k] = 0; // zero the negative half (the analytic signal keeps the positive)
+  for (let k = half + 1; k < n; k++) im[k] = 0;
+  inverseFft(re, im);
+}
+
+/**
+ * Fundamental-frequency (pitch) estimate via the real cepstrum: IFFT of the log-magnitude spectrum; the pitch
+ * is the quefrency of the peak in the plausible pitch band (50–1000 Hz). Grounded in Bogert–Healy–Tukey 1963.
+ * Returns 0 when no confident peak (unvoiced / silence).
+ */
+export function cepstrumPitch(pcm: Uint8Array, sampleRate = 48000): number {
+  const n = 1024;
+  const re = new Float64Array(n);
+  const im = new Float64Array(n);
+  const samples = Math.floor(pcm.length / 4);
+  const stride = Math.max(1, Math.floor(samples / n));
+  for (let i = 0; i < n; i++) {
+    const off = Math.min(i * stride, samples - 1) * 4;
+    const lo = pcm[off]!;
+    const hi = pcm[off + 1]!;
+    const s = (hi << 8) | lo;
+    re[i] = (s >= 0x8000 ? s - 0x10000 : s) / 32768;
+    im[i] = 0;
+  }
+  fft(re, im);
+  // real cepstrum = IFFT(log |X|)
+  for (let k = 0; k < n; k++) re[k] = Math.log(Math.hypot(re[k]!, im[k]!) + 1e-12);
+  im.fill(0);
+  inverseFft(re, im);
+  // scan the quefrency band for 50–1000 Hz
+  const loQ = Math.floor(sampleRate / 1000); // 1000 Hz → quefrency loQ
+  const hiQ = Math.floor(sampleRate / 50);   // 50 Hz  → quefrency hiQ
+  let bestQ = -1;
+  let bestV = -Infinity;
+  for (let q = loQ; q < hiQ && q < n; q++) {
+    if (re[q]! > bestV) {
+      bestV = re[q]!;
+      bestQ = q;
+    }
+  }
+  if (bestQ <= 0 || bestV < 0.3) return 0; // no confident peak
+  return Math.round(sampleRate / bestQ);
+}
