@@ -149,3 +149,73 @@ export function wienerDenoise(spectrum: Float64Array, noiseFloor: number): void 
     spectrum[k] = spectrum[k]! * gain;
   }
 }
+
+/**
+ * Phase spectrum of a 16-bit-LE PCM buffer — the argument (in radians) of each FFT bin. Grounded in Hilbert
+ * (the analytic signal) + Fourier; the phase is where delay/latency is visible (Oppenheim §3, group delay).
+ */
+export function spectrumPhase(pcm: Uint8Array, bins = 64): number[] {
+  const n = bins * 2;
+  const re = new Float64Array(n);
+  const im = new Float64Array(n);
+  const samples = Math.floor(pcm.length / 4);
+  const stride = Math.max(1, Math.floor(samples / n));
+  for (let i = 0; i < n; i++) {
+    const off = Math.min(i * stride, samples - 1) * 4;
+    const lo = pcm[off]!;
+    const hi = pcm[off + 1]!;
+    const s = (hi << 8) | lo;
+    re[i] = (s >= 0x8000 ? s - 0x10000 : s) / 32768;
+    im[i] = 0;
+  }
+  fft(re, im);
+  const out = new Array<number>(bins);
+  for (let k = 0; k < bins; k++) out[k] = Math.atan2(im[k]!, re[k]!);
+  return out;
+}
+
+/**
+ * Haar-wavelet soft-threshold denoiser on a mono downmix of a 16-bit-LE PCM buffer. Grounded in Daubechies
+ * (1992, wavelets) + Donoho–Johnstone (1994, shrinkage). Returns the denoised mono PCM (16-bit LE).
+ */
+export function haarWaveletDenoise(pcm: Uint8Array, threshold = 0.08): Uint8Array {
+  // mono downmix, length rounded to a power of two
+  const samples = Math.floor(pcm.length / 4);
+  let n = 1;
+  while (n < samples) n <<= 1;
+  const x = new Float64Array(n);
+  for (let i = 0; i < samples; i++) {
+    const off = i * 4;
+    const lo = pcm[off]!;
+    const hi = pcm[off + 1]!;
+    const s = (hi << 8) | lo;
+    x[i] = (s >= 0x8000 ? s - 0x10000 : s) / 32768;
+  }
+  // single-level Haar transform (approximation + detail), soft-threshold the detail, inverse
+  const half = n >> 1;
+  const a = new Float64Array(half);
+  const d = new Float64Array(half);
+  for (let i = 0; i < half; i++) {
+    const u = x[2 * i]!;
+    const v = x[2 * i + 1]!;
+    a[i] = (u + v) / Math.SQRT2;
+    d[i] = (u - v) / Math.SQRT2;
+  }
+  for (let i = 0; i < half; i++) {
+    const m = Math.abs(d[i]!);
+    d[i] = m <= threshold ? 0 : (d[i]! > 0 ? d[i]! - threshold : d[i]! + threshold); // soft threshold
+  }
+  const out = new Uint8Array(samples * 2);
+  for (let i = 0; i < half; i++) {
+    const u = (a[i]! + d[i]!) / Math.SQRT2;
+    const v = (a[i]! - d[i]!) / Math.SQRT2;
+    for (const [idx, val] of [[2 * i, u], [2 * i + 1, v]] as const) {
+      if (idx >= samples) continue;
+      const s = Math.max(-1, Math.min(1, val));
+      const s16 = Math.round(s * 32767);
+      out[idx * 2] = s16 & 0xff;
+      out[idx * 2 + 1] = (s16 >> 8) & 0xff;
+    }
+  }
+  return out;
+}
