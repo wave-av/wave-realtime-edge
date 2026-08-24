@@ -307,6 +307,10 @@ AGENT_FLOW_TAP = "true"
 # FFT tap (audio-signal-plane E1) — emit the live egress spectrum (node "fft", evt "spectrum", 64 bins)
 AGENT_FFT_TAP = "true"
 
+# Echo-mute grace (the echo backstop's post-turn window) — drop the mic for 400ms after each turn so the
+# reverberation tail isn't transcribed as the next user turn. Trades a fast barge-in inside the window (documented).
+AGENT_ECHO_MUTE_MS = "400"
+
 
 # ── RT-P1.5 — pluggable recording encoders (design §6). DEFAULT DISARMED / DORMANT. ──
 # RT_RECORD arms recording at all; absent/"0" → selectEncoder() returns the inert DisarmedEncoder (begin →
