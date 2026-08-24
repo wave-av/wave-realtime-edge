@@ -1,8 +1,8 @@
-// agent-media-consumer.ts — #76 P2 (architecture A, co-locate): the agent's media-READ folded onto the
-// single RoomDO.mediaTap. Today the wave-native voice agent reads a room over its OWN second SFU subscription
-// (AgentSessionDO `createWebsocketAdapter`, egress WS) — the exact duplicate subscribe the MediaTap exists to
-// eliminate (transform-once fan-out-many; one authoritative room subscribe). This module makes the agent an
-// in-process MediaConsumer off the room's tap: no cross-DO frame transport, no 2nd SFU subscription.
+// agent-media-consumer.ts — #76 P2 (architecture A, co-locate) + ADR #85 FOLD: the agent's media-READ is
+// folded onto the single RoomDO.mediaTap. The agent reads as an in-process MediaConsumer off the room's tap:
+// no cross-DO frame transport, no 2nd SFU subscription. The old egress-WS duplicate path (AgentSessionDO
+// createWebsocketAdapter) is gated off when MEDIA_TAP_ENABLED — the agent consumes from the tap's bounded
+// queue with the same drop-oldest backpressure that protects egress.
 //
 // ── INERT UNTIL ARMED ───────────────────────────────────────────────────────────────────────────────────────
 //  Nothing here runs unless MEDIA_TAP_ENABLED is armed (the tap publishes nothing when off → the RoomDO builds
