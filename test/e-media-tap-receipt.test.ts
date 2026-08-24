@@ -70,7 +70,7 @@ function publishVideo(tap: MediaTap, ts: number): number {
 // ── receipt: full lifecycle ──────────────────────────────────────────────────────────────────────────────────
 
 describe("E-MEDIA-TAP receipt — one-tap lifecycle", () => {
-  it("tap attach → consumer receives frames → backpressure → isolation → detach GC", async () => {
+  it("attaches consumers, filters selectors, and applies backpressure", async () => {
     // 1. Tap attach: create a tap and register two independent consumers (recorder + perception).
     const tap = new MediaTap(4); // small queue for backpressure proof
     const recorder = tap.subscribe("egress-recorder", {}); // egress wants everything
@@ -116,10 +116,13 @@ describe("E-MEDIA-TAP receipt — one-tap lifecycle", () => {
     expect(remaining.length).toBeGreaterThan(0);
     // All remaining frames have seq > the ones that were dropped — newest survive
     for (const f of remaining) {
-      expect(f.seq).toBeGreaterThanOrEqual(14); // tail of the sequence
+      expect(f.seq).toBeGreaterThanOrEqual(17); // tail of the sequence
     }
 
-    // 4. Consumer isolation: register a slow consumer and a fast consumer; publish frames.
+        });
+
+  it("isolates a fast consumer from a stalled consumer", async () => {
+      // Consumer isolation: register a slow consumer and a fast consumer; publish frames.
     //    Fast consumer drains immediately, slow never drains → slow eats ALL drops, fast gets every frame.
     const tap2 = new MediaTap(3);
     const fast = tap2.subscribe("fast", {});
@@ -137,7 +140,10 @@ describe("E-MEDIA-TAP receipt — one-tap lifecycle", () => {
     // Slow consumer: hit backpressure, lost frames
     expect(slow.stats().dropped).toBeGreaterThan(0);
 
-    // 5. pumpConsumer isolation: a throwing onFrame never crashes the pump or its peers.
+        });
+
+  it("keeps pump peers alive when one consumer throws", async () => {
+      // A throwing onFrame never crashes the pump or its peers.
     const tap3 = new MediaTap(10);
     const goodHandle = tap3.subscribe("good-consumer", {});
     const badHandle = tap3.subscribe("bad-consumer", {});
@@ -168,7 +174,10 @@ describe("E-MEDIA-TAP receipt — one-tap lifecycle", () => {
     await Promise.all([goodPump, badPump]);
     expect(goodSeen).toEqual([1, 2, 3]); // good consumer got everything despite bad consumer throwing
 
-    // 6. Detach GC: unsubscribe removes the consumer; next() resolves null; fan-out count drops to 0.
+        });
+
+  it("garbage-collects detached consumers", async () => {
+      // Unsubscribe removes the consumer; next() resolves null; fan-out count drops to 0.
     const tap4 = new MediaTap();
     const h = tap4.subscribe("to-gc");
     publishFrame(tap4, { ts: 1 });
