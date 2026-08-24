@@ -1,12 +1,12 @@
 // deck-sdk.mjs — the thin SDK rendering over the voice-control-deck API (the API is the authority).
 // Zero-dep fetch wrapper over the edge's deck endpoints. Usage:
 //   import { DeckClient } from './deck/deck-sdk.mjs';
-//   const deck = new DeckClient({ origin: 'https://rt.wave.online', org: 'wave', room: 'demo', session: 'sess', gatewayKey: '…' });
+//   const deck = new DeckClient({ origin: 'https://your-edge.example.com', org: 'wave', room: 'demo', session: 'sess', gatewayKey: '…' });
 //   await deck.list();          // { commands:[{id,description,origin}], muted }
 //   await deck.fire('mute');    // { command:'mute', muted:true }
 
 export class DeckClient {
-  constructor({ origin = 'https://rt.wave.online', org, room, session, gatewayKey, agentId }) {
+  constructor({ origin = process.env.DECK_ORIGIN ?? 'http://localhost:8787', org, room, session, gatewayKey, agentId }) {
     this.base = `${origin.replace(/\/+$/, '')}/v1/realtime/agents/${encodeURIComponent(org)}/${encodeURIComponent(room)}/${encodeURIComponent(session)}`;
     this.headers = {
       ...(org ? { 'x-wave-org': org } : {}),

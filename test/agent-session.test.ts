@@ -329,9 +329,9 @@ describe("AgentSessionDO — the deck API (voice-control-deck E2 P0)", () => {
     const session = new AgentSessionDO(mkState(), { VOICE_AGENT_PROVIDER: "wave" } as never);
     const res = await session.fetch(new Request("https://agent/deck"));
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = (await res.json()) as { muted: boolean; commands: { id: string; origin: { source: string } }[] };
     expect(body.muted).toBe(false);
-    expect(body.commands.map((c: { id: string }) => c.id)).toEqual(["mute", "unmute"]);
+    expect(body.commands.map((c) => c.id)).toEqual(["mute", "unmute"]);
     expect(body.commands[0].origin.source).toBe("voice-control-deck");
   });
 

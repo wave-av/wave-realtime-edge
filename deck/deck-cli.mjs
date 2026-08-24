@@ -17,7 +17,7 @@ for (let i = 0; i < argv.length; i++) {
 }
 const [cmd, command] = [argv[0], argv[1]];
 const client = new DeckClient({
-  origin: args.origin ?? 'https://rt.wave.online',
+  origin: args.origin ?? process.env.DECK_ORIGIN ?? 'http://localhost:8787',
   org: args.org ?? process.env.DECK_ORG,
   room: args.room ?? process.env.DECK_ROOM,
   session: args.session ?? process.env.DECK_SESSION,
