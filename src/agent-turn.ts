@@ -154,12 +154,13 @@ export interface TurnTakingConfig {
 /** The default agent persona when none is configured (honest, generic — a real persona is set per-agent). */
 export { DEFAULT_SYSTEM_PROMPT, buildTurnSystemPrompt, normalizeGatewayEnv };
 
-export {
+import {
   DEFAULT_MAX_TOOL_ITERATIONS,
   DEFAULT_TTS_LEAD_MS,
   ttsLeadMsFromEnv,
   MAX_UTTERANCE_BYTES,
 } from "./turn-config.js";
+export { DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_TTS_LEAD_MS, ttsLeadMsFromEnv, MAX_UTTERANCE_BYTES };
 
 /**
  * TurnTakingCore — the pure, testable turn state machine for one agent session. Accumulates participant PCM,
