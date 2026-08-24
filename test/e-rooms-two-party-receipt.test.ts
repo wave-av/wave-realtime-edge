@@ -39,7 +39,8 @@ function jsonResp(body: unknown, status = 200): Response {
 
 function scriptedFetch(routes: Array<{ match: string; method?: string; body: unknown; status?: number }>) {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
-  const fn = async (url: string, init?: RequestInit) => {
+  const fn: (input: string, init?: RequestInit) => Promise<Response> = async (input, init) => {
+      const url = input;
     calls.push({ url, init });
     const method = init?.method ?? "GET";
     const route = routes.find((r) => url.includes(r.match) && (!r.method || r.method === method));
@@ -63,7 +64,7 @@ describe("E-ROOMS receipt: two-party A/V + state-sync", () => {
       { match: "/sessions/new", method: "POST", body: { sessionId: SESSION_A } },
     ]);
     const core = new RoomCore(memStorage());
-    const aliceSig = new Signaling(core, new SfuClient(CFG, aliceFetch.fn as never));
+    const aliceSig = new Signaling(core, new SfuClient(CFG, aliceFetch.fn));
 
     const aliceJoin = await aliceSig.join(CTX_ALICE);
     expect("waiting" in aliceJoin).toBe(false);
@@ -80,7 +81,7 @@ describe("E-ROOMS receipt: two-party A/V + state-sync", () => {
         sessionDescription: { type: "answer", sdp: "a=pub-ok" },
       }},
     ]);
-    const alicePubSig = new Signaling(core, new SfuClient(CFG, alicePubFetch.fn as never));
+    const alicePubSig = new Signaling(core, new SfuClient(CFG, alicePubFetch.fn));
     const pubResult = await alicePubSig.publishTrack(CTX_ALICE, {
       tracks: [
         { mid: "0", trackName: "cam", kind: "video" },
@@ -101,7 +102,7 @@ describe("E-ROOMS receipt: two-party A/V + state-sync", () => {
     const bobJoinFetch = scriptedFetch([
       { match: "/sessions/new", method: "POST", body: { sessionId: SESSION_B } },
     ]);
-    const bobSig = new Signaling(core, new SfuClient(CFG, bobJoinFetch.fn as never));
+    const bobSig = new Signaling(core, new SfuClient(CFG, bobJoinFetch.fn));
 
     const bobJoin = await bobSig.join(CTX_BOB);
     expect("waiting" in bobJoin).toBe(false);
@@ -116,7 +117,7 @@ describe("E-ROOMS receipt: two-party A/V + state-sync", () => {
         requiresImmediateRenegotiation: true,
       }},
     ]);
-    const bobSubSig = new Signaling(core, new SfuClient(CFG, bobSubFetch.fn as never));
+    const bobSubSig = new Signaling(core, new SfuClient(CFG, bobSubFetch.fn));
     const subResult = await bobSubSig.subscribeTrack(CTX_BOB, { trackName: "cam" });
     expect(subResult.requiresImmediateRenegotiation).toBe(true);
 
