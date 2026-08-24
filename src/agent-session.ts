@@ -48,8 +48,10 @@ import {
   type CreateIngestAdapterResult,
 } from "./agent-ingest-adapter.js";
 import { TurnTakingCore, buildTurnDeps, toolAllowlistFromEnv, ttsLeadMsFromEnv, type AgentTurnEnv } from "./agent-turn.js";
+import { toolCatalogFromGateway } from "./agent-tools.js";
 import { vadConfigFromEnv } from "./agent-vad.js";
 import { voiceCogsRatesFromEnv } from "./voice-cogs.js";
+import { spectrumLogMagnitude, cepstrumPitch } from "./fft.js";
 import { mintRecorderToken } from "./encoders/recorder-auth.js";
 
 /** The flag value that arms the WAVE voice agent. Anything else → fully inert. */
@@ -71,6 +73,10 @@ export interface AgentSessionConfig {
   participantTrackName: string;
   /** The track name the agent publishes back (ingest). Defaults to `agent-${agentId}`. */
   agentTrackName?: string;
+  /** Headless mode: a non-browser client (CLI / on-prem / cloud) drives the turn over the audio-in + TTS
+   *  WS instead of the SFU egress/ingest. Skips the SFU adapter create (no real SFU session) — the DO still
+   *  arms the turn core and mints the audio-in + TTS capability tokens. */
+  headless?: boolean;
 }
 
 const SAFE = /^[A-Za-z0-9_:.-]{1,128}$/;
@@ -292,12 +298,22 @@ export interface AgentSessionEnv {
   AGENT_PUBLIC_WSS?: string; // our public wss base the SFU dials back to (default rt.wave.online)
   /** Send-side ingest framing override; "packet" (default, modeled) | "raw" (the live spike may select). */
   AGENT_INGEST_FRAMING?: IngestFraming;
+  /** flow-tap (signal-flow E1): when "true"/"1", emit the observer transition records on the voice-agent flow. */
+  AGENT_FLOW_TAP?: string;
+  /** FFT tap (audio-signal-plane E1): when "true"/"1", emit the live egress spectrum (node "fft", evt "spectrum"). */
+  AGENT_FFT_TAP?: string;
+  /** Echo-mute grace after a turn (ms) — drops the mic during the reverberation tail (default 400; 0 disables). */
+  AGENT_ECHO_MUTE_MS?: string;
   /** Step-4 barge-in: TTS send-ahead lead (ms) for real-time pacing → interruptible playout (default 150). */
   AGENT_TTS_LEAD_MS?: string | number;
+  /** ElevenLabs optimize_streaming_latency (0-4): higher = lower first-audio latency. Default 3. */
+  VOICE_AGENT_TTS_LATENCY?: string;
   /** Step-3: the agent persona / system prompt for turn-taking (var; default in buildTurnSystemPrompt). */
   VOICE_AGENT_SYSTEM_PROMPT?: string;
   /** test-only: injected adapter-create fetch (defaults to global fetch). Never a wire input. */
   __agentFetch?: typeof fetch;
+  /** R2 bucket for the session transcript (recorded on read so every offered transcript is also retained). */
+  RT_RECORDINGS?: R2Bucket;
   // ── HONEST EXTENSION POINTS (later #81 steps — NOT stubbed to pretend they work) ──
   // STT:        streaming STT provider creds (step 3). NOT present → no transcription (echo-only today).
   // LLM:        WAVE gateway base + service token for Opus/Sonnet (step 3, design §L1 LOCKED).
@@ -324,8 +340,14 @@ export class AgentSessionDO {
   private readonly env: AgentTurnEnv;
   private readonly state: DurableObjectStateLike;
   private ingest: IngestSocket | null = null;
+  /** FFT-tap frame counter (decimation for the live spectrum — see the echo-frame handler). */
+  private fftTapFrame = 0;
+  /** Latest computed spectrum (the FFT tap's output) — served by the spectrum endpoint for the dashboard. */
+  private latestSpectrum: { bins: number[]; at: number } | null = null;
   /** Direct-playback client sockets: the browser dials the TTS route and we fan speak() PCM out to each. */
   private ttsClients: WebSocket[] = [];
+  /** Audio-in sockets (the headless "mic"): the runtime delivers their frames to webSocketMessage(). */
+  private audioInSockets = new Set<WebSocket>();
   /** Step-3 turn-taking core, armed on bind when the provider is WAVE (replaces echo as the live behavior). */
   private turn: TurnTakingCore | null = null;
 
@@ -347,6 +369,24 @@ export class AgentSessionDO {
     if (path === "echo-frame" && request.method === "POST") {
       try {
         const buf = new Uint8Array(await request.arrayBuffer());
+        // FFT tap (wave-audio-signal-plane E1): flag-gated live spectrum of the egress PCM — the Fourier truth
+        // the audio.wave.online dashboard renders. Decimated to every 4th frame (≈12.5 fps) to keep it cheap.
+        if ((this.env.AGENT_FFT_TAP === "true" || this.env.AGENT_FFT_TAP === "1") && (this.fftTapFrame = (this.fftTapFrame + 1) & 3) === 0) {
+          try {
+            const bins = spectrumLogMagnitude(buf, 64);
+            const pitch = cepstrumPitch(buf); // cepstral pitch (Bogert–Healy–Tukey) — 0 when unvoiced
+            this.latestSpectrum = { bins, at: Date.now() };
+            console.log(JSON.stringify({ flow: "voice-agent", node: "fft", evt: "spectrum", bins, pitch }));
+            // Transport the spectrum to the audio showcase (fire-and-forget — never blocks the media path).
+            fetch("https://audio.wave.online/v1/audio/taps/ingest", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ bins, pitch, at: this.latestSpectrum.at }),
+            }).catch(() => {});
+          } catch {
+            /* a tap must never break the live media path */
+          }
+        }
         // Step 3: once a turn-taking core is armed (bound under VOICE_AGENT_PROVIDER=wave) frames drive a real
         // conversational turn; until armed (or if turn-taking is unwired) we fall back to the echo harness.
         if (buf.length > 0) await (this.turn ? this.turn.onFrame(buf) : this.core.echoFrame(buf));
@@ -397,6 +437,10 @@ export class AgentSessionDO {
       this.ingest = sink;
       const clear = (): void => {
         if (this.ingest === sink) this.ingest = null;
+        // Session-end recording (E1 close-hook): when the SFU drops the ingest sink, the room's media
+        // is over — persist the transcript so a session that is never read still records. Overwrite-safe
+        // (same `transcript:{org}:{room}:{session}.json` key) and best-effort (never fails the close path).
+        void this.persistTranscript();
       };
       server.addEventListener("close", clear);
       server.addEventListener("error", clear);
@@ -442,6 +486,37 @@ export class AgentSessionDO {
         return new Response(null, { status: 200, webSocket: client } as ResponseInit & { webSocket: WebSocket });
       }
     }
+    // The agent audio-IN WS: a NON-browser client (local CLI / on-prem / cloud) dials IN to STREAM the
+    // participant's PCM — the headless "mic" that replaces the SFU egress leg. Each binary frame is fed into
+    // the turn loop (onFrame / echoFrame) exactly as the echo-frame POST path does. Native hibernation-safe.
+    if (path === "audio-in" && (request.headers.get("Upgrade") ?? "").toLowerCase() === "websocket") {
+      const WSP = (globalThis as unknown as { WebSocketPair?: new () => Record<string, WebSocket> }).WebSocketPair;
+      if (!WSP) {
+        return Response.json({ error: "REALTIME_NOT_CONFIGURED", message: "WebSocketPair unavailable" }, { status: 503 });
+      }
+      const pair = new WSP();
+      const client = (pair as unknown as Record<string, WebSocket>)[0];
+      const server = (pair as unknown as Record<string, WebSocket>)[1];
+      if (this.state.acceptWebSocket) {
+        this.state.acceptWebSocket(server);
+      } else {
+        server.accept();
+      }
+      try {
+        (server as unknown as { binaryType?: string }).binaryType = "arraybuffer";
+      } catch {
+        /* binaryType not settable on some runtimes — non-fatal (we only RECEIVE; the runtime handles binary) */
+      }
+      // Hibernation: the runtime delivers this socket's frames to webSocketMessage(), NOT addEventListener("message")
+      // (which is a no-op on an acceptWebSocket'd socket). Track it so webSocketMessage can route the frames.
+      this.audioInSockets.add(server);
+      console.log(JSON.stringify({ msg: "agent-audio-in-open", bound: this.core.bound?.roomId ?? null }));
+      try {
+        return new Response(null, { status: 101, webSocket: client } as ResponseInit & { webSocket: WebSocket });
+      } catch {
+        return new Response(null, { status: 200, webSocket: client } as ResponseInit & { webSocket: WebSocket });
+      }
+    }
     try {
       if (path === "bind" && request.method === "POST") {
         const body = (await request.json().catch(() => ({}))) as { config?: AgentSessionConfig };
@@ -466,26 +541,74 @@ export class AgentSessionDO {
         const ttsEndpoint = ttsToken
           ? `${baseWss.replace(/\/+$/, "")}/v1/realtime/agents/tts/${encodeURIComponent(bound.org)}/${encodeURIComponent(bound.roomId)}/${encodeURIComponent(bound.participantSessionId)}/${encodeURIComponent(bound.agentTrackName!)}?t=${encodeURIComponent(ttsToken)}`
           : undefined;
-        const { egress, ingest } = await this.core.openAdapters({ baseWss, egressToken, ingestToken });
-        this.armTurnTaking(bound); // step 3: arm the turn core for this binding (replaces echo on frames)
+        // The audio-IN endpoint the CLIENT dials to STREAM the participant's PCM to the agent (the headless
+        // "mic" — a non-browser client replaces the SFU egress leg). Bound to the PARTICIPANT track.
+        const audioInToken = secret
+          ? await mintRecorderToken(secret, bound.org, bound.participantSessionId, bound.participantTrackName)
+          : undefined;
+        const audioInEndpoint = audioInToken
+          ? `${baseWss.replace(/\/+$/, "")}/v1/realtime/agents/audio-in/${encodeURIComponent(bound.org)}/${encodeURIComponent(bound.roomId)}/${encodeURIComponent(bound.participantSessionId)}/${encodeURIComponent(bound.participantTrackName)}?t=${encodeURIComponent(audioInToken)}`
+          : undefined;
+        // Headless: a non-browser client (CLI / on-prem / cloud) drives the turn over the audio-in + TTS WS,
+        // so the SFU adapters are SKIPPED (no real SFU session). The browser path still opens them.
+        const adapters = bound.headless
+          ? { egress: undefined, ingest: undefined }
+          : await this.core.openAdapters({ baseWss, egressToken, ingestToken });
+        await this.armTurnTaking(bound); // step 3: arm the turn core for this binding (replaces echo on frames)
         return Response.json(
           {
             ok: true,
             bound,
-            egressAdapterId: egress.adapterId,
-            ingestAdapterId: ingest.adapterId,
+            egressAdapterId: adapters.egress?.adapterId,
+            ingestAdapterId: adapters.ingest?.adapterId,
             // The session the agent track is published on (CF's own, returned by the ingest adapter) — a consumer
             // (the room participant / harness) pulls `agentTrackName` from HERE, not participantSessionId (#29).
-            agentSessionId: ingest.publishedSessionId ?? bound.participantSessionId,
+            agentSessionId: adapters.ingest?.publishedSessionId ?? bound.participantSessionId,
             // The direct-playback endpoint the CLIENT dials to receive the agent's TTS PCM (bypasses the broken
             // SFU ingest). Pre-built with the capability token so the browser needs no other auth.
             ttsEndpoint,
+            // The audio-IN endpoint a NON-browser client dials to STREAM the participant's PCM (headless mic).
+            audioInEndpoint,
           },
           { status: 200 },
         );
       }
       if (path === "info" && request.method === "GET") {
         return Response.json({ bound: this.core.bound, timings: this.core.timingSamples() }, { status: 200 });
+      }
+      if (path === "spectrum" && request.method === "GET") {
+        // The latest FFT spectrum (the audio-signal-plane tap output) — CORS-open so the audio.wave.online
+        // dashboard can poll it. Returns null when no frame has been tapped yet (no live session).
+        return Response.json(this.latestSpectrum ?? { bins: null, at: 0 }, {
+          status: 200,
+          headers: { "access-control-allow-origin": "*" },
+        });
+      }
+      if (path === "history" && request.method === "GET") {
+        // The conversation transcript (system + alternating user/assistant). A core product surface:
+        // every voice-agent session must OFFER its transcript, not just speak it. `this.turn` is null
+        // until armed, so an unarmed/echo session honestly returns an empty history. Returns the SAME
+        // TranscriptResult shape the R2 retention uses and the console's getTranscript expects.
+        const bound = this.core.bound;
+        const history = this.turn ? this.turn.history() : [];
+        void this.persistTranscript(); // record on read (best-effort; the read never blocks on the write)
+        return Response.json(
+          {
+            org: bound?.org ?? "",
+            roomId: bound?.roomId ?? "",
+            sessionId: bound?.participantSessionId ?? "",
+            recordedAt: Date.now(),
+            messages: history,
+          },
+          { status: 200 },
+        );
+      }
+      if (path === "finalize" && request.method === "POST") {
+        // Persist the transcript at SESSION END (the worker calls this when the room/session closes), so
+        // every recorded session is retained even if its history was never explicitly read. Returns whether
+        // a non-empty transcript was actually written.
+        const recorded = await this.persistTranscript();
+        return Response.json({ ok: true, recorded }, { status: 200 });
       }
       return Response.json({ error: "BAD_REQUEST", message: `unknown agent intent: ${path}` }, { status: 400 });
     } catch (e) {
@@ -500,24 +623,74 @@ export class AgentSessionDO {
     return this.turn ? this.turn.onFrame(frame) : this.core.echoFrame(frame);
   }
 
+  /** Hibernation handler — the runtime calls this per inbound frame on an accepted socket. The audio-in WS
+   *  is the only socket that RECEIVES (the ingest + TTS sockets are send-only), so every binary frame here is
+   *  a headless-mic PCM frame. Fail-safe: a defect must never crash the socket. */
+  webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
+    if (!this.audioInSockets.has(ws) || typeof message === "string") return;
+    try {
+      const buf = new Uint8Array(message);
+      if (buf.length === 0) return;
+      const r = this.turn ? this.turn.onFrame(buf) : this.core.echoFrame(buf);
+      if (r && typeof (r as Promise<void>).then === "function") void (r as Promise<void>).catch(() => {});
+    } catch {
+      /* fail-safe — a decode/turn defect must never crash the socket */
+    }
+  }
+
+  /** Hibernation handler — drop a closed audio-in socket from the tracked set. */
+  webSocketClose(ws: WebSocket): void {
+    this.audioInSockets.delete(ws);
+  }
+
+  webSocketError(ws: WebSocket): void {
+    this.audioInSockets.delete(ws);
+  }
+
+  /**
+   * Persist the session transcript to R2 (`transcript:{org}:{room}:{session}.json`). Best-effort — a bucket
+   * write never fails the caller. Returns true only when a non-empty transcript was actually written.
+   */
+  private persistTranscript(): Promise<boolean> {
+    const bound = this.core.bound;
+    const history = this.turn ? this.turn.history() : [];
+    if (!this.env.RT_RECORDINGS || !bound || history.length === 0) return Promise.resolve(false);
+    const key = `transcript:${bound.org}:${bound.roomId}:${bound.participantSessionId}.json`;
+    return this.env.RT_RECORDINGS.put(
+      key,
+      JSON.stringify({
+        org: bound.org,
+        roomId: bound.roomId,
+        sessionId: bound.participantSessionId,
+        recordedAt: Date.now(),
+        messages: history,
+      }),
+    )
+      .then(() => true)
+      .catch(() => false);
+  }
+
   /**
    * Arm the step-3 turn-taking core for a binding. INERT unless VOICE_AGENT_PROVIDER=wave. Lazily imported so
    * the skeleton's binding/migration deploy is unaffected. Wires LIVE STT/gateway-LLM/ElevenLabs deps from env
    * (creds referenced, never logged) over the same media deps the echo core uses. Fail-soft: if arming throws,
    * the DO keeps the echo fallback (media safety > agent) — never crashes the bind.
    */
-  private armTurnTaking(bound: AgentSessionConfig): void {
+  private async armTurnTaking(bound: AgentSessionConfig): Promise<void> {
     if (!voiceAgentEnabled(this.env)) return;
     try {
       const media = this.buildMediaDeps();
       const deps = buildTurnDeps(this.env, media, this.env.__agentFetch ?? fetch, bound.org, bound.agentId);
-      const tools = toolAllowlistFromEnv(this.env); // step 5: agent-least-privilege allowlist (env-driven)
+      // step 5: the DYNAMIC catalog (voice-control-deck E0) first, the hardcoded env allowlist as the fallback —
+      // so a tool added on the gateway becomes voice-callable with no edge redeploy.
+      const tools = (await toolCatalogFromGateway(this.env)) ?? toolAllowlistFromEnv(this.env);
       this.turn = new TurnTakingCore(deps, { ...bound, systemPrompt: this.env.VOICE_AGENT_SYSTEM_PROMPT }, {
         framing: this.env.AGENT_INGEST_FRAMING,
         vad: vadConfigFromEnv(this.env), // step 4: barge-in VAD thresholds (env-overridable, sensible defaults)
         ttsLeadMs: ttsLeadMsFromEnv(this.env), // step 4: real-time TTS pacing → interruptible playout (barge-in)
         tools, // step 5: only these tools are advertised to the model + executable (others refused)
         cogsRates: voiceCogsRatesFromEnv(this.env), // E0-P2: vendor COGS rates (absent ⇒ reported unpriced)
+        echoMuteMs: parseInt(this.env.AGENT_ECHO_MUTE_MS ?? "400", 10), // echo-mute grace after a turn
       });
       media.log("agent-turn-armed", { org: bound.org, room: bound.roomId, agentId: bound.agentId });
     } catch (e) {

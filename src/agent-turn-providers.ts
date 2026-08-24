@@ -18,7 +18,37 @@
  */
 import { AgentSessionError } from "./agent-session.js";
 import { pcmToWav, WAV_MIME } from "./pcm-wav.js";
-import type { AgentTurnEnv, SttResult } from "./agent-turn.js";
+import { flowTap } from "./flow-tap.js";
+import type { AgentTurnEnv, SttResult, TurnTakingConfig } from "./agent-turn.js";
+
+/** The default agent persona when none is configured (honest, generic — a real persona is set per-agent). */
+export const DEFAULT_SYSTEM_PROMPT =
+  "You are a helpful, concise WAVE voice agent. Always reply in English, regardless of the user's language. Reply in short, natural spoken sentences.";
+
+/** The configured persona, or the default. Pure → unit-testable. */
+export function buildTurnSystemPrompt(config: Pick<TurnTakingConfig, "systemPrompt">): string {
+  const p = (config.systemPrompt ?? "").trim();
+  return p.length > 0 ? p : DEFAULT_SYSTEM_PROMPT;
+}
+
+/**
+ * Normalize the gateway base/token to ONE canonical pair so a single operator-provided set provisions EVERY
+ * gateway path (LLM, STT, tools, metering). The voice runtime introduced `WAVE_GATEWAY_BASE`/`WAVE_GATEWAY_TOKEN`,
+ * but the established edge convention (metering.ts, room.ts) is `GATEWAY_BASE_URL`/`WAVE_SERVICE_TOKEN`. Without
+ * this, setting one pair leaves the other path silently INERT. We fill BOTH names from whichever is set (voice
+ * name wins), so an operator may provision EITHER convention and every path resolves. Pure → unit-testable.
+ */
+export function normalizeGatewayEnv(env: AgentTurnEnv): AgentTurnEnv {
+  const base = env.WAVE_GATEWAY_BASE ?? env.GATEWAY_BASE_URL;
+  const token = env.WAVE_GATEWAY_TOKEN ?? env.WAVE_SERVICE_TOKEN;
+  return {
+    ...env,
+    WAVE_GATEWAY_BASE: base,
+    WAVE_GATEWAY_TOKEN: token,
+    GATEWAY_BASE_URL: env.GATEWAY_BASE_URL ?? base,
+    WAVE_SERVICE_TOKEN: env.WAVE_SERVICE_TOKEN ?? token,
+  };
+}
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -107,13 +137,17 @@ export async function* streamElevenLabs(
     throw new AgentSessionError("TTS_UPSTREAM", `ElevenLabs returned ${res.status}`, 502);
   }
   const reader = res.body.getReader();
+  flowTap(env, "tts", "start", { chars: text.length });
   // try/finally so a consumer that breaks early (barge-in abort cancels the for-await) releases the underlying
   // body via reader.cancel() — otherwise the abandoned TTS Response leaks and deadlocks the DO's fetch pool.
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (value && value.length > 0) yield value;
+      if (value && value.length > 0) {
+        flowTap(env, "tts", "chunk", { bytes: value.length });
+        yield value;
+      }
     }
   } finally {
     reader.cancel().catch(() => {});
@@ -131,6 +165,7 @@ export async function* streamElevenLabs(
  */
 export async function* upmixMonoToStereo16LE(
   mono: AsyncIterable<Uint8Array>,
+  env?: AgentTurnEnv,
 ): AsyncIterable<Uint8Array> {
   let carry: number | null = null; // pending low byte of a sample split across a chunk boundary
   for await (const chunk of mono) {
@@ -161,6 +196,7 @@ export async function* upmixMonoToStereo16LE(
       out[o++] = hi;
     }
     if (i < chunk.length) carry = chunk[i]!; // odd trailing byte → carry into the next chunk
+    flowTap(env, "upmix", "out", { bytes: out.length });
     yield out;
   }
 }
@@ -210,6 +246,7 @@ export async function transcribeViaProvider(
   const json = (await res.json().catch(() => ({}))) as { text?: unknown; transcript?: unknown };
   const text =
     typeof json.text === "string" ? json.text : typeof json.transcript === "string" ? json.transcript : "";
+  flowTap(env, "stt", "result", { chars: text.length });
   return { isFinal: true, transcript: text };
 }
 

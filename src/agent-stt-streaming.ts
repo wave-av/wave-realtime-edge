@@ -53,7 +53,10 @@ export async function streamingTranscribe(
   }
 
   // Deepgram streaming listen — linear16 PCM @ 48 kHz / stereo, endpointing enabled so the
-  // server flushes the final transcript as soon as it detects the end of the utterance.
+  // server flushes the final transcript as soon as it detects the end of the utterance. Auth is the
+  // `token` QUERY PARAM (the server-side WS form — a WS client can't set headers, and the CF Workers
+  // outbound WS does not forward a subprotocol handshake reliably, which is why the browser-style
+  // ["token", key] subprotocol 401'd every turn).
   const params = new URLSearchParams({
     encoding: "linear16",
     sample_rate: "48000",
@@ -63,12 +66,10 @@ export async function streamingTranscribe(
     endpointing: "300",
     utterance_end_ms: "1000",
   });
+  params.set("token", apiKey);
   const url = `wss://api.deepgram.com/v1/listen?${params}`;
 
   return new Promise<SttResult>((resolve, reject) => {
-    // The CF Workers runtime exposes the standard browser WebSocket constructor for outbound
-    // connections from DOs. The @cloudflare/workers-types package only types the hibernation
-    // (server-side) WebSocket; we bridge via the OutboundWebSocket interface above.
     const ws = new (globalThis.WebSocket as unknown as new (url: string) => OutboundWebSocket)(url);
     let settled = false;
     let transcript = "";

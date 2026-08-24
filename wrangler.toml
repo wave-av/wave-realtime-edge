@@ -263,9 +263,22 @@ VOICE_AGENT_PROVIDER = "wave"
 # a voice agent (allowlisted in the governed gateway). Switch back to "ollama"/"anthropic" once either is healthy.
 VOICE_AGENT_LLM_BACKEND = "openrouter"
 VOICE_AGENT_LLM_MODEL = "qwen/qwen3.7-flash"
+<<<<<<< HEAD
 # ElevenLabs optimize_streaming_latency (0-4): 3 = minimum-latency synthesis for a snappy voice agent
 # (trades a little quality for first-audio speed). 0 restores max quality.
 VOICE_AGENT_TTS_LATENCY = "3"
+||||||| 0e0c647
+=======
+# ElevenLabs optimize_streaming_latency (0-4): 3 = minimum-latency synthesis for a snappy voice agent
+# (trades a little quality for first-audio speed). 0 restores max quality.
+VOICE_AGENT_TTS_LATENCY = "3"
+
+# Streaming STT (E1 task 4): KNOWN-OPEN — the Deepgram WS from the CF Workers DO fails with "Deepgram
+# WebSocket error" under BOTH auth forms (subprotocol AND the token query param, both tried live). This is
+# a CF Workers DO outbound-WS limitation, not an auth bug. DISABLED: the batch gateway-fronted STT is the
+# PROVEN path (the live browser + headless CLI conversations both use it). "true" arms the broken path.
+VOICE_AGENT_STREAMING_STT = "false"
+>>>>>>> origin/main
 
 # E0-P2 vendor COGS rates (voice-cogs.ts voiceCogsRatesFromEnv) — the published vendor list prices used to
 # price each turn's cost internally (ttsUsdPerChar = ElevenLabs Business v2 ~$0.05/1k chars; sttUsdPerAudioMinute
@@ -293,6 +306,18 @@ VOICE_AGENT_TOOLS = "[{\"name\":\"wave_usage_summary\",\"description\":\"Read th
 # (2026-06-26): 150ms→~1100ms end-to-end barge stop, 40ms→~540ms, 20ms→~104-147ms; 30 keeps barge-in well under
 # the 300ms target with a small anti-underrun cushion above 20. 0 disables pacing (legacy bulk send).
 AGENT_TTS_LEAD_MS = "30"
+
+# signal-flow E1 observer tap — when "true"/"1", the voice-agent flow emits transition records
+# (stt/result, tts/chunk, upmix/out, frame-encode/out) as JSON lines for the garbled-audio diagnosis.
+AGENT_FLOW_TAP = "true"
+
+# FFT tap (audio-signal-plane E1) — emit the live egress spectrum (node "fft", evt "spectrum", 64 bins)
+AGENT_FFT_TAP = "true"
+
+# Echo-mute grace (the echo backstop's post-turn window) — drop the mic for 400ms after each turn so the
+# reverberation tail isn't transcribed as the next user turn. Trades a fast barge-in inside the window (documented).
+AGENT_ECHO_MUTE_MS = "400"
+
 
 # ── RT-P1.5 — pluggable recording encoders (design §6). DEFAULT DISARMED / DORMANT. ──
 # RT_RECORD arms recording at all; absent/"0" → selectEncoder() returns the inert DisarmedEncoder (begin →

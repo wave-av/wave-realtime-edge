@@ -70,6 +70,9 @@ import {
   streamElevenLabs,
   upmixMonoToStereo16LE,
   transcribeViaProvider,
+  buildTurnSystemPrompt,
+  DEFAULT_SYSTEM_PROMPT,
+  normalizeGatewayEnv,
   type FetchLike,
 } from "./agent-turn-providers.js";
 import { streamingTranscribe } from "./agent-stt-streaming.js";
@@ -134,6 +137,7 @@ export interface AgentTurnDeps {
    * `buildTurnDeps` mirrors src/metering.ts (POST /v1/internal/usage, service token); tests pass a fake.
    */
   emitMeter(usage: VoiceTurnUsage): Promise<void>;
+  flowTap?: boolean;
 }
 
 /** Config to run a turn-taking session for one room/participant (superset of the bind config + the persona). */
@@ -148,8 +152,7 @@ export interface TurnTakingConfig {
 }
 
 /** The default agent persona when none is configured (honest, generic — a real persona is set per-agent). */
-export const DEFAULT_SYSTEM_PROMPT =
-  "You are a helpful, concise WAVE voice agent. Reply in short, natural spoken sentences.";
+export { DEFAULT_SYSTEM_PROMPT, buildTurnSystemPrompt, normalizeGatewayEnv };
 
 /** Step-5 hard default cap on tool-call iterations within ONE turn (anti-runaway). Overridable per-core. */
 export const DEFAULT_MAX_TOOL_ITERATIONS = 5;
@@ -180,12 +183,6 @@ export function ttsLeadMsFromEnv(env: { AGENT_TTS_LEAD_MS?: string | number }): 
  */
 export const MAX_UTTERANCE_BYTES = 48_000 * 2 * 2 * 15;
 
-/** The configured persona, or the default. Pure → unit-testable. */
-export function buildTurnSystemPrompt(config: Pick<TurnTakingConfig, "systemPrompt">): string {
-  const p = (config.systemPrompt ?? "").trim();
-  return p.length > 0 ? p : DEFAULT_SYSTEM_PROMPT;
-}
-
 /**
  * TurnTakingCore — the pure, testable turn state machine for one agent session. Accumulates participant PCM,
  * runs STT → (on final) LLM via the gateway → ElevenLabs TTS → publishes PCM out the ingest socket. Holds the
@@ -202,8 +199,13 @@ export class TurnTakingCore {
   /** Running byte total of `utterance` (avoids re-summing on every frame; drives bounded eviction). */
   private utteranceBytes = 0;
   private outSeq = 0;
+  private readonly tsTicksRef = { value: 0 }; // session-wide RTP ts, shared into every SpeechSession (monotonic across turns)
   /** Guards against re-entrant turns (a turn is in flight while we await STT/LLM/TTS). */
   private turnInFlight = false;
+  /** Echo-mute window end (ms) — frames are dropped until this wall-clock (the "agent hears itself" backstop). */
+  private echoMuteUntil = 0;
+  /** Echo-mute grace after a turn (ms) — the reverberation tail before the next STT. Env AGENT_ECHO_MUTE_MS. */
+  private readonly echoMuteMs: number;
   /** Set by the step-4 interrupt controller (onUserSpeech / VAD barge-in) to cancel an in-flight turn. */
   private aborted = false;
   /** Step-4 VAD: detects user speech ONSET on every frame → drives true barge-in while the agent talks. */
@@ -243,6 +245,8 @@ export class TurnTakingCore {
       ttsLeadMs?: number;
       /** E0-P2: vendor COGS rates. Omitted ⇒ quantities are measured and reported UNPRICED (never estimated). */
       cogsRates?: VoiceCogsRates;
+      /** Echo-mute grace after a turn (ms) — the reverberation tail before the next STT (default 400). */
+      echoMuteMs?: number;
     },
   ) {
     this.deps = deps;
@@ -253,6 +257,7 @@ export class TurnTakingCore {
     this.cogs = new TurnCogsLedger(() => this.deps.now());
     this.cogsRates = opts?.cogsRates;
     this.ttsLeadMs = typeof opts?.ttsLeadMs === "number" && opts.ttsLeadMs >= 0 ? Math.floor(opts.ttsLeadMs) : DEFAULT_TTS_LEAD_MS;
+    this.echoMuteMs = typeof opts?.echoMuteMs === "number" && opts.echoMuteMs >= 0 ? Math.floor(opts.echoMuteMs) : 0;
     this.tools = opts?.tools ?? new ToolAllowlist([]);
     this.maxToolIterations =
       typeof opts?.maxToolIterations === "number" && opts.maxToolIterations >= 1
@@ -275,6 +280,12 @@ export class TurnTakingCore {
     try {
       const pkt = decodePacket(frame);
       if (pkt.payload.length === 0) return; // keep-alive / empty
+      // ECHO MUTE (the "agent hears itself" fix): for a short grace window after each turn we DROP the egress audio
+      // so the agent's own TTS (picked up by a mic that hears the speaker) is never transcribed as the next utterance.
+      // This is the code-level echo mitigation — real deployments add WebRTC echo cancellation on the client; this
+      // window is the edge-side backstop for a raw mic+speaker rig. It also eats a fast barge-in inside the window,
+      // which is the documented tradeoff (env-tunable; 0 disables).
+      if (this.deps.now() < this.echoMuteUntil) return;
       // VAD runs on EVERY decoded frame (design §L2.1) — it's the barge-in trigger AND the silence sensor.
       stage = "vad";
       const vadEvent = this.vad.feed(pkt.payload);
@@ -460,6 +471,11 @@ export class TurnTakingCore {
       this.deps.log("agent-turn-error", { stage, ...this.idFields(), message: (e as Error)?.message ?? "unknown" });
     } finally {
       this.turnInFlight = false;
+      // ECHO MUTE: discard the audio accumulated during the turn (the agent's own TTS picked up by the mic) +
+      // hold a short grace so the reverberation tail isn't transcribed as the next user turn. This is the code-
+      // level backstop; real deployments add AEC (WebRTC AEC3) on the client for the full fix.
+      this.resetUtterance();
+      this.echoMuteUntil = this.deps.now() + this.echoMuteMs;
       // E0-P2: EVERY turn closes the ledger exactly once. A turn that died before the clean-completion meter
       // still SUBMITTED characters the vendor bills, so it still gets a COGS receipt (log-only, never a billable
       // emit). Without this, no emitted row could ever carry abortedSpeaks > 0 and the barge-in wastage term
@@ -535,6 +551,8 @@ export class TurnTakingCore {
       isAborted: () => this.aborted,
       nextSeq: () => this.outSeq++,
       idFields: () => this.idFields(),
+      flowTap: this.deps.flowTap,
+      tsTicks: this.tsTicksRef,
     });
   }
 
@@ -699,26 +717,6 @@ export interface AgentTurnEnv extends AgentSessionEnv, VadEnv, VoiceMeterEnv, Vo
 }
 
 /**
- * Normalize the gateway base/token to ONE canonical pair so a single operator-provided set provisions EVERY
- * gateway path (LLM, STT, tools, metering). The voice runtime introduced `WAVE_GATEWAY_BASE`/`WAVE_GATEWAY_TOKEN`,
- * but the established edge convention (metering.ts, room.ts) is `GATEWAY_BASE_URL`/`WAVE_SERVICE_TOKEN`. Without
- * this, setting one pair leaves the other path silently INERT (e.g. LLM works but billing emits nothing) — a
- * config-no-silent-noop trap. We fill BOTH names from whichever is set (voice name wins when both are present),
- * so an operator may provision EITHER convention and every path resolves. Pure → unit-testable.
- */
-export function normalizeGatewayEnv(env: AgentTurnEnv): AgentTurnEnv {
-  const base = env.WAVE_GATEWAY_BASE ?? env.GATEWAY_BASE_URL;
-  const token = env.WAVE_GATEWAY_TOKEN ?? env.WAVE_SERVICE_TOKEN;
-  return {
-    ...env,
-    WAVE_GATEWAY_BASE: base,
-    WAVE_GATEWAY_TOKEN: token,
-    GATEWAY_BASE_URL: env.GATEWAY_BASE_URL ?? base,
-    WAVE_SERVICE_TOKEN: env.WAVE_SERVICE_TOKEN ?? token,
-  };
-}
-
-/**
  * Build the LIVE turn-taking deps from env (the concrete network adapters live in agent-turn-providers.ts). Wires:
  *   • transcribe → the WAVE transcribe spoke via the gateway (batch-on-utterance; fails CLOSED when unprovisioned,
  *     never a fake transcript).
@@ -739,6 +737,7 @@ export function buildTurnDeps(
   // routes attribute + meter usage to the right tenant. Empty only in non-bound test paths.
   return {
     ...media,
+    flowTap: env.AGENT_FLOW_TAP === "true" || env.AGENT_FLOW_TAP === "1",
     async transcribe(pcm: Uint8Array): Promise<SttResult> {
       // Streaming STT path (Deepgram WebSocket) — behind env flag, default OFF.
       // When armed, the adapter opens a WebSocket to Deepgram, streams PCM incrementally,
@@ -775,7 +774,7 @@ export function buildTurnDeps(
       }
       // ElevenLabs pcm_48000 is MONO; CF Realtime buffer-mode ingest wants 48 kHz/16-bit/STEREO interleaved.
       // Upmix (L=R) before publish or the agent's voice plays as endianness-shifted noise. (#30)
-      yield* upmixMonoToStereo16LE(streamElevenLabs(fetchImpl, env, text));
+      yield* upmixMonoToStereo16LE(streamElevenLabs(fetchImpl, env, text), env);
     },
     async emitMeter(usage: VoiceTurnUsage): Promise<void> {
       // Step-7 real usage emit (mirrors metering.ts). INERT until the gateway base + service token are
