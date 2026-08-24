@@ -344,6 +344,8 @@ export class AgentSessionDO {
   private fftTapFrame = 0;
   /** Latest computed spectrum (the FFT tap's output) — served by the spectrum endpoint for the dashboard. */
   private latestSpectrum: { bins: number[]; at: number } | null = null;
+  /** Muted (voice-control-deck E1): when true the egress audio is dropped (no STT/turn/FFT). */
+  private muted = false;
   /** Direct-playback client sockets: the browser dials the TTS route and we fan speak() PCM out to each. */
   private ttsClients: WebSocket[] = [];
   /** Audio-in sockets (the headless "mic"): the runtime delivers their frames to webSocketMessage(). */
@@ -368,6 +370,9 @@ export class AgentSessionDO {
     // 204, never throws (a recording/echo error must not affect the live media the SFU is also pushing).
     if (path === "echo-frame" && request.method === "POST") {
       try {
+        // MUTED (voice-control-deck E1): drop the egress audio entirely — no STT, no turn, no FFT. The agent
+        // listens again only on unmute. Fail-closed: nothing leaks while muted.
+        if (this.muted) return new Response(null, { status: 204 });
         const buf = new Uint8Array(await request.arrayBuffer());
         // FFT tap (wave-audio-signal-plane E1): flag-gated live spectrum of the egress PCM — the Fourier truth
         // the audio.wave.online dashboard renders. Decimated to every 4th frame (≈12.5 fps) to keep it cheap.
@@ -574,7 +579,17 @@ export class AgentSessionDO {
         );
       }
       if (path === "info" && request.method === "GET") {
-        return Response.json({ bound: this.core.bound, timings: this.core.timingSamples() }, { status: 200 });
+        return Response.json({ bound: this.core.bound, timings: this.core.timingSamples(), muted: this.muted }, { status: 200 });
+      }
+      if (path === "mute" && request.method === "POST") {
+        // voice-control-deck E1: mute = drop the egress audio (the "turn off the mic" intent). Idempotent.
+        this.muted = true;
+        return Response.json({ muted: true }, { status: 200 });
+      }
+      if (path === "unmute" && request.method === "POST") {
+        // "turn on the mic": resume listening.
+        this.muted = false;
+        return Response.json({ muted: false }, { status: 200 });
       }
       if (path === "spectrum" && request.method === "GET") {
         // The latest FFT spectrum (the audio-signal-plane tap output) — CORS-open so the audio.wave.online
