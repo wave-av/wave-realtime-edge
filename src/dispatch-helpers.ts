@@ -158,6 +158,8 @@ export const SAFE_SEGMENT = /^[A-Za-z0-9_:.-]{1,128}$/;
 /** Task #81 — voice-agent dispatch: POST /v1/realtime/agents/:intent (bind|info). Gated by the flag. */
 export const AGENT_DISPATCH_ROUTE = /^\/v1\/realtime\/agents\/([a-z]+)\/?$/;
 export const AGENT_DISPATCH_INTENTS = new Set(["bind", "info"]);
+/** Session-addressed voice controls. */
+export const AGENT_CONTROL_ROUTE = /^\/v1\/realtime\/agents\/([^/]+)\/([^/]+)\/([^/]+)\/(mute|unmute)\/?$/;
 /** Task #81 — agent egress WS the SFU dials OUT to (PCM in): /v1/realtime/agents/egress/:org/:room/:sessionId/:trackName.
  *  Mirrors RECORDER_ROUTE; the DO key is `${org}:${room}`-derived so a frame reaches the SAME AgentSessionDO
  *  the dispatch bound. The capability token (?t=) authorizes the third-party SFU dial-in (it can't send x-wave-internal). */

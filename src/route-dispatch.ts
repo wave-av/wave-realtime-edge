@@ -67,6 +67,7 @@ import {
 	SAFE_SEGMENT,
 	AGENT_DISPATCH_ROUTE,
 	AGENT_DISPATCH_INTENTS,
+	AGENT_CONTROL_ROUTE,
 	AGENT_EGRESS_ROUTE,
 	AGENT_INGEST_ROUTE,
 	AGENT_TTS_ROUTE,
@@ -595,6 +596,22 @@ export async function dispatch(
 	// route additionally accepts the per-(org,session,track) capability token the SFU appends (it can't send
 	// x-wave-internal). The AgentSessionDO is keyed `${org}:${room}` so dispatch + egress address one DO.
 	if (voiceAgentEnabled(env)) {
+		// Session controls are addressed by the bound participant session, not merely the room.
+		const controlMatch = request.method === "POST" ? url.pathname.match(AGENT_CONTROL_ROUTE) : null;
+		if (controlMatch) {
+			const denied = gatewayGate(request, env.WAVE_INTERNAL_SECRET);
+			if (denied) return denied;
+			const [, org, room, session] = controlMatch;
+			if (![org, room, session].every((s) => SAFE_SEGMENT.test(s)) || !env.AGENT_SESSION) {
+				return Response.json({ error: "BAD_REQUEST", message: "invalid agent control path" }, { status: 400 });
+			}
+			const stub = env.AGENT_SESSION.get(env.AGENT_SESSION.idFromName(`${org}:${room}`));
+			return stub.fetch(new Request(`https://agent/${controlMatch[4]}`, {
+				method: "POST",
+				headers: { "x-agent-session": session },
+			}));
+		}
+
 		// 1) Dispatch: POST /v1/realtime/agents/:intent (bind|info) → bind/inspect an AgentSessionDO for a room.
 		const adMatch = request.method === "POST" ? url.pathname.match(AGENT_DISPATCH_ROUTE) : null;
 		if (adMatch && AGENT_DISPATCH_INTENTS.has(adMatch[1])) {

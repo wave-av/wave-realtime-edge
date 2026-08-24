@@ -394,14 +394,7 @@ export class AgentSessionDO {
         }
         // Step 3: once a turn-taking core is armed (bound under VOICE_AGENT_PROVIDER=wave) frames drive a real
         // conversational turn; until armed (or if turn-taking is unwired) we fall back to the echo harness.
-        if (buf.length > 0) {
-          await (this.turn ? this.turn.onFrame(buf) : this.core.echoFrame(buf));
-          // A stop word muted the agent (voice-control-deck E1.P1) — the core set muteRequested; honor it here.
-          if (this.turn?.muteRequested) {
-            this.turn.muteRequested = false;
-            this.muted = true;
-          }
-        }
+        if (buf.length > 0) await (this.turn ? this.turn.onFrame(buf) : this.core.echoFrame(buf));
       } catch {
         /* fail-open */
       }
@@ -534,6 +527,8 @@ export class AgentSessionDO {
         const body = (await request.json().catch(() => ({}))) as { config?: AgentSessionConfig };
         if (!body.config) throw new AgentSessionError("BAD_REQUEST", "config is required", 400);
         const bound = this.core.bind(body.config);
+          // Reset room-scoped control state for the newly bound session.
+          this.muted = false;
         const baseWss = this.env.AGENT_PUBLIC_WSS ?? "wss://rt.wave.online";
         // Mint the per-endpoint capability tokens the SFU appends as ?t= on its dial-in (it can't send
         // x-wave-internal). Egress binds the participant track; ingest binds the agent track. Without these
@@ -589,11 +584,21 @@ export class AgentSessionDO {
         return Response.json({ bound: this.core.bound, timings: this.core.timingSamples(), muted: this.muted }, { status: 200 });
       }
       if (path === "mute" && request.method === "POST") {
+          const bound = this.core.bound;
+          const requestedSession = request.headers.get("x-agent-session");
+          if (!bound || requestedSession !== bound.participantSessionId) {
+            return Response.json({ error: "SESSION_MISMATCH" }, { status: 409 });
+          }
         // voice-control-deck E1: mute = drop the egress audio (the "turn off the mic" intent). Idempotent.
         this.muted = true;
         return Response.json({ muted: true }, { status: 200 });
       }
       if (path === "unmute" && request.method === "POST") {
+          const bound = this.core.bound;
+          const requestedSession = request.headers.get("x-agent-session");
+          if (!bound || requestedSession !== bound.participantSessionId) {
+            return Response.json({ error: "SESSION_MISMATCH" }, { status: 409 });
+          }
         // "turn on the mic": resume listening.
         this.muted = false;
         return Response.json({ muted: false }, { status: 200 });
@@ -650,6 +655,8 @@ export class AgentSessionDO {
    *  a headless-mic PCM frame. Fail-safe: a defect must never crash the socket. */
   webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
     if (!this.audioInSockets.has(ws) || typeof message === "string") return;
+      // Muting drops audio-in before STT, turn processing, or FFT.
+      if (this.muted) return;
     try {
       const buf = new Uint8Array(message);
       if (buf.length === 0) return;
