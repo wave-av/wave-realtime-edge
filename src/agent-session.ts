@@ -82,6 +82,12 @@ export interface AgentSessionConfig {
 const SAFE = /^[A-Za-z0-9_:.-]{1,128}$/;
 const SESSIONID = /^[0-9a-zA-Z_-]{8,128}$/;
 
+/** The voice-control-deck command catalog (E2 P0): the deck's idempotent commands, each origin'd. */
+const DECK_COMMANDS = [
+  { id: "mute", description: "drop the egress audio (turn off the mic)", origin: { source: "voice-control-deck", year: 2026 } },
+  { id: "unmute", description: "resume listening (turn on the mic)", origin: { source: "voice-control-deck", year: 2026 } },
+];
+
 /** A minimal outbound WS the ingest side sends on (the live DO supplies a real socket; tests a mock). */
 export interface IngestSocket {
   send(data: ArrayBufferView | ArrayBuffer): void;
@@ -597,6 +603,17 @@ export class AgentSessionDO {
         // "turn on the mic": resume listening.
         this.muted = false;
         return Response.json({ muted: false }, { status: 200 });
+      }
+      if (path === "deck" && request.method === "GET") {
+        // voice-control-deck E2 P0: the deck API (the command-deck authority) — list the commands + the state.
+        return Response.json({ commands: DECK_COMMANDS, muted: this.muted }, { status: 200 });
+      }
+      if (path.startsWith("deck/") && request.method === "POST") {
+        // Fire a deck command idempotently. The four renderings (CLI/SDK/MCP) call this same surface.
+        const command = path.slice("deck/".length);
+        if (command === "mute") { this.muted = true; return Response.json({ command, muted: true }, { status: 200 }); }
+        if (command === "unmute") { this.muted = false; return Response.json({ command, muted: false }, { status: 200 }); }
+        return Response.json({ error: "unknown command", command }, { status: 404 });
       }
       if (path === "spectrum" && request.method === "GET") {
         // The latest FFT spectrum (the audio-signal-plane tap output) — CORS-open so the audio.wave.online
