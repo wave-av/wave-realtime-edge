@@ -271,7 +271,6 @@ VOICE_AGENT_TTS_LATENCY = "3"
 =======
 # ElevenLabs optimize_streaming_latency (0-4): 3 = minimum-latency synthesis for a snappy voice agent
 # (trades a little quality for first-audio speed). 0 restores max quality.
-VOICE_AGENT_TTS_LATENCY = "3"
 
 # Streaming STT (E1 task 4): KNOWN-OPEN — the Deepgram WS from the CF Workers DO fails with "Deepgram
 # WebSocket error" under BOTH auth forms (subprotocol AND the token query param, both tried live). This is
