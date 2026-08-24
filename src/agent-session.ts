@@ -48,6 +48,7 @@ import {
   type CreateIngestAdapterResult,
 } from "./agent-ingest-adapter.js";
 import { TurnTakingCore, buildTurnDeps, toolAllowlistFromEnv, ttsLeadMsFromEnv, type AgentTurnEnv } from "./agent-turn.js";
+import { toolCatalogFromGateway } from "./agent-tools.js";
 import { vadConfigFromEnv } from "./agent-vad.js";
 import { voiceCogsRatesFromEnv } from "./voice-cogs.js";
 import { spectrumLogMagnitude, cepstrumPitch } from "./fft.js";
@@ -553,7 +554,7 @@ export class AgentSessionDO {
         const adapters = bound.headless
           ? { egress: undefined, ingest: undefined }
           : await this.core.openAdapters({ baseWss, egressToken, ingestToken });
-        this.armTurnTaking(bound); // step 3: arm the turn core for this binding (replaces echo on frames)
+        await this.armTurnTaking(bound); // step 3: arm the turn core for this binding (replaces echo on frames)
         return Response.json(
           {
             ok: true,
@@ -675,12 +676,14 @@ export class AgentSessionDO {
    * (creds referenced, never logged) over the same media deps the echo core uses. Fail-soft: if arming throws,
    * the DO keeps the echo fallback (media safety > agent) — never crashes the bind.
    */
-  private armTurnTaking(bound: AgentSessionConfig): void {
+  private async armTurnTaking(bound: AgentSessionConfig): Promise<void> {
     if (!voiceAgentEnabled(this.env)) return;
     try {
       const media = this.buildMediaDeps();
       const deps = buildTurnDeps(this.env, media, this.env.__agentFetch ?? fetch, bound.org, bound.agentId);
-      const tools = toolAllowlistFromEnv(this.env); // step 5: agent-least-privilege allowlist (env-driven)
+      // step 5: the DYNAMIC catalog (voice-control-deck E0) first, the hardcoded env allowlist as the fallback —
+      // so a tool added on the gateway becomes voice-callable with no edge redeploy.
+      const tools = (await toolCatalogFromGateway(this.env)) ?? toolAllowlistFromEnv(this.env);
       this.turn = new TurnTakingCore(deps, { ...bound, systemPrompt: this.env.VOICE_AGENT_SYSTEM_PROMPT }, {
         framing: this.env.AGENT_INGEST_FRAMING,
         vad: vadConfigFromEnv(this.env), // step 4: barge-in VAD thresholds (env-overridable, sensible defaults)

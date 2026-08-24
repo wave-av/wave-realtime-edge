@@ -104,6 +104,40 @@ export function toolAllowlistFromEnv(env: { VOICE_AGENT_TOOLS?: string }): ToolA
 }
 
 /**
+ * Fetch the DYNAMIC tool catalog from the gateway (voice-control-deck E0). Returns a ToolAllowlist built from
+ * the catalog's tools (name/description/input_schema), or null on ANY failure (unprovisioned gateway, non-ok,
+ * malformed) so the caller falls back to the hardcoded env allowlist. This is the E0.P1 edge half — once the
+ * caller awaits this at bind, a tool added on the gateway becomes voice-callable with no edge redeploy.
+ */
+export async function toolCatalogFromGateway(
+  env: { WAVE_GATEWAY_BASE?: string; WAVE_GATEWAY_TOKEN?: string },
+  fetchImpl: (input: string, init?: RequestInit) => Promise<Response> = fetch,
+): Promise<ToolAllowlist | null> {
+  const base = env.WAVE_GATEWAY_BASE?.replace(/\/+$/, "");
+  const token = env.WAVE_GATEWAY_TOKEN;
+  if (!base || !token) return null;
+  try {
+    const res = await fetchImpl(`${base}/v1/internal/tools`, { headers: { authorization: `Bearer ${token}` } });
+    if (!res.ok) return null;
+    const body = (await res.json().catch(() => ({}))) as { tools?: unknown };
+    if (!Array.isArray(body.tools)) return null;
+    const defs = body.tools
+      .filter(
+        (t): t is { name: unknown; description: unknown; input_schema: unknown } =>
+          !!t && typeof (t as Record<string, unknown>).name === "string",
+      )
+      .map((t) => ({
+        name: t.name as string,
+        description: typeof t.description === "string" ? t.description : "",
+        input_schema: typeof t.input_schema === "object" && t.input_schema !== null ? (t.input_schema as Record<string, unknown>) : { type: "object", properties: {} },
+      }));
+    return new ToolAllowlist(defs);
+  } catch {
+    return null; // a catalog fetch must never break arming — fall back to the env
+  }
+}
+
+/**
  * Redact a tool input for AUDIT logging: never log the raw input verbatim (never-log-or-leak-sensitive-data — it
  * may carry PII/secrets). We log the tool NAME (logged by the caller) + a SIZE summary of the input here. Pure.
  */
