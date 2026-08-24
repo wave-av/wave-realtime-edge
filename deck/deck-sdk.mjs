@@ -10,7 +10,7 @@ export class DeckClient {
     this.base = `${origin.replace(/\/+$/, '')}/v1/realtime/agents/${encodeURIComponent(org)}/${encodeURIComponent(room)}/${encodeURIComponent(session)}`;
     this.headers = {
       ...(org ? { 'x-wave-org': org } : {}),
-      ...(gatewayKey ? { 'x-wave-gateway': gatewayKey } : {}),
+      ...(gatewayKey ? { authorization: `Bearer ${gatewayKey}` } : {}),
     };
   }
 

@@ -28,7 +28,7 @@ describe("DeckClient (the SDK rendering)", () => {
     expect(res).toMatchObject({ command: "mute", muted: true });
     const init = fn.mock.calls[0]![1] as RequestInit;
     expect(init.method).toBe("POST");
-    expect((init.headers as Record<string, string>)["x-wave-gateway"]).toBe("k");
+    expect((init.headers as Record<string, string>).authorization).toBe("Bearer k");
   });
 
   it("a non-ok response throws with the body", async () => {
