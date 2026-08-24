@@ -163,6 +163,12 @@ import {
 export { DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_TTS_LEAD_MS, ttsLeadMsFromEnv, MAX_UTTERANCE_BYTES };
 
 /**
+ * Stop words that mute the agent (voice-control-deck E1.P1): the transcript matching one of these mutes
+ * locally — no LLM turn, no TTS. Kept narrow (a real "stop" intent, not a backchannel like "uh-huh").
+ */
+const STOP_WORDS = new Set(["mute", "stop", "stop listening", "shut up", "turn off the mic", "be quiet"]);
+
+/**
  * TurnTakingCore — the pure, testable turn state machine for one agent session. Accumulates participant PCM,
  * runs STT → (on final) LLM via the gateway → ElevenLabs TTS → publishes PCM out the ingest socket. Holds the
  * conversation history. Persists nothing itself (the DO wrapper owns DO storage). Every stage is fail-safe: an
@@ -181,6 +187,8 @@ export class TurnTakingCore {
   private readonly tsTicksRef = { value: 0 }; // session-wide RTP ts, shared into every SpeechSession (monotonic across turns)
   /** Guards against re-entrant turns (a turn is in flight while we await STT/LLM/TTS). */
   private turnInFlight = false;
+  /** Set when a stop word mutes the agent (voice-control-deck E1) — the DO reads it and drops the egress audio. */
+  muteRequested = false;
   /** Echo-mute window end (ms) — frames are dropped until this wall-clock (the "agent hears itself" backstop). */
   private echoMuteUntil = 0;
   /** Echo-mute grace after a turn (ms) — the reverberation tail before the next STT. Env AGENT_ECHO_MUTE_MS. */
@@ -296,6 +304,13 @@ export class TurnTakingCore {
       const userText = stt.transcript.trim();
       this.deps.log("agent-stt-result", { len: userText.length, transcript: userText.slice(0, 80), pcmBytes: pcm.length, rms: Math.round(this.vad.lastFrameRms) });
       if (userText.length === 0) return; // silence / nothing recognized → no turn
+      // Stop words (voice-control-deck E1.P1): "mute"/"stop"/"shut up" mute the agent locally — no LLM turn,
+      // no TTS, no meter. The DO reads `muteRequested` and drops the egress audio until unmute.
+      if (STOP_WORDS.has(userText.toLowerCase())) {
+        this.muteRequested = true;
+        this.deps.log("agent-mute-intent", { transcript: userText });
+        return;
+      }
       await this.runTurn(userText);
     } catch (e) {
       this.deps.log("agent-turn-error", { stage, message: (e as Error)?.message ?? "unknown" });

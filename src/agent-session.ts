@@ -394,7 +394,14 @@ export class AgentSessionDO {
         }
         // Step 3: once a turn-taking core is armed (bound under VOICE_AGENT_PROVIDER=wave) frames drive a real
         // conversational turn; until armed (or if turn-taking is unwired) we fall back to the echo harness.
-        if (buf.length > 0) await (this.turn ? this.turn.onFrame(buf) : this.core.echoFrame(buf));
+        if (buf.length > 0) {
+          await (this.turn ? this.turn.onFrame(buf) : this.core.echoFrame(buf));
+          // A stop word muted the agent (voice-control-deck E1.P1) — the core set muteRequested; honor it here.
+          if (this.turn?.muteRequested) {
+            this.turn.muteRequested = false;
+            this.muted = true;
+          }
+        }
       } catch {
         /* fail-open */
       }
