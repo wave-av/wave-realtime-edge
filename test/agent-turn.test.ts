@@ -230,6 +230,30 @@ describe("TurnTakingCore — one full turn", () => {
   });
 });
 
+describe("TurnTakingCore — stop-word mute (voice-control-deck E1.P1)", () => {
+  // A stop word ("mute"/"stop"/…) on the final transcript mutes the agent locally — no LLM turn, no TTS, no
+  // meter. The core raises muteRequested for the DO to honor (drops the egress audio until unmute).
+  it("a stop word mutes with no turn and raises muteRequested", async () => {
+    const transcribe = vi.fn(async (_pcm: Uint8Array): Promise<SttResult> => ({ isFinal: true, transcript: "mute" }));
+    const { deps, complete, synthesize, emitMeter } = mkDeps({ transcribe });
+    const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_FAST });
+    await speak(core);
+    expect(transcribe).toHaveBeenCalled();
+    expect(core.muteRequested).toBe(true);
+    expect(complete).not.toHaveBeenCalled(); // no LLM
+    expect(synthesize).not.toHaveBeenCalled(); // no TTS
+    expect(emitMeter).not.toHaveBeenCalled(); // no meter for a muted agent
+  });
+
+  it("normal speech still runs the turn (muteRequested stays false)", async () => {
+    const { deps, complete } = mkDeps(); // default fake STT returns "hello agent"
+    const core = new TurnTakingCore(deps, goodCfg, { vad: VAD_FAST });
+    await speak(core);
+    expect(core.muteRequested).toBe(false);
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("TurnTakingCore — barge-in (step 4 interrupt controller)", () => {
   const tick = () => new Promise<void>((r) => setTimeout(r, 0));
   // Loud PCM (16-bit LE samples of ~10000 → RMS ≫ default 500) = "speech"; no 0x00 so it never reads as STT-final.

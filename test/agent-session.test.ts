@@ -321,3 +321,39 @@ describe("AgentSessionDO audio-in WS — the headless mic (non-browser client)",
     (globalThis as unknown as { WebSocketPair: unknown }).WebSocketPair = saved;
   });
 });
+
+describe("AgentSessionDO — the deck API (voice-control-deck E2 P0)", () => {
+  const mkState = () => ({ storage: { get: async () => undefined, put: async () => {} } }) as never;
+
+  it("GET /deck lists the command catalog + the mute state", async () => {
+    const session = new AgentSessionDO(mkState(), { VOICE_AGENT_PROVIDER: "wave" } as never);
+    const res = await session.fetch(new Request("https://agent/deck"));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { muted: boolean; commands: { id: string; origin: { source: string } }[] };
+    expect(body.muted).toBe(false);
+    expect(body.commands.map((c) => c.id)).toEqual(["mute", "unmute"]);
+    expect(body.commands[0].origin.source).toBe("voice-control-deck");
+  });
+
+  it("POST /deck/mute → /deck/unmute fire idempotently and flip the state", async () => {
+    const session = new AgentSessionDO(mkState(), { VOICE_AGENT_PROVIDER: "wave" } as never);
+    const m = await (await session.fetch(new Request("https://agent/deck/mute", { method: "POST" }))).json();
+    expect(m).toMatchObject({ command: "mute", muted: true });
+    const u = await (await session.fetch(new Request("https://agent/deck/unmute", { method: "POST" }))).json();
+    expect(u).toMatchObject({ command: "unmute", muted: false });
+  });
+
+  it("an unknown deck command is refused 404", async () => {
+    const session = new AgentSessionDO(mkState(), { VOICE_AGENT_PROVIDER: "wave" } as never);
+    const res = await session.fetch(new Request("https://agent/deck/nope", { method: "POST" }));
+    expect(res.status).toBe(404);
+  });
+
+  it("a muted session drops the echo-frame (fail-closed — nothing leaks while muted)", async () => {
+    const session = new AgentSessionDO(mkState(), { VOICE_AGENT_PROVIDER: "wave" } as never);
+    await session.fetch(new Request("https://agent/deck/mute", { method: "POST" }));
+    const frame = encodeIngestFrame(new Uint8Array([1, 2, 3, 4]), { sequenceNumber: 1, timestamp: 1 }, "packet");
+    const res = await session.fetch(new Request("https://agent/echo-frame", { method: "POST", body: frame }));
+    expect(res.status).toBe(204); // muted → dropped, no STT/turn/FFT
+  });
+});

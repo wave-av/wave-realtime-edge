@@ -60,6 +60,8 @@ import { vadConfigFromEnv } from "./agent-vad.js";
 import { voiceCogsRatesFromEnv } from "./voice-cogs.js";
 import { spectrumLogMagnitude, cepstrumPitch } from "./fft.js";
 import { mintRecorderToken } from "./encoders/recorder-auth.js";
+import { handleDeckRequest } from "./agent-deck.js";
+import { handleReadRequest } from "./agent-read.js";
 
 /** The flag value that arms the WAVE voice agent. Anything else → fully inert. */
 export const VOICE_AGENT_PROVIDER_WAVE = "wave";
@@ -370,6 +372,8 @@ export class AgentSessionDO {
   private fftTapFrame = 0;
   /** Latest computed spectrum (the FFT tap's output) — served by the spectrum endpoint for the dashboard. */
   private latestSpectrum: { bins: number[]; at: number } | null = null;
+  /** Muted (voice-control-deck E1): when true the egress audio is dropped (no STT/turn/FFT). */
+  private muted = false;
   /** Direct-playback client sockets: the browser dials the TTS route and we fan speak() PCM out to each. */
   private ttsClients: WebSocket[] = [];
   /** Audio-in sockets (the headless "mic"): the runtime delivers their frames to webSocketMessage(). */
@@ -402,6 +406,9 @@ export class AgentSessionDO {
         return new Response(null, { status: 204 });
       }
       try {
+        // MUTED (voice-control-deck E1): drop the egress audio entirely — no STT, no turn, no FFT. The agent
+        // listens again only on unmute. Fail-closed: nothing leaks while muted.
+        if (this.muted) return new Response(null, { status: 204 });
         const buf = new Uint8Array(await request.arrayBuffer());
         // FFT tap (wave-audio-signal-plane E1): flag-gated live spectrum of the egress PCM — the Fourier truth
         // the audio.wave.online dashboard renders. Decimated to every 4th frame (≈12.5 fps) to keep it cheap.
@@ -423,7 +430,14 @@ export class AgentSessionDO {
         }
         // Step 3: once a turn-taking core is armed (bound under VOICE_AGENT_PROVIDER=wave) frames drive a real
         // conversational turn; until armed (or if turn-taking is unwired) we fall back to the echo harness.
-        if (buf.length > 0) await (this.turn ? this.turn.onFrame(buf) : this.core.echoFrame(buf));
+        if (buf.length > 0) {
+          await (this.turn ? this.turn.onFrame(buf) : this.core.echoFrame(buf));
+          // A stop word muted the agent (voice-control-deck E1.P1) — the core set muteRequested; honor it here.
+          if (this.turn?.muteRequested) {
+            this.turn.muteRequested = false;
+            this.muted = true;
+          }
+        }
       } catch {
         /* fail-open */
       }
@@ -609,35 +623,23 @@ export class AgentSessionDO {
           { status: 200 },
         );
       }
-      if (path === "info" && request.method === "GET") {
-        return Response.json({ bound: this.core.bound, timings: this.core.timingSamples() }, { status: 200 });
-      }
-      if (path === "spectrum" && request.method === "GET") {
-        // The latest FFT spectrum (the audio-signal-plane tap output) — CORS-open so the audio.wave.online
-        // dashboard can poll it. Returns null when no frame has been tapped yet (no live session).
-        return Response.json(this.latestSpectrum ?? { bins: null, at: 0 }, {
-          status: 200,
-          headers: { "access-control-allow-origin": "*" },
+      if (path === "info" || path === "spectrum" || path === "history") {
+        // The read/telemetry GET surface lives in agent-read.ts (decomposed under the 800-line gate).
+        const readRes = handleReadRequest(path, request.method, {
+          bound: this.core.bound,
+          timings: () => this.core.timingSamples(),
+          muted: this.muted,
+          latestSpectrum: this.latestSpectrum,
+          history: () => (this.turn ? this.turn.history() : []),
+          persistTranscript: () => this.persistTranscript(),
         });
+        if (readRes) return readRes;
       }
-      if (path === "history" && request.method === "GET") {
-        // The conversation transcript (system + alternating user/assistant). A core product surface:
-        // every voice-agent session must OFFER its transcript, not just speak it. `this.turn` is null
-        // until armed, so an unarmed/echo session honestly returns an empty history. Returns the SAME
-        // TranscriptResult shape the R2 retention uses and the console's getTranscript expects.
-        const bound = this.core.bound;
-        const history = this.turn ? this.turn.history() : [];
-        void this.persistTranscript(); // record on read (best-effort; the read never blocks on the write)
-        return Response.json(
-          {
-            org: bound?.org ?? "",
-            roomId: bound?.roomId ?? "",
-            sessionId: bound?.participantSessionId ?? "",
-            recordedAt: Date.now(),
-            messages: history,
-          },
-          { status: 200 },
-        );
+      if (path === "mute" || path === "unmute" || path === "deck" || path.startsWith("deck/")) {
+        // voice-control-deck E1+E2: the mute/unmute + deck routes live in agent-deck.ts (decomposed under
+        // the 800-line gate). The DO owns the `muted` field; the helper flips it.
+        const deckRes = handleDeckRequest(path, request.method, this.muted, (v) => { this.muted = v; });
+        if (deckRes) return deckRes;
       }
       if (path === "finalize" && request.method === "POST") {
         // Persist the transcript at SESSION END (the worker calls this when the room/session closes), so
