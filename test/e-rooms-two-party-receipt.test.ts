@@ -67,8 +67,9 @@ describe("E-ROOMS receipt: two-party A/V + state-sync", () => {
 
     const aliceJoin = await aliceSig.join(CTX_ALICE);
     expect("waiting" in aliceJoin).toBe(false);
-    expect(aliceJoin.sessionId).toBe(SESSION_A);
-    expect(aliceJoin.participantId).toBe("alice");
+    const alice = aliceJoin as import("../src/signaling.js").JoinResult;
+    expect(alice.sessionId).toBe(SESSION_A);
+    expect(alice.participantId).toBe("alice");
 
     // ── Step 2: Alice publishes audio + video ──
     const alicePubFetch = scriptedFetch([
@@ -105,8 +106,9 @@ describe("E-ROOMS receipt: two-party A/V + state-sync", () => {
 
     const bobJoin = await bobSig.join(CTX_BOB);
     expect("waiting" in bobJoin).toBe(false);
-    expect(bobJoin.sessionId).toBe(SESSION_B);
-    expect(bobJoin.participantId).toBe("bob");
+    const bob = bobJoin as import("../src/signaling.js").JoinResult;
+    expect(bob.sessionId).toBe(SESSION_B);
+    expect(bob.participantId).toBe("bob");
 
     // ── Step 4: Bob subscribes to Alice's "cam" ──
     const bobSubFetch = scriptedFetch([
