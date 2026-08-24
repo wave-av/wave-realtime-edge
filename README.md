@@ -122,6 +122,18 @@ threat-model.md, SECURITY.md, CONTRIBUTING.md
 | CF Stream → SFU bridge | in | ![live](https://img.shields.io/badge/live-brightgreen?style=flat-square) |
 | presence-websocket | bidir | ![inert](https://img.shields.io/badge/inert-lightgrey?style=flat-square) |
 
+## The receipts
+
+Every claim below is resolved against the live repo or endpoint by the SSOT verifier — a non-`pass` verdict fails the gate.
+
+| Claim | How it's verified |
+| --- | --- |
+| Protocol requests are authenticated by bearer token and authorized at the gateway | resolved by grepping `docs/REALTIME.md` |
+| Worker is routed on the custom domain rt.wave.online | resolved by grepping `wrangler.toml` |
+| Publishes rtc.session.opened and rtc.session.closed as x402-metered events | resolved by grepping `capabilities.json` |
+| Repo is tagged protocol-plane-layer-1 in capabilities.json | resolved by grepping `capabilities.json` |
+| Custom SFU on a Cloudflare Durable Object (ROOM binding) for multi-party media | ![preview](https://img.shields.io/badge/preview-blue?style=flat-square) |
+
 ## Topics
 
 `edge` · `webrtc` · `sfu` · `x402-metered` · `protocol-plane-layer-1`
@@ -133,4 +145,3 @@ threat-model.md, SECURITY.md, CONTRIBUTING.md
 **Built by [WAVE Online, LLC](https://wave.online)** · [wave.online](https://wave.online) · [Docs](https://docs.wave.online) · [LinkedIn](https://www.linkedin.com/company/wave-online)
 
 </div>
-
