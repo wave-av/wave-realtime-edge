@@ -110,17 +110,32 @@ export function toolAllowlistFromEnv(env: { VOICE_AGENT_TOOLS?: string }): ToolA
  * caller awaits this at bind, a tool added on the gateway becomes voice-callable with no edge redeploy.
  */
 export async function toolCatalogFromGateway(
-  env: { WAVE_GATEWAY_BASE?: string; WAVE_GATEWAY_TOKEN?: string },
+  env: {
+    WAVE_GATEWAY_BASE?: string;
+    WAVE_GATEWAY_TOKEN?: string;
+    GATEWAY_BASE_URL?: string;
+    WAVE_SERVICE_TOKEN?: string;
+  },
   fetchImpl: (input: string, init?: RequestInit) => Promise<Response> = fetch,
 ): Promise<ToolAllowlist | null> {
-  const base = env.WAVE_GATEWAY_BASE?.replace(/\/+$/, "");
-  const token = env.WAVE_GATEWAY_TOKEN;
+  let base = String(env.WAVE_GATEWAY_BASE ?? env.GATEWAY_BASE_URL ?? "");
+  while (base.endsWith("/")) base = base.slice(0, -1);
+  const token = env.WAVE_GATEWAY_TOKEN ?? env.WAVE_SERVICE_TOKEN;
   if (!base || !token) return null;
   try {
     const res = await fetchImpl(`${base}/v1/internal/tools`, { headers: { authorization: `Bearer ${token}` } });
-    if (!res.ok) return null;
-    const body = (await res.json().catch(() => ({}))) as { tools?: unknown };
-    if (!Array.isArray(body.tools)) return null;
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {});
+      return null;
+    }
+    const body = (await res.json().catch(async () => {
+      await res.body?.cancel().catch(() => {});
+      return {};
+    })) as { tools?: unknown };
+    if (!Array.isArray(body.tools)) {
+      await res.body?.cancel().catch(() => {});
+      return null;
+    }
     const defs = body.tools
       .filter(
         (t): t is { name: unknown; description: unknown; input_schema: unknown } =>
