@@ -1,9 +1,8 @@
 /**
  * E-INGRESS P1 (#77) — the inbound-ingest DECISION CORE.
  *
- * Ingress, like egress, is not one target; it is a decision function. `LiveKitIngressService` was the single entry
- * that took an ingress mode (RTMP_INPUT / WHIP_INPUT / URL_INPUT) and set up the right inbound path. wave-native
- * already has the BACKENDS — three orthogonal ingest surfaces — but no unifying router that picks between them:
+ * Ingress, like egress, is not one target; it is a decision function. wave-native has the BACKENDS — three orthogonal
+ * ingest surfaces — but no unifying router that picks between them:
  *
  *   • cfCallsSfu      — native WebRTC WHIP ingest, straight into the SFU (`whip.ts`). Most direct: no transcode,
  *                       no managed-ingest hop, no container we run.
@@ -44,24 +43,6 @@ export type IngestSourceKind = (typeof INGEST_SOURCE_KINDS)[number];
 
 /** The three ingest backends, most-direct → most owned-compute. */
 export type IngestBackend = "cfCallsSfu" | "cfStreamLive" | "containerBridge";
-
-/** LiveKit's ingress input modes — the thing `LiveKitIngressService` dispatched on. Kept only to MAP the legacy
- *  surface onto wave-native source kinds for E-DECOMMISSION; nothing wave-native emits these. */
-export const LIVEKIT_INGRESS_MODES = ["RTMP_INPUT", "WHIP_INPUT", "URL_INPUT"] as const;
-export type LiveKitIngressMode = (typeof LIVEKIT_INGRESS_MODES)[number];
-
-/** Map a LiveKit ingress mode → the wave-native source kind that replaces it (the epic's "map LiveKit ingress modes
- *  to the transport SSOT"). Total over the three LiveKit modes; feeds E-DECOMMISSION's cutover of the ingress tree. */
-export function mapLiveKitIngress(mode: LiveKitIngressMode): IngestSourceKind {
-  switch (mode) {
-    case "RTMP_INPUT":
-      return "rtmpPush";
-    case "WHIP_INPUT":
-      return "whip";
-    case "URL_INPUT":
-      return "urlPull";
-  }
-}
 
 /** The Plane-2 push protocol (`IngestProtocol` SSOT) a source kind hands off to the container bridge, or null when
  *  the kind is not a container-bridge push (whip → SFU, urlPull → CF Stream). Reuses the ingest-bridge enum rather

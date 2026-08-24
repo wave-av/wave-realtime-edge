@@ -70,7 +70,7 @@ describe("AgentSessionCore.openAdapters — two adapters on one DO", () => {
     const core = new AgentSessionCore(deps);
     core.bind(goodCfg);
     const { egress, ingest } = await core.openAdapters({ baseWss: "wss://rt.wave.online", egressToken: "egtok", ingestToken: "intok" });
-    expect(egress.adapterId).toBe("eg_1");
+    expect(egress?.adapterId).toBe("eg_1");
     expect(ingest.adapterId).toBe("in_1");
     const egTracks = (deps.createEgress as ReturnType<typeof vi.fn>).mock.calls[0][0];
     const inTracks = (deps.createIngest as ReturnType<typeof vi.fn>).mock.calls[0][0];

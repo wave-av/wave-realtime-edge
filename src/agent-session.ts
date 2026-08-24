@@ -8,7 +8,14 @@
  * adapters on one DO, and echo received PCM back out — to prove the media path end-to-end before STT/LLM/TTS
  * land on top. It does NOT do STT/LLM/TTS/VAD/Twilio/metering (later steps; honest TODOs link #81).
  *
- * ── THE TWO ADAPTERS, CO-EXISTENT ON ONE DO ────────────────────────────────────────────────────────────
+ * ── MEDIA-TAP FOLD (ADR #85) ───────────────────────────────────────────────────────────────────────────
+ *  When MEDIA_TAP_ENABLED is armed, the agent's media-READ is folded onto the room's single MediaTap (via
+ *  room.ts armAgentRead → agent-media-consumer.ts pumpConsumer). The EGRESS adapter (createWebsocketAdapter)
+ *  is GATED OFF — the agent consumes frames from the tap's bounded queue, not a 2nd SFU subscription. This
+ *  eliminates the duplicate subscribe (one SFU session per room, shared metering, single backpressure domain).
+ *  The INGEST adapter (createIngestAdapter) remains — the agent still publishes TTS back into the room.
+ *
+ * ── THE TWO ADAPTERS, CO-EXISTENT ON ONE DO (LEGACY — WHEN TAP IS UNARMED) ─────────────────────────────
  *  • EGRESS (subscribe): `createWebsocketAdapter` (location:"remote", outputCodec:"pcm") tells the SFU to
  *    dial OUT to our egress WS route and PUSH a participant's audio as decoded 16-bit LE PCM 48k stereo
  *    frames. We decode each frame with the PROVEN `decodePacket` (container-adapter.ts) → PCM in.
@@ -183,11 +190,15 @@ export class AgentSessionCore {
   }
 
   /**
-   * Open BOTH adapters for the bound session: egress (subscribe to the participant's PCM) + ingest (publish
+   * Open adapters for the bound session: egress (subscribe to the participant's PCM) + ingest (publish
    * the agent's PCM track). This is the "two adapters co-exist on one DO" proof. Returns the two adapter
    * results. Must be bound first. The actual SFU dial-back / socket connect is the injected media seam.
+   *
+   * When `mediaTapArmed` is true (MEDIA_TAP_ENABLED), the egress adapter is GATED OFF — the agent consumes
+   * frames from the room's MediaTap instead of a 2nd SFU subscription. The ingest adapter is always created
+   * (the agent still publishes TTS back into the room).
    */
-  async openAdapters(endpoints: AgentEndpoints): Promise<{ egress: CreateAdapterResult; ingest: CreateIngestAdapterResult }> {
+  async openAdapters(endpoints: AgentEndpoints, mediaTapArmed = false): Promise<{ egress: CreateAdapterResult | null; ingest: CreateIngestAdapterResult }> {
     const c = this.requireBound();
     if (!/^wss:\/\//.test(endpoints.baseWss || "")) {
       throw new AgentSessionError("BAD_ENDPOINT", "baseWss must be a wss:// URL", 400);
@@ -195,24 +206,35 @@ export class AgentSessionCore {
     // Per-endpoint capability tokens — egress binds the PARTICIPANT track, ingest binds the AGENT track, so
     // they MUST differ (each route verifies the token against its own trackName segment). A missing/mismatched
     // token makes the SFU's WS dial-in 401 → CF reports websocket_handshake_failed → "returned 503".
-    const egTokenQs = endpoints.egressToken ? `?t=${encodeURIComponent(endpoints.egressToken)}` : "";
     const inTokenQs = endpoints.ingestToken ? `?t=${encodeURIComponent(endpoints.ingestToken)}` : "";
-    const egressEndpoint =
-      `${endpoints.baseWss.replace(/\/+$/, "")}/v1/realtime/agents/egress/` +
-      `${encodeURIComponent(c.org)}/${encodeURIComponent(c.roomId)}/${encodeURIComponent(c.participantSessionId)}/${encodeURIComponent(c.participantTrackName)}${egTokenQs}`;
     const ingestEndpoint =
       `${endpoints.baseWss.replace(/\/+$/, "")}/v1/realtime/agents/ingest/` +
       `${encodeURIComponent(c.org)}/${encodeURIComponent(c.roomId)}/${encodeURIComponent(c.participantSessionId)}/${encodeURIComponent(c.agentTrackName!)}${inTokenQs}`;
 
-    this.egress = await this.deps.createEgress([
-      { location: "remote", sessionId: c.participantSessionId, trackName: c.participantTrackName, endpoint: egressEndpoint, outputCodec: "pcm" },
-    ]);
+    // ── MEDIA-TAP FOLD: gate the egress adapter when the tap is armed ──────────────────────────────────
+    // When MEDIA_TAP_ENABLED, the agent reads frames from the room's MediaTap (armAgentRead → pumpConsumer),
+    // NOT from its own egress WS subscription. This eliminates the duplicate SFU subscribe: one session per
+    // room, shared metering, single backpressure domain. The egress adapter is skipped entirely.
+    if (!mediaTapArmed) {
+      const egTokenQs = endpoints.egressToken ? `?t=${encodeURIComponent(endpoints.egressToken)}` : "";
+      const egressEndpoint =
+        `${endpoints.baseWss.replace(/\/+$/, "")}/v1/realtime/agents/egress/` +
+        `${encodeURIComponent(c.org)}/${encodeURIComponent(c.roomId)}/${encodeURIComponent(c.participantSessionId)}/${encodeURIComponent(c.participantTrackName)}${egTokenQs}`;
+      this.egress = await this.deps.createEgress([
+        { location: "remote", sessionId: c.participantSessionId, trackName: c.participantTrackName, endpoint: egressEndpoint, outputCodec: "pcm" },
+      ]);
+    } else {
+      // Tap armed: no egress SFU subscription — the agent reads from the tap's bounded queue.
+      this.egress = null;
+    }
     this.ingest = await this.deps.createIngest([
       { location: "local", sessionId: c.participantSessionId, trackName: c.agentTrackName!, endpoint: ingestEndpoint, inputCodec: "pcm", mode: "buffer" },
     ]);
     this.deps.log("agent-adapters-open", {
       org: c.org, room: c.roomId, agentId: c.agentId,
-      egressAdapterId: this.egress.adapterId, ingestAdapterId: this.ingest.adapterId,
+      egressAdapterId: this.egress?.adapterId ?? null,
+      ingestAdapterId: this.ingest.adapterId,
+      tapFold: mediaTapArmed,
       // The SESSION the agent track was actually published on (CF's own, NOT the participant's) — consumers pull
       // agentTrackName from here. Logged so the mismatch is visible (#29). Falls back to participant if absent.
       agentSessionId: this.ingest.publishedSessionId ?? c.participantSessionId,
@@ -297,6 +319,10 @@ export interface AgentSessionEnv {
   CF_CALLS_APP_SECRET?: string; // CF Realtime SFU app bearer — never logged/returned
   WAVE_INTERNAL_SECRET?: string; // capability-token key for the egress/ingest WS dial-in
   AGENT_PUBLIC_WSS?: string; // our public wss base the SFU dials back to (default rt.wave.online)
+  /** MEDIA-TAP FOLD (ADR #85): when "true"/"1", the agent reads from the room's MediaTap (in-process) instead
+   *  of its own egress WS subscription. Gates the createWebsocketAdapter call (no 2nd SFU subscribe). The
+   *  ingest adapter is always created (agent still publishes TTS back). Default OFF (legacy path). */
+  MEDIA_TAP_ENABLED?: string | boolean;
   /** Send-side ingest framing override; "packet" (default, modeled) | "raw" (the live spike may select). */
   AGENT_INGEST_FRAMING?: IngestFraming;
   /** flow-tap (signal-flow E1): when "true"/"1", emit the observer transition records on the voice-agent flow. */
@@ -369,7 +395,15 @@ export class AgentSessionDO {
     const path = new URL(request.url).pathname.replace(/^\/+/, "");
     // The agent egress WS route forwards each decoded frame here as a raw binary POST. Fail-open: always
     // 204, never throws (a recording/echo error must not affect the live media the SFU is also pushing).
+    // ── MEDIA-TAP FOLD: when MEDIA_TAP_ENABLED, the agent reads from the tap, not the egress WS. The
+    // echo-frame path is inert — frames arrive via room.ts armAgentRead → pumpConsumer instead. ──
     if (path === "echo-frame" && request.method === "POST") {
+      // Tap fold: when armed, the agent reads from the MediaTap (in-process), not from the egress WS.
+      // The echo-frame POST is a no-op — the old duplicate-subscribe path is gated off.
+      const tapArmed = this.env.MEDIA_TAP_ENABLED === "true" || this.env.MEDIA_TAP_ENABLED === "1" || this.env.MEDIA_TAP_ENABLED === true;
+      if (tapArmed) {
+        return new Response(null, { status: 204 });
+      }
       try {
         // MUTED (voice-control-deck E1): drop the egress audio entirely — no STT, no turn, no FFT. The agent
         // listens again only on unmute. Fail-closed: nothing leaks while muted.
@@ -540,9 +574,6 @@ export class AgentSessionDO {
         // x-wave-internal). Egress binds the participant track; ingest binds the agent track. Without these
         // the SFU handshake 401s → CF returns "create websocket adapter returned 503" (the live-spike bug).
         const secret = this.env.WAVE_INTERNAL_SECRET;
-        const egressToken = secret
-          ? await mintRecorderToken(secret, bound.org, bound.participantSessionId, bound.participantTrackName)
-          : undefined;
         const ingestToken = secret
           ? await mintRecorderToken(secret, bound.org, bound.participantSessionId, bound.agentTrackName!)
           : undefined;
@@ -564,15 +595,18 @@ export class AgentSessionDO {
           : undefined;
         // Headless: a non-browser client (CLI / on-prem / cloud) drives the turn over the audio-in + TTS WS,
         // so the SFU adapters are SKIPPED (no real SFU session). The browser path still opens them.
+        const mediaTapArmed = this.env.MEDIA_TAP_ENABLED === "true" || this.env.MEDIA_TAP_ENABLED === "1" || this.env.MEDIA_TAP_ENABLED === true;
+        // ── MEDIA-TAP FOLD: when tap is armed, the egress adapter is gated off — the agent reads from the
+        // room's MediaTap instead of a 2nd SFU subscription. The ingest adapter is always created. ──
         const adapters = bound.headless
-          ? { egress: undefined, ingest: undefined }
-          : await this.core.openAdapters({ baseWss, egressToken, ingestToken });
+          ? { egress: null, ingest: undefined as unknown as CreateIngestAdapterResult }
+          : await this.core.openAdapters({ baseWss, ingestToken, egressToken: mediaTapArmed ? undefined : (secret ? await mintRecorderToken(secret, bound.org, bound.participantSessionId, bound.participantTrackName) : undefined) }, mediaTapArmed);
         await this.armTurnTaking(bound); // step 3: arm the turn core for this binding (replaces echo on frames)
         return Response.json(
           {
             ok: true,
             bound,
-            egressAdapterId: adapters.egress?.adapterId,
+            egressAdapterId: adapters.egress?.adapterId ?? null,
             ingestAdapterId: adapters.ingest?.adapterId,
             // The session the agent track is published on (CF's own, returned by the ingest adapter) — a consumer
             // (the room participant / harness) pulls `agentTrackName` from HERE, not participantSessionId (#29).
@@ -582,6 +616,8 @@ export class AgentSessionDO {
             ttsEndpoint,
             // The audio-IN endpoint a NON-browser client dials to STREAM the participant's PCM (headless mic).
             audioInEndpoint,
+            // The media-tap fold status — true when the agent reads from the tap (no egress SFU subscription).
+            tapFold: mediaTapArmed,
           },
           { status: 200 },
         );

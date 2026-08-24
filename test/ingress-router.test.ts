@@ -1,17 +1,14 @@
 // E-INGRESS P1 (#77) — the inbound-ingest decision core. Proves the epic's hard-gate: the router picks the CHEAPEST
 // CAPABLE ingest plane first (native WHIP → managed CF Stream → self-hosted container), escalates only on need
-// (RIST/MoQ, which CF Stream can't carry), honors a cost ceiling, maps LiveKit ingress modes onto wave-native source
-// kinds, flags the URL-pull path as SSRF-guard-required, and rejects a malformed job with a reason (never a silent
-// default). Pure engine, no env / clock / network.
+// (RIST/MoQ, which CF Stream can't carry), honors a cost ceiling, flags the URL-pull path as SSRF-guard-required,
+// and rejects a malformed job with a reason (never a silent default). Pure engine, no env / clock / network.
 import { describe, it, expect } from "vitest";
 import {
   ingressRoute,
   validateIngestJob,
-  mapLiveKitIngress,
   pushProtocolOf,
   INGEST_ROUTING_TABLE,
   INGEST_SOURCE_KINDS,
-  LIVEKIT_INGRESS_MODES,
   type IngestJob,
   type IngestSourceKind,
 } from "../src/ingress-router.js";
@@ -84,17 +81,6 @@ describe("ingressRoute — cost ceiling (maxCostRank)", () => {
 
   it("an RTMP push capped at rank 0 (WHIP-only) is rejected — managed ingest is above the ceiling", () => {
     expect(ingressRoute(job("rtmpPush", { maxCostRank: 0 })).ok).toBe(false);
-  });
-});
-
-describe("mapLiveKitIngress — legacy ingress modes → wave-native source kinds (E-DECOMMISSION cutover)", () => {
-  it("maps the three LiveKit modes and every mapped kind is routable", () => {
-    expect(mapLiveKitIngress("RTMP_INPUT")).toBe("rtmpPush");
-    expect(mapLiveKitIngress("WHIP_INPUT")).toBe("whip");
-    expect(mapLiveKitIngress("URL_INPUT")).toBe("urlPull");
-    for (const mode of LIVEKIT_INGRESS_MODES) {
-      expect(ingressRoute(job(mapLiveKitIngress(mode))).ok).toBe(true);
-    }
   });
 });
 
