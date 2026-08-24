@@ -113,12 +113,21 @@ export async function toolCatalogFromGateway(
   env: { WAVE_GATEWAY_BASE?: string; WAVE_GATEWAY_TOKEN?: string },
   fetchImpl: (input: string, init?: RequestInit) => Promise<Response> = fetch,
 ): Promise<ToolAllowlist | null> {
-  const base = env.WAVE_GATEWAY_BASE?.replace(/\/+$/, "");
+  let base = String(env.WAVE_GATEWAY_BASE ?? "");
+  while (base.endsWith("/") && base !== "https://" && base !== "http://") base = base.slice(0, -1);
   const token = env.WAVE_GATEWAY_TOKEN;
   if (!base || !token) return null;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 2_000);
   try {
-    const res = await fetchImpl(`${base}/v1/internal/tools`, { headers: { authorization: `Bearer ${token}` } });
-    if (!res.ok) return null;
+    const res = await fetchImpl(`${base}/v1/internal/tools`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: ac.signal,
+    });
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {});
+      return null;
+    }
     const body = (await res.json().catch(() => ({}))) as { tools?: unknown };
     if (!Array.isArray(body.tools)) return null;
     const defs = body.tools
@@ -134,6 +143,8 @@ export async function toolCatalogFromGateway(
     return new ToolAllowlist(defs);
   } catch {
     return null; // a catalog fetch must never break arming — fall back to the env
+  } finally {
+    clearTimeout(timer);
   }
 }
 
