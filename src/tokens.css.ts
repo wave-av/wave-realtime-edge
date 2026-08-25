@@ -4,5 +4,5 @@
 // are the SAME color for the SAME product — one registry, no drift.
 export const ACCENT_OKLCH = "oklch(0.72 0.18 30)";
 export const ACCENT_HEX = "#ff715d";
-export const TOKENS_CSS = `:root{--bg:#0b0f14;--fg:#cfe3f7;--dim:#5b7287;--acc:${ACCENT_OKLCH};--warn:#e6b450}
+export const TOKENS_CSS = `:root{--bg:#0b0f14;--fg:#cfe3f7;--dim:#7b93aa;--acc:${ACCENT_OKLCH};--warn:#e6b450}
 ::selection{background:var(--acc);color:var(--bg)}`;
