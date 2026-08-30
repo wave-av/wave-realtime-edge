@@ -48,7 +48,23 @@ export interface TurnRunContext {
   executeTools(toolUses: ToolUse[]): Promise<ToolResult[]>;
 }
 
-/** The turn loop. Sets ctx.state flags; mutates ctx.messages via commitSpoken. */
+/**
+ * Run ONE turn for a final user transcript — the BOUNDED AGENTIC TOOL LOOP (step 5):
+ * Run ONE turn for a final user transcript — the BOUNDED AGENTIC TOOL LOOP (step 5):
+ * complete(history, tools) → if the model emitted tool_use blocks: execute each (allowlist-gated), append the
+ * assistant(tool_use) + user(tool_result) pair to the working history (strict Anthropic shapes), re-call.
+ * Repeat until the model returns TEXT with no tool_use OR a HARD max-iterations cap (anti-runaway). Then the
+ * final assistant TEXT → ElevenLabs TTS → publish PCM out (the step-3/4 path, unchanged).
+ * 
+ * History correctness + atomicity: the user message and every assistant/tool pair accumulate in a LOCAL working
+ * list; `this.messages` is committed ATOMICALLY (one splice) ONLY on a successful, non-aborted final reply — so an
+ * aborted / empty / failed turn leaves NO dangling user (or half-applied tool) messages and the strict
+ * user/assistant alternation Claude requires is preserved across tool turns. `aborted` (barge-in) is honored at
+ * EVERY await — the LLM stream, between iterations, DURING tool execution, and the TTS publish.
+ * /
+ * The turn loop. Sets ctx.state flags; mutates ctx.messages via commitSpoken (atomic splice via
+ * ctx.commitSpoken only on a successful, non-aborted final reply).
+ */
 export async function runAgentTurn(ctx: TurnRunContext, userText: string): Promise<void> {
 
   ctx.state.turnInFlight = true;
