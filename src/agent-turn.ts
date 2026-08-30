@@ -79,88 +79,20 @@ import { streamingTranscribe } from "./agent-stt-streaming.js";
 
 // ── Public contracts (the injectable-deps seam) ──────────────────────────────────────────────────────────────
 
-/** One STT result for the accumulated PCM. `isFinal` = end-of-user-turn (the v1 endpointing signal). */
-export interface SttResult {
-  isFinal: boolean;
-  /** The (partial or final) transcript text. Empty string = silence/no speech. */
-  transcript: string;
-}
-
-/**
- * One LLM chat message — the gateway/Claude message shape (system + alternating user/assistant). `content` is a
- * plain string for the common case, OR an Anthropic content-block array for the tool turns (an assistant message
- * carrying `tool_use` blocks, and the matching `user` message carrying `tool_result` blocks). The strict
- * user/assistant alternation Claude requires is preserved across tool turns by the bounded loop in runTurn.
- */
-export interface LlmMessage {
-  role: "system" | "user" | "assistant";
-  content: string | Array<Record<string, unknown>>;
-}
-
-/**
- * The turn-taking deps seam — extends the media seam with the three step-3 externals. ALL fakeable: the live DO
- * wires them to real STT / WAVE-gateway / ElevenLabs in `buildTurnDeps()`; unit tests pass fakes (no network).
- */
-export interface AgentTurnDeps {
-  /**
-   * STT: feed the PCM accumulated since the last final; resolve a partial or FINAL transcript. Streaming impls
-   * may ignore the buffer and read their own socket — the buffer is the simple, provider-agnostic v1 contract.
-   * Fail-safe: a throw is caught by the core (logged stage="stt", turn aborted).
-   */
-  transcribe(pcm: Uint8Array): Promise<SttResult>;
-  /**
-   * LLM via the WAVE gateway (Claude Opus/Sonnet, ALWAYS). Streams a DISCRIMINATED UNION of events given the full
-   * message history (system + alternating user/assistant) AND the allowlisted tool definitions to offer the model:
-   *   • { type:"text", text }                — an assistant text delta (streamed to TTS, exactly as step 3/4).
-   *   • { type:"tool_use", id, name, input } — a COMPLETED tool_use block (Anthropic), to be executed mid-turn.
-   * An async generator so text streams to TTS incrementally and is cancellable on barge-in (step 4). The `tools`
-   * arg is the agent-least-privilege allowlist (step 5) — only these are ever advertised to the model. Fail-safe:
-   * a throw is caught by the core (logged stage="llm").
-   */
-  complete(messages: LlmMessage[], tools: ToolDefinition[]): AsyncIterable<CompletionEvent>;
-  /**
-   * Execute ONE allowlisted tool via the WAVE gateway / MCP (step 5). The core only ever calls this AFTER its
-   * allowlist check passes (agent-least-privilege). Returns the stringified tool result. Fail-safe: a throw is
-   * caught by the core (logged stage="tool", turned into an is_error tool_result; the turn is abandoned cleanly).
-   * Secrets/PII in `input` are NEVER logged verbatim (the core logs name + a redacted size summary only).
-   */
-  callTool(name: string, input: unknown): Promise<string>;
-  /**
-   * TTS = ElevenLabs streaming → pcm_48000 chunks (16-bit LE, 48 kHz — matches the ingest path, zero transcode).
-   * An async generator so audio streams out as it's synthesized. Fail-safe: a throw is caught (logged stage="tts").
-   */
-  synthesize(text: string): AsyncIterable<Uint8Array>;
-  /**
-   * Step-7 METERING: emit one completed turn's `voice_agent_minutes` usage to the gateway. Fire-and-forget +
-   * FAIL-OPEN — a metering error NEVER breaks the turn or drops media (the live impl swallows + logs). The core
-   * awaits it inside a try/catch so even a thrown emit can't propagate up the media path. Live impl in
-   * `buildTurnDeps` mirrors src/metering.ts (POST /v1/internal/usage, service token); tests pass a fake.
-   */
-  emitMeter(usage: VoiceTurnUsage): Promise<void>;
-  flowTap?: boolean;
-}
-
-/** Config to run a turn-taking session for one room/participant (superset of the bind config + the persona). */
-export interface TurnTakingConfig {
-  roomId: string;
-  org: string;
-  agentId: string;
-  participantSessionId: string;
-  participantTrackName: string;
-  /** The agent persona / system prompt. Falls back to a sensible default when unset. */
-  systemPrompt?: string;
-}
-
-/** The default agent persona when none is configured (honest, generic — a real persona is set per-agent). */
-export { DEFAULT_SYSTEM_PROMPT, buildTurnSystemPrompt, normalizeGatewayEnv };
-
-import {
-  DEFAULT_MAX_TOOL_ITERATIONS,
-  DEFAULT_TTS_LEAD_MS,
-  ttsLeadMsFromEnv,
-  MAX_UTTERANCE_BYTES,
-} from "./turn-config.js";
-export { DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_TTS_LEAD_MS, ttsLeadMsFromEnv, MAX_UTTERANCE_BYTES };
+import { runAgentTurn } from "./agent-turn-run.js";
+import { DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_TTS_LEAD_MS, ttsLeadMsFromEnv, MAX_UTTERANCE_BYTES } from "./turn-config.js";
+import type { SttResult, LlmMessage, AgentTurnDeps, TurnTakingConfig } from "./agent-turn-types.js";
+export type {
+  SttResult, LlmMessage, AgentTurnDeps, TurnTakingConfig,
+} from "./agent-turn-types.js";
+export type { ToolDefinition, ToolUse, ToolResult, CompletionEvent } from "./agent-tools.js";
+export { ToolAllowlist } from "./agent-tools.js";
+export { DEFAULT_VOICE_LLM_MODEL, ELEVENLABS_OUTPUT_FORMAT } from "./agent-turn-providers.js";
+export type { AgentTurnEnv } from "./agent-turn-env.js";
+export { buildTurnDeps } from "./agent-turn-env.js";
+export { DEFAULT_SYSTEM_PROMPT, buildTurnSystemPrompt, normalizeGatewayEnv } from "./agent-turn-providers.js";
+export { toolAllowlistFromEnv } from "./agent-tools.js";
+export { DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_TTS_LEAD_MS, ttsLeadMsFromEnv, MAX_UTTERANCE_BYTES } from "./turn-config.js";
 
 /**
  * Stop words that mute the agent (voice-control-deck E1.P1): the transcript matching one of these mutes
@@ -168,12 +100,20 @@ export { DEFAULT_MAX_TOOL_ITERATIONS, DEFAULT_TTS_LEAD_MS, ttsLeadMsFromEnv, MAX
  */
 const STOP_WORDS = new Set(["mute", "stop", "stop listening", "shut up", "turn off the mic", "be quiet"]);
 
-/**
- * TurnTakingCore — the pure, testable turn state machine for one agent session. Accumulates participant PCM,
- * runs STT → (on final) LLM via the gateway → ElevenLabs TTS → publishes PCM out the ingest socket. Holds the
- * conversation history. Persists nothing itself (the DO wrapper owns DO storage). Every stage is fail-safe: an
- * error is logged via the injected `log` and the turn is abandoned — it is NEVER thrown up the media path.
- */
+/** Concatenate PCM chunks into one buffer (the utterance drain path). */
+function concat(chunks: Uint8Array[]): Uint8Array {
+  if (chunks.length === 1) return chunks[0];
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.length;
+  }
+  return out;
+}
+
 export class TurnTakingCore {
   private readonly deps: AgentTurnDeps & AgentMediaDeps;
   private readonly config: TurnTakingConfig;
@@ -192,7 +132,7 @@ export class TurnTakingCore {
   /** Echo-mute window end (ms) — frames are dropped until this wall-clock (the "agent hears itself" backstop). */
   private echoMuteUntil = 0;
   /** Echo-mute grace after a turn (ms) — the reverberation tail before the next STT. Env AGENT_ECHO_MUTE_MS. */
-  private readonly echoMuteMs: number;
+  private echoMuteMs: number; // settable via TurnRunContext.state (the loop mutes echo during TTS)
   /** Set by the step-4 interrupt controller (onUserSpeech / VAD barge-in) to cancel an in-flight turn. */
   private aborted = false;
   /** Step-4 VAD: detects user speech ONSET on every frame → drives true barge-in while the agent talks. */
@@ -331,165 +271,41 @@ export class TurnTakingCore {
    * EVERY await — the LLM stream, between iterations, DURING tool execution, and the TTS publish.
    */
   private async runTurn(userText: string): Promise<void> {
-    this.turnInFlight = true;
-    this.aborted = false;
-    this.committed = false;
-    this.framesThisTurn = 0;
-    const turnId = `t${this.turnSeq++}`;
-    // The user's final utterance was just consumed. MARK the VAD as speaking (NOT reset-to-silence): the audio that
-    // produced this turn's transcript is often still arriving (network/jitter-buffer lag, the utterance tail), and a
-    // reset-to-silence would re-onset on that same-utterance audio and FALSE-barge-in the agent before it utters a
-    // word. Holding "speaking" makes the trailing audio steady-speech (no event); a REAL barge-in must be a fresh
-    // speech-start, which the VAD only emits after a silence (speech-end) — the user genuinely stops, then speaks
-    // over the agent. (#27: this self-barge-in was why agent-turn-interrupt fired on every live turn → 0 RTP out.)
-    this.vad.markSpeaking();
-    const startMs = this.deps.now();
-    let stage = "llm";
-    // E0-P2: the turn's speech session, hoisted so the `finally` COGS emit below can read its counters on EVERY
-    // exit. The abandoned exits (barge-in, mid-stream error, empty reply, tool cap, unexpected tool_use) are
-    // exactly the turns that WASTE, so a receipt skipped there would structurally zero the wastage term.
-    let turnSpeech: SpeechSession | undefined;
-    let metered = false;
-    try {
-      const userMsg: LlmMessage = { role: "user", content: userText };
-      // The working history for THIS turn (committed state + this turn's user/assistant/tool messages). Nothing is
-      // pushed to this.messages until the final atomic commit below.
-      const working: LlmMessage[] = [...this.messages, userMsg];
-      const toolDefs = this.tools.definitions();
-      let toolsUsed = 0;
-
-      // D1: speak sentences AS THEY ARRIVE (see speakStreaming) instead of after the stream completes — but ONLY
-      // when no tool is advertised, because a tool_use block can arrive AFTER text in the same stream and
-      // `assistantToolUseMessage` carries tool_use blocks only. Speaking a preamble we then cannot commit would
-      // desync history from what the listener actually heard, which is worse than the latency. TODO(#81 D1
-      // follow-up): teach assistantToolUseMessage to carry the leading text block, then drop this condition.
-      const eager = toolDefs.length === 0;
-
-      // ── the bounded agentic loop ──────────────────────────────────────────────────────────────────────────
-      for (let iter = 0; ; iter++) {
-        stage = "llm";
-        // Stream this iteration: collect text (only the FINAL no-tool iteration's text is spoken) + tool_use blocks.
-        let assistant = "";
-        const toolUses: ToolUse[] = [];
-        if (eager) {
-          // ── D1 sentence-streaming path (the ONLY iteration — no tools are advertised, so there is no loop) ──
-          const speech = (turnSpeech = this.openSpeech());
-          const acc: StreamSpeakAcc = { assistant: "", spoken: "", toolUses: [], aborted: false };
-          const chunker = new SentenceChunker();
-          try {
-            await streamSpeakSentences(this.deps.complete([...working], toolDefs), speech, chunker, acc, () => this.aborted, () => { if (this.currentMarks) this.currentMarks.llmFirstTokenMs = this.deps.now(); }, () => { if (this.currentMarks) this.currentMarks.ttsFirstAudioMs = this.deps.now(); });
-          } catch (e) {
-            // HONEST FAILURE (#344 semantics): the turn FAILED, but audio already on the wire cannot be unheard.
-            // Commit exactly what was spoken so the next turn's history matches what the listener heard, then
-            // rethrow so the outer catch marks the turn failed (agent-turn-error) — never a silent success.
-            // `errorStage` tells WHICH lane died: a synthesize/send throw is a TTS failure, not an LLM one, and
-            // must be logged as such or production debugging chases the wrong upstream.
-            if (acc.errorStage === "tts") stage = "tts";
-            this.commitSpoken(working, acc.spoken, acc.errorStage === "tts" ? "tts-error" : "llm-error");
-            throw e;
-          }
-          if (acc.aborted || this.aborted) {
-            this.commitSpoken(working, acc.spoken, "barge-in"); // same rule for barge-in: heard ⇒ remembered
-            return;
-          }
-          if (acc.toolUses.length > 0) {
-            // FAIL-CLOSED (D1 scope guard): eager mode is entered ONLY with no tools advertised, so a tool_use
-            // here means the provider mis-behaved. streamSpeakSentences already stopped speaking at the first
-            // tool_use; committing acc.assistant as a plain reply (or speaking the tail) would desync history
-            // from tool semantics AND from what was heard. Acknowledge only the spoken prefix and abandon.
-            this.deps.log("agent-turn-unexpected-tool-use", { ...this.idFields(), toolUses: acc.toolUses.length });
-            this.commitSpoken(working, acc.spoken, "unexpected-tool-use");
-            return;
-          }
-          const assistant = acc.assistant.trim();
-          if (assistant.length === 0) {
-            this.deps.log("agent-turn-empty-llm", this.idFields());
-            return; // nothing to say + nothing to commit → clean abandon (no dangling user)
-          }
-          working.push({ role: "assistant", content: assistant });
-          // Commit the WHOLE turn atomically at STREAM END (one splice) — exactly as the non-eager path does, and
-          // still BEFORE the final speak() below.
-          this.messages.push(...working.slice(this.messages.length));
-          this.committed = true;
-          stage = "tts";
-          const tail = chunker.flush(); // the trailing partial sentence the boundary policy held back
-          if (tail.length > 0 && (await speech.speak(tail, () => { if (this.currentMarks) this.currentMarks.ttsFirstAudioMs = this.deps.now(); })) < 0) return; // aborted mid-tail: history already valid
-          metered = true;
-          await this.logMeter(userText, assistant, toolsUsed, turnId, startMs, speech);
-          return;
-        }
-        for await (const evt of this.deps.complete([...working], toolDefs)) {
-          if (this.aborted) break; // step-4 barge-in: cancel the in-flight stream
-          if (evt.type === "text") assistant += evt.text;
-          else toolUses.push({ id: evt.id, name: evt.name, input: evt.input });
-        }
-        if (this.aborted) return;
-
-        // No tool calls → this is the final assistant turn. Speak it.
-        if (toolUses.length === 0) {
-          assistant = assistant.trim();
-          if (assistant.length === 0) {
-            this.deps.log("agent-turn-empty-llm", this.idFields());
-            return; // nothing to say + nothing to commit → clean abandon (no dangling user)
-          }
-          working.push({ role: "assistant", content: assistant });
-          // Commit the WHOLE turn atomically (user + every assistant/tool message produced this turn).
-          this.messages.push(...working.slice(this.messages.length));
-          this.committed = true;
-          stage = "tts";
-          const speech = (turnSpeech = this.openSpeech());
-          const pcmBytesOut = await speech.speak(assistant, () => { if (this.currentMarks) this.currentMarks.ttsFirstAudioMs = this.deps.now(); });
-          if (pcmBytesOut < 0) return; // aborted mid-TTS (already committed history is valid + alternating)
-          metered = true;
-          await this.logMeter(userText, assistant, toolsUsed, turnId, startMs, speech);
-          return;
-        }
-
-        // The model wants to use tools. Stop at the hard cap (anti-runaway) — DON'T execute another round.
-        if (iter >= this.maxToolIterations) {
-          this.deps.log("agent-turn-tool-cap", { ...this.idFields(), maxToolIterations: this.maxToolIterations });
-          return; // abandon cleanly — no commit (no partial tool turn leaks into committed history)
-        }
-
-        // Append the assistant(tool_use) message verbatim (history must replay the model's tool_use blocks), then
-        // execute each requested tool (allowlist-gated) and append the matching user(tool_result) message.
-        working.push(assistantToolUseMessage(toolUses) as LlmMessage);
-        stage = "tool";
-        const results = await this.executeTools(toolUses);
-        if (this.aborted) return; // barge-in DURING tool execution → abandon (nothing committed)
-        toolsUsed += results.length;
-        working.push(userToolResultMessage(results) as LlmMessage);
-        // loop: re-call the LLM with the tool_result(s) in history
-      }
-    } catch (e) {
-      this.deps.log("agent-turn-error", { stage, ...this.idFields(), message: (e as Error)?.message ?? "unknown" });
-    } finally {
-      this.turnInFlight = false;
-      // ECHO MUTE: discard the audio accumulated during the turn (the agent's own TTS picked up by the mic) +
-      // hold a short grace so the reverberation tail isn't transcribed as the next user turn. This is the code-
-      // level backstop; real deployments add AEC (WebRTC AEC3) on the client for the full fix.
-      this.resetUtterance();
-      this.echoMuteUntil = this.deps.now() + this.echoMuteMs;
-      // E0-P2: EVERY turn closes the ledger exactly once. A turn that died before the clean-completion meter
-      // still SUBMITTED characters the vendor bills, so it still gets a COGS receipt (log-only, never a billable
-      // emit). Without this, no emitted row could ever carry abortedSpeaks > 0 and the barge-in wastage term
-      // would be structurally ~0 in production: the aborted turns are exactly the ones that waste.
-      if (!metered) {
-        const { org, roomId: room, agentId } = this.config;
-        const who = { org, room, agentId, ledger: this.cogs, rates: this.cogsRates };
-        meterAbandonedTurn(this.deps, this.idFields(), who, { turnId, startMs, speech: turnSpeech });
-      }
-      // E1 harness: record this turn's hop marks. Every 30 turns, log the p50/p95 distribution (the
-      // Done-check names it) so the numbers land in the agent-turn logs without any extra plumbing.
-      if (this.currentMarks) {
-        this.latency.record(this.currentMarks);
-        this.deps.log("agent-turn-hop", { ...this.idFields(), ...this.currentMarks });
-        if (this.latency.count() % 30 === 0) {
-          this.deps.log("agent-turn-latency", { ...this.idFields(), distribution: this.latency.distribution() });
-        }
-        this.currentMarks = undefined;
-      }
-    }
+    // The turn LOOP lives in agent-turn-run.ts (token-budget decompose, 2026-08-30): the loop is the
+    // use case, the class is the session state machine, and TurnRunContext is the honest contract
+    // between them — every field a thing the loop needs from the session, named, instead of
+    // seventeen this.* captures. Moved verbatim; this delegation owns the mutable state mapping.
+    const outer = this;
+    await runAgentTurn(
+      {
+        deps: this.deps,
+        config: this.config,
+        messages: this.messages,
+        tools: this.tools,
+        vad: this.vad,
+        latency: this.latency,
+        cogs: this.cogs,
+        cogsRates: this.cogsRates,
+        state: {
+          get turnInFlight() { return outer.turnInFlight; }, set turnInFlight(v) { outer.turnInFlight = v; },
+          get aborted() { return outer.aborted; }, set aborted(v) { outer.aborted = v; },
+          get committed() { return outer.committed; }, set committed(v) { outer.committed = v; },
+          get framesThisTurn() { return outer.framesThisTurn; }, set framesThisTurn(v) { outer.framesThisTurn = v; },
+          get turnSeq() { return outer.turnSeq; }, set turnSeq(v) { outer.turnSeq = v; },
+          get echoMuteMs() { return outer.echoMuteMs; }, set echoMuteMs(v) { outer.echoMuteMs = v; },
+          get echoMuteUntil() { return outer.echoMuteUntil; }, set echoMuteUntil(v) { outer.echoMuteUntil = v; },
+        },
+        maxToolIterations: this.maxToolIterations,
+        currentMarks: this.currentMarks,
+        idFields: () => this.idFields(),
+        openSpeech: () => this.openSpeech(),
+        commitSpoken: (w, s, r) => this.commitSpoken(w, s, r),
+        logMeter: (u, a, t, i, s, sp) => this.logMeter(u, a, t, i, s, sp),
+        resetUtterance: () => this.resetUtterance(),
+        executeTools: (uses) => this.executeTools(uses),
+      },
+      userText,
+    );
   }
 
   /** E1 Task 7: the accumulated per-hop latency distribution (p50/p95 over the recorded turns). */
@@ -645,151 +461,3 @@ export class TurnTakingCore {
 }
 
 /** Concatenate PCM chunks into one buffer (the accumulated utterance handed to STT). */
-function concat(chunks: Uint8Array[]): Uint8Array {
-  if (chunks.length === 1) return chunks[0];
-  let total = 0;
-  for (const c of chunks) total += c.length;
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) {
-    out.set(c, off);
-    off += c.length;
-  }
-  return out;
-}
-
-// ── Live deps wiring (env → real STT / WAVE-gateway / ElevenLabs). Creds referenced, NEVER logged/returned. ──
-
-/**
- * Env the turn-taking LIVE deps read. All step-3 creds are added here as HONEST names — real values come from
- * Doppler at deploy. INERT until provisioned: a missing cred fails its stage CLOSED (logged, turn abandoned),
- * it never crashes the DO. Extends AgentSessionEnv so the DO env is one shape.
- */
-export interface AgentTurnEnv extends AgentSessionEnv, VadEnv, VoiceMeterEnv, VoiceCogsRatesEnv {
-  /** WAVE gateway origin for the LLM proxy (var; not a secret). e.g. https://api.wave.online */
-  WAVE_GATEWAY_BASE?: string;
-  /** Internal service-to-service bearer for the gateway LLM proxy (secret; deploy-time, never logged). */
-  WAVE_GATEWAY_TOKEN?: string;
-  /** Claude model id routed through the gateway (Opus/Sonnet per design). Defaults to a sensible Sonnet. */
-  VOICE_AGENT_LLM_MODEL?: string;
-  /** LLM backend routed through the gateway (`x-wave-inference-backend`, agent-spokes.ts:286). Defaults
-   *  "anthropic"; "ollama"|"runpod"|"openrouter"|"ssd-stream" route to an OpenAI-compatible GPU plane. */
-  VOICE_AGENT_LLM_BACKEND?: string;
-  /** LLM proxy path on the gateway (var). Default /v1/internal/messages (the service-token-gated internal route). */
-  VOICE_AGENT_LLM_PATH?: string;
-  /** ElevenLabs API key (secret; server-side ONLY, never client, never logged). */
-  ELEVENLABS_API_KEY?: string;
-  /** ElevenLabs voice id for the agent persona (var). */
-  ELEVENLABS_VOICE_ID?: string;
-  /** ElevenLabs optimize_streaming_latency (0-4): higher = lower first-audio latency, lower quality. Default 3. */
-  VOICE_AGENT_TTS_LATENCY?: string;
-  /**
-   * STT gateway base (var). The WAVE transcribe spoke is reached THROUGH the gateway (metering-governed).
-   * Defaults to WAVE_GATEWAY_BASE when unset (one gateway origin serves both LLM + STT). e.g. https://api.wave.online
-   */
-  VOICE_AGENT_STT_BASE?: string;
-  /** STT gateway internal service Bearer (secret; never logged). Defaults to WAVE_GATEWAY_TOKEN when unset. */
-  VOICE_AGENT_STT_TOKEN?: string;
-  /** STT engine routed by the transcribe spoke (var): auto|whisper|deepgram|elevenlabs. Default "auto". */
-  VOICE_AGENT_STT_ENGINE?: string;
-  /** STT path on the gateway (var). Default /v1/internal/transcribe (the service-token-gated internal STT route). */
-  VOICE_AGENT_STT_PATH?: string;
-  /**
-   * Step-5 agent-least-privilege tool ALLOWLIST (var; JSON array of {name,description,input_schema}). The agent
-   * advertises ONLY these to the model + refuses any unlisted tool. Unset/blank/garbage → NO tools (fail closed).
-   */
-  VOICE_AGENT_TOOLS?: string;
-  /** Step-5 gateway tool-exec path override (var). Default /v1/internal/tools/exec (TODO #81: pin with gateway). */
-  VOICE_AGENT_TOOL_EXEC_PATH?: string;
-  /**
-   * Streaming STT flag (var). When "true" or "1", uses Deepgram WebSocket streaming STT
-   * instead of the batch gateway-fronted path. Default OFF (byte-identical batch path).
-   */
-  VOICE_AGENT_STREAMING_STT?: string;
-  /** Deepgram API key (secret; server-side ONLY). Required when VOICE_AGENT_STREAMING_STT is enabled. */
-  DEEPGRAM_API_KEY?: string;
-}
-
-/**
- * Build the LIVE turn-taking deps from env (the concrete network adapters live in agent-turn-providers.ts). Wires:
- *   • transcribe → the WAVE transcribe spoke via the gateway (batch-on-utterance; fails CLOSED when unprovisioned,
- *     never a fake transcript).
- *   • complete   → the WAVE gateway LLM proxy (Claude Opus/Sonnet), streamed, Bearer service token.
- *   • synthesize → ElevenLabs streaming TTS, pcm_48000, key server-side only.
- *   • emitMeter  → voice_agent_minutes usage emit (fail-OPEN).
- * Tests pass fakes instead of calling this. The DO calls this ONLY behind voiceAgentEnabled(env).
- */
-export function buildTurnDeps(
-  rawEnv: AgentTurnEnv,
-  media: AgentMediaDeps,
-  fetchImpl: FetchLike = fetch,
-  org = "", agentId = "", // agentId → x-wave-agent (gateway per-agent usage attribution, #81 envelope)
-): AgentTurnDeps & AgentMediaDeps {
-  // One canonical gateway base/token for ALL paths (LLM, STT, tools, metering) — either convention provisions all.
-  const env = normalizeGatewayEnv(rawEnv);
-  // `org` (the bound tenant) is asserted as x-wave-org on each gateway call so the gateway's internal STT/LLM
-  // routes attribute + meter usage to the right tenant. Empty only in non-bound test paths.
-  return {
-    ...media,
-    flowTap: env.AGENT_FLOW_TAP === "true" || env.AGENT_FLOW_TAP === "1",
-    async transcribe(pcm: Uint8Array): Promise<SttResult> {
-      // Streaming STT path (Deepgram WebSocket) — behind env flag, default OFF.
-      // When armed, the adapter opens a WebSocket to Deepgram, streams PCM incrementally,
-      // and resolves the final transcript with lower time-to-final than batch.
-      if (env.VOICE_AGENT_STREAMING_STT === "true" || env.VOICE_AGENT_STREAMING_STT === "1") {
-        return streamingTranscribe(pcm, env);
-      }
-      // Batch path (byte-identical to current) — the proven gateway-fronted transcribe spoke.
-      const base = env.VOICE_AGENT_STT_BASE ?? env.WAVE_GATEWAY_BASE;
-      const token = env.VOICE_AGENT_STT_TOKEN ?? env.WAVE_GATEWAY_TOKEN;
-      if (!base || !token) {
-        // Fail CLOSED + loud — the WAVE transcribe spoke (gateway-fronted) is not provisioned. NEVER a fake.
-        throw new AgentSessionError("STT_NOT_CONFIGURED", "STT gateway base/token not provisioned", 503);
-      }
-      return transcribeViaProvider(fetchImpl, env, org, base, token, pcm);
-    },
-    async *complete(messages: LlmMessage[], tools: ToolDefinition[]): AsyncIterable<CompletionEvent> {
-      if (!env.WAVE_GATEWAY_BASE || !env.WAVE_GATEWAY_TOKEN) {
-        throw new AgentSessionError("LLM_NOT_CONFIGURED", "WAVE gateway base/token not provisioned", 503);
-      }
-      yield* streamGatewayLlm(fetchImpl, env, org, messages, tools, agentId);
-    },
-    async callTool(name: string, input: unknown): Promise<string> {
-      if (!env.WAVE_GATEWAY_BASE || !env.WAVE_GATEWAY_TOKEN) {
-        // Fail CLOSED — a tool can ONLY be executed through the provisioned gateway (agent-least-privilege +
-        // metering authority). Unprovisioned → throw (the core turns it into an is_error tool_result, logged).
-        throw new AgentSessionError("TOOL_NOT_CONFIGURED", "WAVE gateway base/token not provisioned", 503);
-      }
-      return callGatewayTool(fetchImpl, env, org, name, input);
-    },
-    async *synthesize(text: string): AsyncIterable<Uint8Array> {
-      if (!env.ELEVENLABS_API_KEY || !env.ELEVENLABS_VOICE_ID) {
-        throw new AgentSessionError("TTS_NOT_CONFIGURED", "ElevenLabs key/voice not provisioned", 503);
-      }
-      // ElevenLabs pcm_48000 is MONO; CF Realtime buffer-mode ingest wants 48 kHz/16-bit/STEREO interleaved.
-      // Upmix (L=R) before publish or the agent's voice plays as endianness-shifted noise. (#30)
-      yield* upmixMonoToStereo16LE(streamElevenLabs(fetchImpl, env, text), env);
-    },
-    async emitMeter(usage: VoiceTurnUsage): Promise<void> {
-      // Step-7 real usage emit (mirrors metering.ts). INERT until the gateway base + service token are
-      // provisioned (now resolved from EITHER convention by normalizeGatewayEnv); fail-OPEN so a metering
-      // error never breaks the turn (emitVoiceTurnUsage swallows + logs).
-      await emitVoiceTurnUsage(env, usage, fetchImpl as unknown as typeof fetch);
-    },
-  };
-}
-
-/** Re-export the live-adapter constants so callers (+ tests) reach them from the turn module's public API. */
-export { DEFAULT_VOICE_LLM_MODEL, ELEVENLABS_OUTPUT_FORMAT } from "./agent-turn-providers.js";
-
-/** Re-export for callers that need it next to the turn module. */
-export type { IngestSocket };
-/** Step-5 re-exports so the DO + callers reach the tool types/allowlist from the turn module. */
-export {
-  ToolAllowlist,
-  toolAllowlistFromEnv,
-  type ToolDefinition,
-  type ToolUse,
-  type ToolResult,
-  type CompletionEvent,
-} from "./agent-tools.js";
