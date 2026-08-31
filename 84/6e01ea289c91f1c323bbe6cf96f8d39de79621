@@ -1,0 +1,14 @@
+SAFETY.md
+  h_af5ac1a9798224 1-13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "846e01ea289c91f1c323bbe6cf96f8d39de79621",
+  "prompts": {},
+  "humans": {
+    "h_af5ac1a9798224": {
+      "author": "Jake Fineman <jakefineman@gmail.com>"
+    }
+  }
+}
