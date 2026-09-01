@@ -1,0 +1,32 @@
+src/agent-turn-env.ts
+  s_3c7a371f5618a4::t_5052636a5c34b4 61,67-74
+  s_3c7a371f5618a4::t_b2944bfd5209df 100-103,105-114
+  s_3c7a371f5618a4::t_9934aea3153ef1 22
+src/agent-stt-elevenlabs-realtime.ts
+  s_3c7a371f5618a4::t_f4d37c75910f5f 303-306
+  s_3c7a371f5618a4::t_7cd7c8b5d7abb0 163-165
+  s_3c7a371f5618a4::t_ba4030796bb195 1-162,166-302,307-308
+test/agent-turn-streaming-stt-provider.test.ts
+  s_3c7a371f5618a4::t_01482b766ec8d8 1-92,100-170
+  s_3c7a371f5618a4::t_aa1104bd7eb486 93-99
+test/agent-stt-elevenlabs-realtime.test.ts
+  s_3c7a371f5618a4::t_374eafbdafa6fb 93
+  s_3c7a371f5618a4::t_fc53c3f1ab1e81 37
+  s_3c7a371f5618a4::t_a4a87133986e07 1-36,38-92,94-180
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "069cc7deeba167e13beed747a1cc3a74106b992c",
+  "prompts": {},
+  "sessions": {
+    "s_3c7a371f5618a4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5bd8e1fc-0b4d-4027-8f86-88e3237e562e",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Jake Fineman <jakefineman@gmail.com>"
+    }
+  }
+}
