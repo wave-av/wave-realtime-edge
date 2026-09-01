@@ -4,6 +4,13 @@ node_modules
 .env
 .dev.vars
 
+# Derived by scripts/ci/bundle-eval-gate.mjs from wrangler.toml on every gate run (the
+# StreamBridgeContainer remote-registry [[containers]] block + its paired
+# [[durable_objects.bindings]] entry removed so `wrangler dev` boots fully local with zero
+# Cloudflare credentials). Generated, never authored: committing it would let it drift from the
+# real Worker config.
+wrangler.bundle-eval.generated.toml
+
 # >>> wave claude-project-chassis (managed) — do not edit between these markers >>>
 .claude/settings.local.json
 .claude/*.local.json

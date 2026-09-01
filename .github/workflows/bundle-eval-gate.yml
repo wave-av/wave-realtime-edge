@@ -1,0 +1,91 @@
+name: bundle eval gate
+
+# Systemic prevention for wave-av/wave-moq-edge #215 — a 5-day prod outage where every
+# `wrangler deploy --env production` failed at Cloudflare's upload step with `Uncaught
+# ReferenceError: buildTokensCss is not defined`, while `tsc --noEmit` (typecheck) and a
+# bundle-only `wrangler deploy --dry-run` (deploy:dry) both stayed green the whole time. Neither
+# typechecks nor bundles EVALUATE the produced JS — Cloudflare's upload step does that
+# server-side, which is why the break shipped silently. Ported here (wave-realtime-edge /
+# rt.wave.online) from the proven wave-gateway rollout (PR #1480) of the wave-moq-edge #217
+# template. This repo deploys ONLY via a Jake-named `workflow_dispatch` (production/canary) —
+# never on push — so this workflow is CI-only: it never deploys anything, it only boots the
+# bundle offline to prove it would evaluate cleanly if deployed.
+#
+# This job boots the actual Worker bundle inside workerd via `wrangler dev` (local mode, zero
+# Cloudflare credentials) — the same bundling path `wrangler deploy` uses, then a real workerd
+# isolate loads the module graph exactly like Cloudflare's upload-time evaluation does. A
+# top-level ReferenceError/SyntaxError fails the boot before "Ready on" ever prints, and the gate
+# script (scripts/ci/bundle-eval-gate.mjs) fails loudly with the captured error.
+#
+# wave-realtime-edge adaptation: this repo has no `[env.production]` block (the top-level
+# wrangler.toml config IS the deployed production config), so the gate boots that top-level
+# config directly. It strips only the StreamBridgeContainer `[[containers]]` binding — the one
+# Durable Object whose image is a pre-pushed ref on Cloudflare's OWN managed registry and so
+# genuinely cannot resolve without a live Cloudflare account (verified locally: 403 Forbidden
+# calling the CF registry-credentials API with zero credentials present). Every other Durable
+# Object in this repo — including the two OTHER container-backed ones, RecorderContainer and
+# MoqPublishContainer, which build their image from a vendored in-repo Dockerfile — boots and
+# builds fully offline and is left untouched. See the gate script's header for the full writeup.
+#
+# Making this a REQUIRED status check (branch protection) is the durable half of the fix — this
+# workflow file only adds the check; enabling branch protection is managed out-of-band.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "containers/**/Dockerfile"
+      - "wrangler.toml"
+      - "package.json"
+      - "package-lock.json"
+      - "scripts/ci/bundle-eval-gate.mjs"
+      - ".github/workflows/bundle-eval-gate.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "containers/**/Dockerfile"
+      - "wrangler.toml"
+      - "package.json"
+      - "package-lock.json"
+      - "scripts/ci/bundle-eval-gate.mjs"
+      - ".github/workflows/bundle-eval-gate.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: bundle-eval-gate-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read # read @wave-av/spoke-chassis (private GitHub Packages dep) via GITHUB_TOKEN
+
+jobs:
+  bundle-eval:
+    name: boot worker bundle in workerd
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: "npm"
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@wave-av"
+
+      - name: install
+        run: npm ci --no-audit --no-fund
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Boot the Worker bundle in workerd (module-eval gate)
+        # Deliberately NO CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID — rt.wave.online is a paid
+        # customer host; no deploy-capable secret belongs in a job that runs on every PR push. The
+        # gate script strips the one remote-registry-only container binding before booting, so it
+        # needs none. RecorderContainer/MoqPublishContainer build their images from the vendored
+        # containers/*/Dockerfile via the runner's local Docker daemon (no registry credential
+        # needed either); a cold build can take a few minutes, hence the generous job timeout.
+        run: npm run test:bundle-eval
