@@ -19,6 +19,7 @@ import {
   type FetchLike,
 } from "./agent-turn-providers.js";
 import { streamingTranscribe } from "./agent-stt-streaming.js";
+import { streamingTranscribeElevenLabs } from "./agent-stt-elevenlabs-realtime.js";
 
 export interface AgentTurnEnv extends AgentSessionEnv, VadEnv, VoiceMeterEnv, VoiceCogsRatesEnv {
   /** WAVE gateway origin for the LLM proxy (var; not a secret). e.g. https://api.wave.online */
@@ -57,12 +58,20 @@ export interface AgentTurnEnv extends AgentSessionEnv, VadEnv, VoiceMeterEnv, Vo
   /** Step-5 gateway tool-exec path override (var). Default /v1/internal/tools/exec (TODO #81: pin with gateway). */
   VOICE_AGENT_TOOL_EXEC_PATH?: string;
   /**
-   * Streaming STT flag (var). When "true" or "1", uses Deepgram WebSocket streaming STT
+   * Streaming STT flag (var). When "true" or "1", uses WebSocket streaming STT
    * instead of the batch gateway-fronted path. Default OFF (byte-identical batch path).
    */
   VOICE_AGENT_STREAMING_STT?: string;
   /** Deepgram API key (secret; server-side ONLY). Required when VOICE_AGENT_STREAMING_STT is enabled. */
   DEEPGRAM_API_KEY?: string;
+  /**
+   * E1 (elevenlabs-surface-adoption epic, #4081) — streaming STT PROVIDER selector (var):
+   * "deepgram" | "elevenlabs". Only consulted when VOICE_AGENT_STREAMING_STT is armed. Default
+   * "deepgram" (byte-identical to the pre-E1 streaming path when unset). "elevenlabs" routes to
+   * the Scribe v2 Realtime WebSocket adapter (agent-stt-elevenlabs-realtime.ts); on ANY ElevenLabs
+   * error this FAILS CLOSED back to the Deepgram streaming adapter — the turn is never dropped.
+   */
+  VOICE_AGENT_STREAMING_STT_PROVIDER?: string;
 }
 
 /**
@@ -88,10 +97,21 @@ export function buildTurnDeps(
     ...media,
     flowTap: env.AGENT_FLOW_TAP === "true" || env.AGENT_FLOW_TAP === "1",
     async transcribe(pcm: Uint8Array): Promise<SttResult> {
-      // Streaming STT path (Deepgram WebSocket) — behind env flag, default OFF.
-      // When armed, the adapter opens a WebSocket to Deepgram, streams PCM incrementally,
-      // and resolves the final transcript with lower time-to-final than batch.
+      // Streaming STT path — behind env flag, default OFF. When armed, PROVIDER selects the
+      // WebSocket backend (E1, elevenlabs-surface-adoption epic #4081): "elevenlabs" routes to
+      // the Scribe v2 Realtime adapter; anything else (including unset) stays on Deepgram — the
+      // pre-E1 default, byte-identical when VOICE_AGENT_STREAMING_STT_PROVIDER is unset.
       if (env.VOICE_AGENT_STREAMING_STT === "true" || env.VOICE_AGENT_STREAMING_STT === "1") {
+        if (env.VOICE_AGENT_STREAMING_STT_PROVIDER === "elevenlabs") {
+          try {
+            return await streamingTranscribeElevenLabs(pcm, env, fetchImpl);
+          } catch {
+            // Fail CLOSED to Deepgram on ANY ElevenLabs error (upgrade failure, vendor error
+            // event, timeout, missing key) — never drop the turn. A second failure here still
+            // throws (both backends unavailable is a real STT outage, not silently swallowed).
+            return streamingTranscribe(pcm, env);
+          }
+        }
         return streamingTranscribe(pcm, env);
       }
       // Batch path (byte-identical to current) — the proven gateway-fronted transcribe spoke.
