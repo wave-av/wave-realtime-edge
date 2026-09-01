@@ -1,0 +1,19 @@
+src/agent-turn-tools-exec.ts
+  s_727a7865b9cf0a::t_1e7f5c39f838ad 1-56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "f9268e706cf3e4821462b12d6ac8baf321905b85",
+  "prompts": {},
+  "sessions": {
+    "s_727a7865b9cf0a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c4cb020-d377-430e-9356-a2a574828c3f",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Jake Fineman <jakefineman@gmail.com>"
+    }
+  }
+}

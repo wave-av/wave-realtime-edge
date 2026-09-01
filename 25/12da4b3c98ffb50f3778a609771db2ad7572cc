@@ -1,0 +1,19 @@
+src/route-v1-media.ts
+  s_9b6ba3f8f14ff7::t_28123552b35dba 1-83
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "2512da4b3c98ffb50f3778a609771db2ad7572cc",
+  "prompts": {},
+  "sessions": {
+    "s_9b6ba3f8f14ff7": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fac971bdeffey96MOzg3UQKUaD",
+        "model": "glm-5.3"
+      },
+      "human_author": "Jake Fineman <jakefineman@gmail.com>"
+    }
+  }
+}
