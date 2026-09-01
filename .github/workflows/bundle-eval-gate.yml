@@ -6,10 +6,10 @@ name: bundle eval gate
 # bundle-only `wrangler deploy --dry-run` (deploy:dry) both stayed green the whole time. Neither
 # typechecks nor bundles EVALUATE the produced JS — Cloudflare's upload step does that
 # server-side, which is why the break shipped silently. Ported here (wave-realtime-edge /
-# rt.wave.online) from the proven wave-gateway rollout (PR #1480) of the wave-moq-edge #217
-# template. This repo deploys ONLY via a Jake-named `workflow_dispatch` (production/canary) —
-# never on push — so this workflow is CI-only: it never deploys anything, it only boots the
-# bundle offline to prove it would evaluate cleanly if deployed.
+# rt.wave.online) from the proven pilot rollout of the wave-moq-edge #217 template. This repo
+# deploys ONLY via a Jake-named `workflow_dispatch` (production/canary) — never on push — so this
+# workflow is CI-only: it never deploys anything, it only boots the bundle offline to prove it
+# would evaluate cleanly if deployed.
 #
 # This job boots the actual Worker bundle inside workerd via `wrangler dev` (local mode, zero
 # Cloudflare credentials) — the same bundling path `wrangler deploy` uses, then a real workerd

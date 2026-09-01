@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // scripts/ci/bundle-eval-gate.mjs
 //
-// Ported from wave-av/wave-moq-edge PR #217 (merged to main) / wave-av/wave-gateway PR #1480, the
+// Ported from wave-av/wave-moq-edge PR #217 (merged to main) via the pilot rollout, the
 // systemic prevention for moq-edge #215 — a 5-day prod outage where every `wrangler deploy --env
 // production` failed at Cloudflare's upload step with `Uncaught ReferenceError: buildTokensCss is
 // not defined`, while `tsc --noEmit` and a bundle-only `wrangler deploy --dry-run` both stayed
@@ -17,7 +17,7 @@
 // script fails loudly with the captured error. A clean boot + one successful HTTP round trip is
 // the only thing that passes.
 //
-// ── wave-realtime-edge-specific adaptation (vs. the wave-gateway template) ────────────────────
+// ── wave-realtime-edge-specific adaptation (vs. the pilot template) ────────────────────────────
 // wave-realtime-edge has NO `[env.production]` block: the top-level wrangler.toml config (name=
 // wave-realtime-edge, rt.wave.online custom_domain) IS the deployed production config, so this
 // gate boots the top-level config as-is — no `--env production` flag. (The repo does have a
@@ -25,7 +25,7 @@
 // customer-facing deploy target and named envs do not inherit top-level bindings anyway.)
 //
 // wave-realtime-edge declares NO `[ai]` / `[[vectorize]]` / hyperdrive / remote D1 bindings (the
-// #731 defect class wave-gateway hit). It DOES declare six Durable Object classes (RoomDO,
+// defect class the pilot hit). It DOES declare six Durable Object classes (RoomDO,
 // RecorderContainer, StreamBridgeContainer, AgentSessionDO, ZoomRtmsBridgeDO,
 // MoqPublishContainer) — plain SQLite-backed DOs (RoomDO, AgentSessionDO, ZoomRtmsBridgeDO) DO
 // emulate fully locally in workerd and are left untouched. Three of the six are CONTAINER-backed
@@ -40,7 +40,7 @@
 // Verified locally: booting the unmodified top-level config makes `wrangler dev` call Cloudflare's
 // `/registries/{domain}/credentials` endpoint to pull that image and hard-fails `403 Forbidden`
 // with zero Cloudflare credentials present — the exact "genuinely cannot bind locally" class
-// `[ai]`/`[[vectorize]]` are in the wave-gateway template. So this gate strips ONLY the
+// `[ai]`/`[[vectorize]]` are in the pilot template. So this gate strips ONLY the
 // StreamBridgeContainer `[[containers]]` block and its paired `[[durable_objects.bindings]]`
 // entry (name="STREAM_BRIDGE") from the derived config before booting — every other Durable
 // Object, container, KV namespace, and R2 bucket binding is untouched and still exercises the
