@@ -53,5 +53,17 @@ Top-level directories: containers, deck, docs, harness, scripts, src, test.
 ```yaml agents-router
 version: "0.1"
 budget_lines: 200
-index: []
+index:
+  - family: architecture-contract
+    path: ARCHITECTURE.md
+  - family: permissions-contract
+    path: PERMISSIONS.md
+  - family: safety-contract
+    path: SAFETY.md
+  - family: secrets-contract
+    path: SECRETS.md
+  - family: telemetry-contract
+    path: TELEMETRY.md
+  - family: test-contract
+    path: TESTING.md
 ```
