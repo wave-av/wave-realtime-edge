@@ -1,0 +1,24 @@
+src/route-dispatch.ts
+  s_4657dee555390b::t_653d3befa87915 99-103
+  s_4657dee555390b::t_177b7c3ecaad42 50-52
+src/agent-discovery.ts
+  s_4657dee555390b::t_5dddb90f8683a4 1-52
+src/landing.ts
+  s_4657dee555390b::t_2d078f24da2b8f 17-19,28-31,38-42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "ffc93df9ebf62d9d19da804a705317291dcaf746",
+  "prompts": {},
+  "sessions": {
+    "s_4657dee555390b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c714314b-1edf-4e54-a112-2a97f2377df1",
+        "model": "unknown"
+      },
+      "human_author": "Jake Fineman <jakefineman@gmail.com>"
+    }
+  }
+}
