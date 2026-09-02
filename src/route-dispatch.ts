@@ -47,6 +47,9 @@ import { maybeHandleCanaryProof } from "./canary-proof";
 // default: DEFAULT_CSP allows only same-origin script-src). Pure string render, no I/O, no auth.
 import { landingPage } from "./landing";
 import { DEFAULT_CSP } from "@wave-av/spoke-chassis";
+// Agent-discovery well-knowns (GET /llms.txt, /.well-known/agent-card.json, /skill.md) — see
+// agent-discovery.ts for why these needed their own leaf module (they previously 501'd).
+import { maybeHandleAgentDiscovery } from "./agent-discovery";
 // Env shape, route-match constants, and the auth/deps/sink plumbing — extracted to a leaf module (task #56) so
 // neither file exceeds 800 lines. dispatch-helpers.ts imports nothing from here (no cycle).
 import {
@@ -92,6 +95,11 @@ export async function dispatch(
 			version: "dev",
 		});
 	}
+
+	// Agent-discovery well-knowns — GET /llms.txt, /.well-known/agent-card.json, /skill.md. Checked
+	// early (same tier as /health and "/") so they never fall through to the 501 catch-all below.
+	const discovery = maybeHandleAgentDiscovery(request, url.pathname);
+	if (discovery) return discovery;
 
 	if (request.method === "GET" && url.pathname === "/") {
 		return new Response(landingPage(), {
