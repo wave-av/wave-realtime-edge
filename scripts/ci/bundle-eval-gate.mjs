@@ -291,7 +291,23 @@ async function main() {
   process.exitCode = 0;
 }
 
-main().catch((err) => {
-  console.error("[bundle-eval-gate] unexpected error:", err);
-  process.exitCode = 1;
-});
+main()
+  .catch((err) => {
+    console.error("[bundle-eval-gate] unexpected error:", err);
+    process.exitCode = 1;
+  })
+  .finally(() => {
+    // FORCE exit — do not rely on the event loop draining naturally. `wrangler dev` (this repo
+    // boots RecorderContainer + MoqPublishContainer, two real Docker-container-backed Durable
+    // Objects) can leave grandchild handles/pipes open after `child.kill("SIGTERM")` above returns
+    // — SIGTERM asks `npx wrangler dev` to stop, but does not guarantee every descendant process
+    // (docker exec streams, the workerd subprocess itself) has actually torn down its fds by the
+    // time this script reaches here. Observed live in CI (wave-realtime-edge PR #473, run
+    // 33786449325): the gate printed "PASSED" at 17:46:51 but the job then hung with zero further
+    // output until the workflow's own timeout force-cancelled it 14 minutes later at 18:00:53 —
+    // the script never called process.exit(), so Node kept the process alive waiting on whatever
+    // handle was still open. `process.exit(process.exitCode ?? 0)` makes the gate's own verdict
+    // (PASSED/FAILED, already logged and captured above) the only thing that determines the job's
+    // outcome, independent of any child process cleanup race.
+    process.exit(process.exitCode ?? 0);
+  });
