@@ -9,10 +9,22 @@ name: deploy
 #   1. .npmrc + npm ci || npm install   (#258 added the private @wave-av/spoke-chassis dep, so this
 #      needs GitHub Packages auth — packages:read + NODE_AUTH_TOKEN + .npmrc, mirroring contract-tests.yml)
 #   2. typecheck + test (re-run the gate before a real deploy)
-#   3. wrangler deploy
+#   3. deploy guard — refuse to deploy a commit no longer reachable from the dispatched ref's tip
+#   4. wrangler deploy --var GIT_SHA:<sha> — stamps the exact commit into the running Worker
 #      wrangler reads wrangler.toml: name, main, routes (rt.wave.online custom_domain), the Durable Object
 #      bindings + migrations — ROOM/v1, RECORDER, and AGENT_SESSION (voice-agent runtime, migration v3,
 #      new_sqlite_classes ["AgentSessionDO"]) — vars, and observability. First deploy bootstraps the migrations.
+#   5. post-deploy verify — polls the live /health for production only (canary has no custom-domain
+#      host per wrangler.toml's ROUTE ISOLATION comment; see scripts/ci/resolve-deploy-host.mjs) until
+#      it echoes this run's sha, proving the RIGHT bundle answered, not just that the API call succeeded.
+#
+# ── Deploy-ordering guarantee (go-live remediation, 2026-09-02 — /health was reporting a stale
+# "version":"dev" with no way to prove which commit was actually live) ─────────────────────────────
+#   This repo is workflow_dispatch-ONLY by design (never push-triggered — see header above), so the
+#   "three PRs merged in 20s" race the sibling spokes guard against cannot happen the same way here;
+#   `concurrency.group` below still serializes any overlapping manual dispatches (queues, never kills
+#   an in-flight deploy), the deploy-guard step is belt-and-suspenders against a stale ref, and the
+#   post-deploy verify step is the actual proof — mirrors wave-spoke-template's proven deploy.yml.
 #
 # Secrets required in this repo (set once, NOT here — same org secrets the other spokes use):
 #   CLOUDFLARE_API_TOKEN   — CF API token: Workers Scripts:Edit, Workers KV:Edit, Zone Workers Routes:Edit
@@ -58,6 +70,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Full history (not the default shallow depth-1) — required by the "deploy guard" step's
+          # `git merge-base --is-ancestor` check below.
+          fetch-depth: 0
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -79,6 +94,22 @@ jobs:
       - name: test (vitest)
         run: npm test
 
+      # Belt-and-suspenders against a stale/orphaned dispatch: refuses to deploy a commit that is no
+      # longer (or never was) reachable from the tip of the dispatched ref — e.g. a force-push/rebase
+      # moved the branch out from under an in-flight run. Mirrors wave-spoke-template's deploy guard.
+      - name: deploy guard — commit must be reachable from the dispatched ref's tip
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -e
+          git fetch origin "$REF_NAME" --quiet
+          TIP=$(git rev-parse "origin/$REF_NAME")
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/$REF_NAME"; then
+            echo "::error::commit $GITHUB_SHA is not an ancestor of origin/$REF_NAME (tip $TIP) — a newer commit has superseded this run; refusing to deploy a stale/orphaned commit"
+            exit 1
+          fi
+          echo "deploy guard OK: $GITHUB_SHA is an ancestor of origin/$REF_NAME (tip $TIP)"
+
       - name: Deploy with Wrangler
         uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
         with:
@@ -89,4 +120,43 @@ jobs:
           # (wave-realtime-edge-canary, workers_dev, routes=[] so it CANNOT inherit/steal the prod custom
           # domain, RT_ENCODER=container + AV1_DEFAULT + NEGOTIATION_ENABLED for the #138 recorder proof).
           # `environment` is a restricted choice input (production|canary) — no injection surface.
-          command: ${{ inputs.environment == 'canary' && 'deploy --env canary' || 'deploy' }}
+          # GIT_SHA is stamped as a plain (non-secret) var override at deploy time — no wrangler.toml
+          # edit needed per deploy. /health echoes it back (both `version` and `sha`) so the next step
+          # can prove THIS commit, not just A commit, is what answers live traffic.
+          command: ${{ inputs.environment == 'canary' && format('deploy --env canary --var GIT_SHA:{0}', github.sha) || format('deploy --var GIT_SHA:{0}', github.sha) }}
+
+      # Proven-live gate (proven-live-or-not-done): a green `wrangler deploy` only proves the API call
+      # succeeded, not that the right bundle is answering live traffic. This step is the receipt.
+      # production resolves to rt.wave.online (wrangler.toml's TOP-LEVEL routes key — this repo has no
+      # [env.production] block, see scripts/ci/resolve-deploy-host.mjs). canary is skipped by design:
+      # [env.canary] deliberately sets `routes = []` (incident 2026-07-12 — ROUTE ISOLATION comment in
+      # wrangler.toml), so it has no custom-domain host to poll.
+      - name: post-deploy verify — proven live, not merely deployed
+        env:
+          TARGET_ENV: ${{ inputs.environment }}
+          EXPECT_SHA: ${{ github.sha }}
+        run: |
+          set -e
+          HOST=$(node scripts/ci/resolve-deploy-host.mjs "$TARGET_ENV" || true)
+          if [ -z "$HOST" ]; then
+            echo "::notice::no live custom-domain route for env '$TARGET_ENV' in wrangler.toml — skipping live verification (expected for canary, see wrangler.toml ROUTE ISOLATION comment)"
+            exit 0
+          fi
+
+          echo "Verifying https://$HOST/health reports sha == $EXPECT_SHA (timeout 120s)..."
+          DEADLINE=$((SECONDS + 120))
+          LIVE_SHA=""
+          while [ "$SECONDS" -lt "$DEADLINE" ]; do
+            LIVE_SHA=$(curl -fsS --max-time 10 "https://$HOST/health" 2>/dev/null \
+              | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{try{process.stdout.write(JSON.parse(d).sha||"")}catch{process.stdout.write("")}})' \
+              || echo "")
+            if [ "$LIVE_SHA" = "$EXPECT_SHA" ]; then
+              echo "receipt: https://$HOST/health sha=$LIVE_SHA matches $EXPECT_SHA"
+              break
+            fi
+            sleep 5
+          done
+          if [ "$LIVE_SHA" != "$EXPECT_SHA" ]; then
+            echo "::error::post-deploy verification FAILED after 120s — https://$HOST/health reports sha='$LIVE_SHA', expected '$EXPECT_SHA'. A stale or wrong bundle may be live."
+            exit 1
+          fi
