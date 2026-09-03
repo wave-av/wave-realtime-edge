@@ -1,0 +1,19 @@
+.github/workflows/deploy.yml
+  s_39fb4157f79543::t_68340dc213d0b6 58,62,65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "4cd8c235f35cebd97f324324e4db1629514f75a4",
+  "prompts": {},
+  "sessions": {
+    "s_39fb4157f79543": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_39fb4157f79543",
+        "model": "unknown"
+      },
+      "human_author": "Jake Fineman <jakefineman@gmail.com>"
+    }
+  }
+}
