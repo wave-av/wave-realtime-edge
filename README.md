@@ -44,6 +44,7 @@ npm run deploy        # wrangler deploy
 | Routed ingest router | `/v1/realtime/ingress/{protocol}/{intent}` | **Live** — `whip` only; `rtmp`/`srt`/`url` return 501 (need a VM listener) |
 | Routed egress router (wave-render/RunPod/Stream) | `EGRESS_ROUTER_ENABLED` | **Inert** — backends built, not armed |
 | Room presence WebSocket | `/v1/realtime/rooms/{room}/presence` | **Inert** — `PRESENCE_ENABLED` off |
+| Channel pub/sub (connect/publish/presence/history) | `/v1/connect` · `/v1/channels/{channel}/{publish,presence,history}` | **Live** — ChannelDO substrate |
 | Multi-region cascade | `RT_CASCADE` | **Inert** — single-region today |
 
 An OpenAPI 3.1 spec (`docs/api/openapi.yaml`) and a 200+ file contract test suite run on every PR.
@@ -111,6 +112,10 @@ threat-model.md, SECURITY.md, CONTRIBUTING.md
 | `POST` | `/v1/realtime/agents/{intent}` | Voice agent bind/info (VOICE_AGENT_PROVIDER=wave) |
 | `POST` | `/v1/realtime/ingress/{protocol}/{intent}` | Routed ingest create/delete (`whip` live; `rtmp`/`srt`/`url` return 501) |
 | `GET` | `/v1/realtime/rooms/{room}/presence` | WebSocket upgrade for room presence/state-sync (PRESENCE_ENABLED gated, inert) |
+| `GET` | `/v1/connect` | Subscribe to a channel — WebSocket upgrade (`?channel=<id>&as=<member>`); sends `welcome` then live `message`/`join`/`leave`/`presence` frames |
+| `POST` | `/v1/channels/{channel}/publish` | Publish one event to every channel subscriber |
+| `GET` | `/v1/channels/{channel}/presence` | Current channel member list |
+| `GET` | `/v1/channels/{channel}/history` | Recent channel events (bounded ring buffer, ≤50) |
 
 ## Transports
 

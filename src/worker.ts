@@ -23,6 +23,11 @@ import { dispatch, scheduledHandler, type Env } from "./route-dispatch";
 // the env/KV/network glue + residency Env fields live in src/residency-sink.ts. residency-rt.ts stays PURE.
 export { RoomDO } from "./room";
 
+// Item #5 — the channel pub/sub Durable Object class (src/channel-do.ts). Exported here so the CHANNEL
+// binding + migration (wrangler.toml) resolve on deploy. One DO per `${org}:${channel}`; route-dispatch.ts
+// (via route-channel.ts) is the only caller.
+export { ChannelDO } from "./channel-do";
+
 // RT-R10 (#72) — the PORTABLE raw-SFU encode container Durable Object class (Path A; mirrors bridge-edge's
 // MoqContainer). INERT: the `[[containers]] RECORDER` block in wrangler.toml stays COMMENTED (Path A attach is
 // a Jake-named ◆); exported here so the class is in scope when the ◆ uncomments the binding.

@@ -544,6 +544,20 @@ new_sqlite_classes = ["ZoomRtmsBridgeDO"]
 tag = "v6"
 new_sqlite_classes = ["MoqPublishContainer"]
 
+# ── Item #5 — Channel Durable Object (channel.ts pure engine + channel-do.ts ChannelDO) — the pub/sub plane
+# (GET /v1/connect WS + POST/GET /v1/channels/{channel}/{publish,presence,history}). ChannelDO is exported
+# from src/worker.ts so this binding + migration resolve on the first deploy. SQLite-backed DO
+# (new_sqlite_classes) per the storage-governed default; one DO per `${org}:${channel}` (route-channel.ts).
+[[durable_objects.bindings]]
+name = "CHANNEL"
+class_name = "ChannelDO"
+
+# The NEW highest/last tag: it applies after v6 (array order). Keep any future migration strictly after
+# this block, or wrangler silently skips it (class not configured → 10061).
+[[migrations]]
+tag = "v7"
+new_sqlite_classes = ["ChannelDO"]
+
 [[unsafe.bindings]]
 type = "plain_text"
 name = "FOUNDATION_VERSION"

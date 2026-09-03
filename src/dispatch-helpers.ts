@@ -69,6 +69,9 @@ export interface Env extends EncoderEnv, ResidencySinkEnv, IngestBridgeRuntimeEn
 	TURN_KEY_TOKEN?: string; // wrangler SECRET — the TURN key's api token. Never logged/returned; only ephemeral ICE creds are.
 	// ── P5 CF-Calls SFU control plane ──
 	ROOM?: RoomNamespace; // Durable Object binding (wrangler ROOM → RoomDO). Per-room state + signaling.
+	// Item #5 — channel pub/sub plane (spec/realtime.yaml). Durable Object binding (wrangler CHANNEL →
+	// ChannelDO, src/channel-do.ts). One DO per `${org}:${channel}`, derived exactly like ROOM above.
+	CHANNEL?: RoomNamespace;
 	// GATEWAY_BASE_URL / WAVE_SERVICE_TOKEN are read INSIDE the RoomDO (see RoomDOEnv in room.ts) — the worker
 	// forwards the env to the DO via the binding, so it does not need to name them here.
 	// ── RT-R10 (#72) portable recorder — ALL inert by default (RECORDER_TARGET 'none', RECORDER_SINK 'r2') ──
