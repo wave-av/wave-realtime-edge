@@ -1,0 +1,30 @@
+src/dispatch-helpers.ts
+  s_73ce9d874d7339::t_4f7d54ac23a5a8 30-31
+  s_73ce9d874d7339::t_393fa22722a693 32
+test/health.test.ts
+  s_73ce9d874d7339::t_1073e5655d40cf 39
+  s_73ce9d874d7339::t_84363ec87bcc56 1-38,40-42
+src/route-dispatch.ts
+  s_73ce9d874d7339::t_132151c984759c 87-90,96
+wrangler.toml
+  s_73ce9d874d7339::t_7bc846f71dd78f 35-39
+.github/workflows/deploy.yml
+  s_73ce9d874d7339::t_da74f63c4ae94b 95-127
+  s_73ce9d874d7339::t_201f761e8b2ac6 12,16-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "6aa097f6295749ad5f309538b74accec09f737a5",
+  "prompts": {},
+  "sessions": {
+    "s_73ce9d874d7339": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "98a8bbf9-cb78-42d8-a6f5-f3aaa2c16b46",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Jake Fineman <jakefineman@gmail.com>"
+    }
+  }
+}
