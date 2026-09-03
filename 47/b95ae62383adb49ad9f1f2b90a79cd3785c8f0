@@ -1,0 +1,27 @@
+src/route-dispatch.ts
+  s_73ce9d874d7339::t_4bc0a832792112 50
+  s_73ce9d874d7339::t_cf1ccb209f3050 97-100
+  s_73ce9d874d7339::t_a8852e02356cc2 101-102
+src/chassis-passthrough.ts
+  s_73ce9d874d7339::t_4ed9926c64bd77 1-41
+package-lock.json
+  s_73ce9d874d7339::t_8f4603eace3822 12,2057-2059
+package.json
+  s_73ce9d874d7339::t_84f5519d3d0322 19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "47b95ae62383adb49ad9f1f2b90a79cd3785c8f0",
+  "prompts": {},
+  "sessions": {
+    "s_73ce9d874d7339": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "98a8bbf9-cb78-42d8-a6f5-f3aaa2c16b46",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Jake Fineman <jakefineman@gmail.com>"
+    }
+  }
+}
