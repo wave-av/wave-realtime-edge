@@ -47,6 +47,7 @@ import { maybeHandleCanaryProof } from "./canary-proof";
 // default: DEFAULT_CSP allows only same-origin script-src). Pure string render, no I/O, no auth.
 import { landingPage } from "./landing";
 import { DEFAULT_CSP } from "@wave-av/spoke-chassis";
+import { chassisFetch, isChassisPath } from "./chassis-passthrough";
 // Env shape, route-match constants, and the auth/deps/sink plumbing — extracted to a leaf module (task #56) so
 // neither file exceeds 800 lines. dispatch-helpers.ts imports nothing from here (no cycle).
 import {
@@ -91,6 +92,12 @@ export async function dispatch(
 			protocol: "webrtc-sfu",
 			version: "dev",
 		});
+	}
+
+	// Chassis passthrough (public GETs only, plus POST /_wave/e for the funnel beacon).
+	// See src/chassis-passthrough.ts for the full seam + audit receipt.
+	if (isChassisPath(url.pathname)) {
+		return chassisFetch(request, env, ctx);
 	}
 
 	if (request.method === "GET" && url.pathname === "/") {
