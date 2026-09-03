@@ -90,12 +90,16 @@ export async function dispatch(
 	const url = new URL(request.url);
 
 	if (url.pathname === "/health") {
+		// GIT_SHA is a [vars] placeholder ("unset") overridden per-deploy by deploy.yml's
+		// `wrangler deploy --var GIT_SHA:${{ github.sha }}` — see dispatch-helpers.ts Env.GIT_SHA.
+		// version echoes it (falling back to "dev" for local/test) so a live receipt can prove which
+		// commit is actually serving traffic (proven-live-or-not-done).
 		return Response.json({
 			ok: true,
 			service: "wave-realtime-edge",
 			layer: "edge",
 			protocol: "webrtc-sfu",
-			version: "dev",
+			version: env.GIT_SHA || "dev",
 		});
 	}
 

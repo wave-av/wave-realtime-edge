@@ -9,10 +9,14 @@ name: deploy
 #   1. .npmrc + npm ci || npm install   (#258 added the private @wave-av/spoke-chassis dep, so this
 #      needs GitHub Packages auth — packages:read + NODE_AUTH_TOKEN + .npmrc, mirroring contract-tests.yml)
 #   2. typecheck + test (re-run the gate before a real deploy)
-#   3. wrangler deploy
+#   3. wrangler deploy --var GIT_SHA:${{ github.sha }}
 #      wrangler reads wrangler.toml: name, main, routes (rt.wave.online custom_domain), the Durable Object
 #      bindings + migrations — ROOM/v1, RECORDER, and AGENT_SESSION (voice-agent runtime, migration v3,
 #      new_sqlite_classes ["AgentSessionDO"]) — vars, and observability. First deploy bootstraps the migrations.
+#      GIT_SHA overrides the wrangler.toml [vars] "unset" placeholder with this run's commit (mirrors
+#      wave-transcode-edge); route-dispatch.ts /health echoes it as `version`.
+#   4. post-deploy verify — curl /health and fail the job unless `version` == github.sha (proven-live-or-not-done:
+#      a green wrangler deploy proves the API call succeeded, not that the right bundle is answering traffic).
 #
 # Secrets required in this repo (set once, NOT here — same org secrets the other spokes use):
 #   CLOUDFLARE_API_TOKEN   — CF API token: Workers Scripts:Edit, Workers KV:Edit, Zone Workers Routes:Edit
@@ -89,4 +93,36 @@ jobs:
           # (wave-realtime-edge-canary, workers_dev, routes=[] so it CANNOT inherit/steal the prod custom
           # domain, RT_ENCODER=container + AV1_DEFAULT + NEGOTIATION_ENABLED for the #138 recorder proof).
           # `environment` is a restricted choice input (production|canary) — no injection surface.
-          command: ${{ inputs.environment == 'canary' && 'deploy --env canary' || 'deploy' }}
+          # --var GIT_SHA:<sha> stamps this run's commit (github.sha is trusted, CI-controlled — not
+          # attacker-influenced input) into the deployed worker regardless of which target is selected;
+          # it overrides the wrangler.toml [vars] "unset" placeholder for whichever worker is deployed.
+          command: >-
+            ${{ inputs.environment == 'canary' && 'deploy --env canary' || 'deploy' }}
+            --var GIT_SHA:${{ github.sha }}
+
+      # Proven-live gate (proven-live-or-not-done): a green `wrangler deploy` only proves the API call
+      # succeeded, not that the right bundle is answering live traffic. This is the receipt — curl /health
+      # and fail the job unless the returned `version` equals the sha we just deployed.
+      - name: post-deploy verify — proven live, not merely deployed
+        env:
+          EXPECT_SHA: ${{ github.sha }}
+          HOST: ${{ inputs.environment == 'canary' && 'wave-realtime-edge-canary.jakefineman.workers.dev' || 'rt.wave.online' }}
+        run: |
+          set -e
+          echo "Verifying https://$HOST/health reports version == $EXPECT_SHA (timeout 120s)..."
+          DEADLINE=$((SECONDS + 120))
+          LIVE_VERSION=""
+          while [ "$SECONDS" -lt "$DEADLINE" ]; do
+            LIVE_VERSION=$(curl -fsS --max-time 10 "https://$HOST/health" 2>/dev/null \
+              | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{try{process.stdout.write(JSON.parse(d).version||"")}catch{process.stdout.write("")}})' \
+              || echo "")
+            if [ "$LIVE_VERSION" = "$EXPECT_SHA" ]; then
+              echo "receipt: https://$HOST/health version=$LIVE_VERSION matches $EXPECT_SHA"
+              break
+            fi
+            sleep 5
+          done
+          if [ "$LIVE_VERSION" != "$EXPECT_SHA" ]; then
+            echo "::error::post-deploy verification FAILED after 120s — https://$HOST/health reports version='$LIVE_VERSION', expected '$EXPECT_SHA'. A stale or wrong bundle may be live."
+            exit 1
+          fi

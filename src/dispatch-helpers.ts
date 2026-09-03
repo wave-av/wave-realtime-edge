@@ -27,6 +27,9 @@ interface RoomNamespace {
 // RT_RECORD/RT_ENCODER/RT_RECORDINGS + the pull-mode RT_MEETING_ORG meetingId→org KV) flows straight from the
 // worker env into selectEncoder()/pullRecordingConfigured()/the webhook pull sink with no re-mapping.
 export interface Env extends EncoderEnv, ResidencySinkEnv, IngestBridgeRuntimeEnv, CascadeSinkEnv {
+	// deploy identity ([vars] "unset" placeholder, overridden per-deploy: `wrangler deploy --var GIT_SHA:$sha`,
+	// mirrors wave-transcode-edge). /health echoes it so CI's post-deploy step proves the live worker == commit.
+	GIT_SHA?: string;
 	// F (#55) Plane-2 direct-ingest control plane — INERT behind INGEST_BRIDGE_ENABLED ([vars], default off) +
 	// per-protocol container bindings (SRT_BRIDGE/RIST_BRIDGE/RTMPS_BRIDGE/MOQ_BRIDGE, all COMMENTED until each
 	// leg's ◆). Off/absent → /v1/ingest/{proto}/session falls through to the 501 catch-all, UNCHANGED. The flag,

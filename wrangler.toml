@@ -32,6 +32,11 @@ enabled = true
 crons = ["*/15 * * * *", "*/5 * * * *"]
 
 [vars]
+# GIT_SHA: default placeholder for local dev / `wrangler deploy --dry-run`. deploy.yml overrides this
+# per-deploy with `--var GIT_SHA:${{ github.sha }}` (no toml edit needed — mirrors wave-transcode-edge).
+# /health echoes it as `version` so a post-deploy curl can prove which commit is actually live.
+GIT_SHA = "unset"
+
 # CF-3.1.2 — RealtimeKit (CF Realtime) config. RTK_APP_ID is a non-secret app identifier.
 RTK_APP_ID = "6dee33e5-cd89-41e8-a81c-9a8cd48bb9c3"
 # CF_ACCOUNT_ID is injected at deploy (CI var or `wrangler deploy --var CF_ACCOUNT_ID:<id>`),
