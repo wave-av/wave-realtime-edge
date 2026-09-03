@@ -1,0 +1,33 @@
+scripts/ci/resolve-deploy-host.d.mts
+  s_4657dee555390b::t_ad2f050b8c78a0 1-6
+src/route-dispatch.ts
+  s_4657dee555390b::t_63788c5e2b5430 87-91,97-98
+.github/workflows/deploy.yml
+  s_4657dee555390b::t_cec1fa253a1a89 12-13,17-27
+  s_4657dee555390b::t_2595221b213994 73-75,96-111,122-161
+test/worker.contract.test.ts
+  s_4657dee555390b::t_b1c439fc7ab66d 9
+  s_4657dee555390b::t_ea16fc521af4cc 66-83
+scripts/ci/resolve-deploy-host.mjs
+  s_4657dee555390b::t_99b3857d4934f3 1-89
+src/dispatch-helpers.ts
+  s_4657dee555390b::t_5eeeaf84de91f9 30-37
+test/resolve-deploy-host.test.ts
+  s_4657dee555390b::t_894d9f6959fe9f 1-87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "65b1c18650c9819b7ef63c0e22ae43a230b8c8bb",
+  "prompts": {},
+  "sessions": {
+    "s_4657dee555390b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c714314b-1edf-4e54-a112-2a97f2377df1",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Jake Fineman <jakefineman@gmail.com>"
+    }
+  }
+}
