@@ -17,6 +17,10 @@
 // scope for a discovery-surface fix. `/openapi.json`, `/robots.txt`, `/sitemap.xml`, `/status`, etc.
 // stay 501 for now (tracked as a follow-up if the product ever needs the full chassis surface set).
 import { llmsTxt, agentCard, skillMd, type SpokeMeta } from "@wave-av/spoke-chassis";
+// The chassis response-header floor (CSP + Referrer-Policy + nosniff + frame-options). Added
+// 2026-09-03: these three responses shipped with NO security headers at all, because rt's custom
+// router set them on the landing page only. See sec-headers.ts for the measurement.
+import { SEC_HEADERS } from "./sec-headers";
 
 // Mirrors landing.ts's `shell()` metadata (product/host/accentHex) so the discovery surfaces and the
 // branded landing describe the SAME product identically — one fact, not two copies that can drift.
@@ -31,9 +35,9 @@ export const RT_META: SpokeMeta = {
 	productPathsDeclared: false,
 };
 
-const TEXT_PLAIN = { "content-type": "text/plain; charset=utf-8" };
-const APP_JSON = { "content-type": "application/json; charset=utf-8" };
-const TEXT_MARKDOWN = { "content-type": "text/markdown; charset=utf-8" };
+const TEXT_PLAIN = { "content-type": "text/plain; charset=utf-8", ...SEC_HEADERS };
+const APP_JSON = { "content-type": "application/json; charset=utf-8", ...SEC_HEADERS };
+const TEXT_MARKDOWN = { "content-type": "text/markdown; charset=utf-8", ...SEC_HEADERS };
 
 /** Serve the three agent-discovery GET well-knowns if `request` matches one; otherwise null so the
  *  caller falls through to the rest of dispatch() unchanged. */

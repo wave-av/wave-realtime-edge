@@ -26,8 +26,29 @@ const chassis = makeFetch(landingPage, markSvg(ACCENT_HEX), {
 
 const CHASSIS_PATHS = new Set(["/favicon.svg", "/favicon.ico", "/robots.txt", "/sitemap.xml"]);
 
-/** True when the path is a chassis-owned public surface — /_wave/* or one of the discovery paths. */
-export function isChassisPath(pathname: string): boolean {
+/**
+ * True when this request is a chassis-owned public surface — a readable /_wave/* asset, the funnel
+ * beacon POST /_wave/e, or one of the discovery paths.
+ *
+ * The METHOD is part of the test, not just the path. This seam's contract has always been "public
+ * GETs only, plus POST /_wave/e for the funnel beacon" (see the header comment above), but the
+ * original predicate matched on pathname ALONE, so any method on a chassis path was handed to
+ * `makeFetch` — which answers a method it does not route with its own 404, ahead of this worker's
+ * REALTIME_NOT_IMPLEMENTED 501 catch-all. That catch-all is a documented invariant that dozens of
+ * INERT feature flags depend on. Measured against production 2026-09-03, before this gate:
+ *   POST /robots.txt → 404 · POST /sitemap.xml → 404 · POST /favicon.ico → 200 (!)
+ *   POST /nonexistent-control → 501  (the invariant, still correct on unclaimed paths)
+ * The /favicon.ico case is the worst of the three: a POST got a 200 and a favicon body. With the gate
+ * below all three fall through to the 501 like every other unroutable method, and the two live
+ * chassis behaviours are preserved exactly — GET/HEAD assets, and the POST /_wave/e beacon (204).
+ *
+ * `/_wave/e` is the ONLY POST route the chassis worker declares (verified against the installed
+ * 0.17.1 dist: its /_wave routes are consent.js, cta.js, e, funnel.json, nav.js, and `e` is the sole
+ * one behind a POST branch), so naming it exactly is precise rather than over-tight.
+ */
+export function isChassisPath(pathname: string, method: string): boolean {
+	if (method === "POST") return pathname === "/_wave/e";
+	if (method !== "GET" && method !== "HEAD") return false;
 	return pathname.startsWith("/_wave/") || CHASSIS_PATHS.has(pathname);
 }
 
