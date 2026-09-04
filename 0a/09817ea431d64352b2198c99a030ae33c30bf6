@@ -1,0 +1,39 @@
+src/route-dispatch.ts
+  s_73ce9d874d7339::t_454f3c749c99dd 49-51
+  s_73ce9d874d7339::t_38e317ef510e27 105-106
+  s_73ce9d874d7339::t_7dac1d18fcc5ff 103-104
+src/discovery-routes.ts
+  s_73ce9d874d7339::t_ecf51194a43328 195-199
+  s_73ce9d874d7339::t_73fcbb61f1892b 35-38
+  s_73ce9d874d7339::t_ce491c20feb7d8 32,34
+  s_73ce9d874d7339::t_3de9c627fb5238 40
+  s_73ce9d874d7339::t_795b6ab64e0857 1-31,33,39,41-194,200-227
+test/discovery-routes.test.ts
+  s_73ce9d874d7339::t_412ee08882deba 1-23,25-27,31,35-97,104-108,112-162
+  s_73ce9d874d7339::t_e75815c67f1bc4 109-111
+  s_73ce9d874d7339::t_1c6e77dc712bb2 24
+  s_73ce9d874d7339::t_6b425562c912ff 28-30
+  s_73ce9d874d7339::t_236fd610e6ae40 32-34
+  s_73ce9d874d7339::t_57f0276b42a8ff 98-103
+src/sec-headers.ts
+  s_73ce9d874d7339::t_74d71ec3fecbba 1-35
+src/agent-discovery.ts
+  s_73ce9d874d7339::t_a63ba6f1cd5f51 20-23
+  s_73ce9d874d7339::t_3b5aa1217b235f 38-40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "0a09817ea431d64352b2198c99a030ae33c30bf6",
+  "prompts": {},
+  "sessions": {
+    "s_73ce9d874d7339": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "98a8bbf9-cb78-42d8-a6f5-f3aaa2c16b46",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jake Fineman <jakefineman@gmail.com>"
+    }
+  }
+}
