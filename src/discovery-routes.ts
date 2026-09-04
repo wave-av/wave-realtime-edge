@@ -59,10 +59,12 @@ const RT_SITEMAP_PATHS = ["/"];
 //      wrangler.toml [vars]: WHIP_INGEST_ENABLED="1", WHEP_EGRESS_ENABLED="1",
 //      INGRESS_ROUTER_ENABLED="1", VOICE_AGENT_PROVIDER="wave". A route behind an INERT flag 501s
 //      after payment, so it is excluded (see NOT_LISTED below).
-//   2. THE GATEWAY FORWARDS IT. wave-gateway src/realtime.ts (REALTIME_ROUTES, SFU_ROOM_ACTIONS,
-//      agentDispatchEdgePath), src/whip.ts (WHIP_PREFIX, methods POST/PATCH/DELETE) and src/whep.ts
-//      (WHEP_PREFIX, same methods) are the fail-closed forward tables. A path the gateway will not
-//      forward is unbuyable no matter what it costs.
+//   2. THE GATEWAY FORWARDS IT. Checked against the WAVE gateway's own fail-closed forward tables —
+//      its realtime route map and SFU room-action allowlist, its agent-dispatch path builder, and the
+//      WHIP and WHEP prefix forwards (POST/PATCH/DELETE). Those tables are the authority, and they
+//      live in a PRIVATE repo, so they are described here rather than cited by path: a public file
+//      does not get to carry another repo's internals. A path the gateway will not forward is
+//      unbuyable no matter what it costs.
 //   3. THE PRICE IS THE LIVE 402. Measured 2026-09-03, unauthenticated, against api.wave.online:
 //        POST /v1/realtime/join            → 402, accepts[0].maxAmountRequired "3000"
 //        POST /v1/realtime/turn            → 402, "3000"
