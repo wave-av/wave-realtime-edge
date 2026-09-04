@@ -153,6 +153,31 @@ describe("the 501 catch-all is otherwise UNCHANGED", () => {
 		}
 	});
 
+	// Added during the rebase onto main (2026-09-03), after #473 landed src/chassis-passthrough.ts
+	// underneath this branch. That seam claimed /robots.txt, /sitemap.xml and /favicon.{ico,svg} by
+	// PATHNAME ONLY, so any method on them reached the chassis `makeFetch` and got ITS 404 (or worse)
+	// instead of this router's 501. Measured live before the fix: POST /robots.txt → 404,
+	// POST /sitemap.xml → 404, POST /favicon.ico → 200 with a favicon body. isChassisPath now takes
+	// the method too. These two tests pin BOTH halves so a future edit cannot regress either one.
+	it("a non-GET/HEAD method on a CHASSIS-claimed path also falls through to the 501", async () => {
+		for (const p of ["/robots.txt", "/sitemap.xml", "/favicon.ico", "/favicon.svg", "/_wave/consent.js"]) {
+			for (const method of ["POST", "PUT", "DELETE"]) {
+				const res = await dispatch(new Request(`https://rt.wave.online${p}`, { method }), env, undefined);
+				expect(res.status, `${method} ${p}`).toBe(501);
+			}
+		}
+	});
+
+	it("POST /_wave/e — the funnel beacon — is STILL routed to the chassis, not 501'd", async () => {
+		// The one POST the chassis worker declares. The method gate above must not cost us this.
+		const res = await dispatch(
+			new Request("https://rt.wave.online/_wave/e", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }),
+			env,
+			undefined,
+		);
+		expect(res.status).not.toBe(501);
+	});
+
 	it("matching is EXACT — no prefix/suffix path can reach a discovery handler", async () => {
 		for (const p of ["/robots.txt/x", "/x/robots.txt", "/.well-known/x402/extra", "/favicon.icon", "/sitemap.xml.bak"]) {
 			const res = await get(p);

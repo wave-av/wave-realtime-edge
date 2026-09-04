@@ -43,6 +43,10 @@ import { resolveRelay } from "./cascade-sink";
 import { maybeHandleCanaryProof } from "./canary-proof";
 // #151 hosted recorder INGEST (PUT /v1/realtime/recording-ingest/*) — leaf module keeps this router under the
 // file-size gate. INERT behind RECORDER_INGEST_ENABLED (default off → 501).
+// Chassis passthrough (#473) — /_wave/* assets the landing shell references, plus the funnel beacon.
+// The branded front door at GET "/" and the crawler/commerce surfaces moved to discovery-routes.ts
+// (below), so `landingPage`/`DEFAULT_CSP` are no longer imported directly here.
+import { chassisFetch, isChassisPath } from "./chassis-passthrough";
 // Agent-discovery well-knowns (GET /llms.txt, /.well-known/agent-card.json, /skill.md) — see
 // agent-discovery.ts for why these needed their own leaf module (they previously 501'd).
 import { maybeHandleAgentDiscovery } from "./agent-discovery";
@@ -102,8 +106,29 @@ export async function dispatch(
 
 	// Front-door + crawler/commerce surfaces — GET|HEAD "/", /robots.txt, /sitemap.xml,
 	// /favicon.{ico,svg}, /.well-known/x402. Same tier as above: they must never reach the 501.
+	//
+	// ORDERING (deliberate, measured 2026-09-03 — this block runs BEFORE the chassis passthrough).
+	// #473 landed chassis-passthrough.ts while this branch was open, and its CHASSIS_PATHS set also
+	// claims /robots.txt, /sitemap.xml and /favicon.{ico,svg}. Those four are served here instead,
+	// because the generic chassis rendering of two of them is wrong for THIS host:
+	//   · /sitemap.xml — the chassis DEFAULT_SITEMAP_PATHS advertise /pricing, /status and
+	//     /transparency. rt serves NONE of them; live receipts that day: rt.wave.online/status → 501,
+	//     /transparency → 501, and the deployed sitemap listed both anyway. RT_SITEMAP_PATHS lists
+	//     only "/" — the one indexable page rt actually has (see discovery-routes.ts).
+	//   · /favicon.svg — the passthrough hands makeFetch `markSvg()`, which is the INLINE NAV mark:
+	//     no `xmlns`, plus a hard-coded width="14" height="11" and aria-hidden. Served standalone as
+	//     image/svg+xml that is not a renderable SVG document (a standalone SVG needs the xmlns).
+	//     `fillFavicon()` — used here — is the chassis's standalone-favicon renderer and emits both.
+	// /_wave/* (the shell's own consent.js, cta.js, nav.js and the funnel beacon) still falls through
+	// to the chassis below, which is the only thing that can serve those. Both seams stay live.
 	const discoveryFiles = maybeHandleDiscoveryRoutes(request, url.pathname);
 	if (discoveryFiles) return discoveryFiles;
+
+	// Chassis passthrough (public GETs only, plus POST /_wave/e for the funnel beacon).
+	// See src/chassis-passthrough.ts for the full seam + audit receipt.
+	if (isChassisPath(url.pathname, request.method)) {
+		return chassisFetch(request, env, ctx);
+	}
 
 	// #138 Canary C3 — CF-runtime recorder proof (canary-only; prod-inert). Handler lives in canary-proof.ts.
 	const canaryProof = await maybeHandleCanaryProof(request, url, env);
