@@ -1,0 +1,26 @@
+package-lock.json
+  h_af5ac1a9798224 12,2039-2041,2057-2059,2062
+package.json
+  h_af5ac1a9798224 19
+scripts/ci/bundle-eval-gate.mjs
+  h_af5ac1a9798224 294-313
+src/chassis-passthrough.ts
+  h_af5ac1a9798224 1-62
+src/route-dispatch.ts
+  h_af5ac1a9798224 46-49,109-123,127-132
+src/sec-headers.ts
+  h_af5ac1a9798224 19-30
+test/discovery-routes.test.ts
+  h_af5ac1a9798224 156-180
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "b56933cfe1f26aaa2f45e36524c321be9d309333",
+  "prompts": {},
+  "humans": {
+    "h_af5ac1a9798224": {
+      "author": "Jake Fineman <jakefineman@gmail.com>"
+    }
+  }
+}
