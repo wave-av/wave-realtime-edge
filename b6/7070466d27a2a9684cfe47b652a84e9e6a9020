@@ -2,6 +2,9 @@ src/route-dispatch.ts
   s_73ce9d874d7339::t_454f3c749c99dd 53-55
   s_73ce9d874d7339::t_38e317ef510e27 124-125
   s_73ce9d874d7339::t_7dac1d18fcc5ff 107-108
+  s_73ce9d874d7339::t_f091158b926e06 46-48
+  s_73ce9d874d7339::t_8e56fa1bbf4362 109-123,126-128,130
+  s_73ce9d874d7339::t_45c097c5b34719 129
 src/discovery-routes.ts
   s_73ce9d874d7339::t_ecf51194a43328 195-199
   s_73ce9d874d7339::t_73fcbb61f1892b 35-38
@@ -15,11 +18,15 @@ test/discovery-routes.test.ts
   s_73ce9d874d7339::t_6b425562c912ff 28-30
   s_73ce9d874d7339::t_236fd610e6ae40 32-34
   s_73ce9d874d7339::t_57f0276b42a8ff 98-103
+  s_73ce9d874d7339::t_4b124bc68cfd23 156-180
 src/sec-headers.ts
   s_73ce9d874d7339::t_74d71ec3fecbba 1-18,31-45
+  s_73ce9d874d7339::t_3cbc8ff6946f90 19-30
 src/agent-discovery.ts
   s_73ce9d874d7339::t_a63ba6f1cd5f51 20-23
   s_73ce9d874d7339::t_3b5aa1217b235f 38-40
+src/chassis-passthrough.ts
+  s_73ce9d874d7339::t_a215cdd9fa89da 29-51
 ---
 {
   "schema_version": "authorship/3.0.0",
