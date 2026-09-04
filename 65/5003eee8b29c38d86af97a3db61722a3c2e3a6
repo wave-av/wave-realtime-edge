@@ -1,0 +1,26 @@
+.github/workflows/deploy.yml
+  h_af5ac1a9798224 58,62,65
+package-lock.json
+  h_af5ac1a9798224 12,752-754,772-774,792-794,812-814,832-834,852-854,872-874,892-894,912-914,938-940,964-966,990-992,1016-1018,1042-1044,1068-1070,1094-1096,2105-2107
+package.json
+  h_af5ac1a9798224 19
+src/agent-discovery.ts
+  h_af5ac1a9798224 1-52
+src/landing.ts
+  h_af5ac1a9798224 17-19,28-31,38-42
+src/route-dispatch.ts
+  h_af5ac1a9798224 51-53,105-108
+test/agent-discovery.test.ts
+  h_af5ac1a9798224 1-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "655003eee8b29c38d86af97a3db61722a3c2e3a6",
+  "prompts": {},
+  "humans": {
+    "h_af5ac1a9798224": {
+      "author": "Jake Fineman <jakefineman@gmail.com>"
+    }
+  }
+}
