@@ -47,6 +47,7 @@ import { maybeHandleCanaryProof } from "./canary-proof";
 // default: DEFAULT_CSP allows only same-origin script-src). Pure string render, no I/O, no auth.
 import { landingPage } from "./landing";
 import { DEFAULT_CSP } from "@wave-av/spoke-chassis";
+import { chassisFetch, isChassisPath } from "./chassis-passthrough";
 // Agent-discovery well-knowns (GET /llms.txt, /.well-known/agent-card.json, /skill.md) — see
 // agent-discovery.ts for why these needed their own leaf module (they previously 501'd).
 import { maybeHandleAgentDiscovery } from "./agent-discovery";
@@ -96,6 +97,11 @@ export async function dispatch(
 		});
 	}
 
+	// Chassis passthrough (public GETs only, plus POST /_wave/e for the funnel beacon).
+	// See src/chassis-passthrough.ts for the full seam + audit receipt.
+	if (isChassisPath(url.pathname)) {
+		return chassisFetch(request, env, ctx);
+	}
 	// Agent-discovery well-knowns — GET /llms.txt, /.well-known/agent-card.json, /skill.md. Checked
 	// early (same tier as /health and "/") so they never fall through to the 501 catch-all below.
 	const discovery = maybeHandleAgentDiscovery(request, url.pathname);
