@@ -48,6 +48,9 @@ import { maybeHandleCanaryProof } from "./canary-proof";
 import { landingPage } from "./landing";
 import { DEFAULT_CSP } from "@wave-av/spoke-chassis";
 import { chassisFetch, isChassisPath } from "./chassis-passthrough";
+// Agent-discovery well-knowns (GET /llms.txt, /.well-known/agent-card.json, /skill.md) — see
+// agent-discovery.ts for why these needed their own leaf module (they previously 501'd).
+import { maybeHandleAgentDiscovery } from "./agent-discovery";
 // Env shape, route-match constants, and the auth/deps/sink plumbing — extracted to a leaf module (task #56) so
 // neither file exceeds 800 lines. dispatch-helpers.ts imports nothing from here (no cycle).
 import {
@@ -99,6 +102,10 @@ export async function dispatch(
 	if (isChassisPath(url.pathname)) {
 		return chassisFetch(request, env, ctx);
 	}
+	// Agent-discovery well-knowns — GET /llms.txt, /.well-known/agent-card.json, /skill.md. Checked
+	// early (same tier as /health and "/") so they never fall through to the 501 catch-all below.
+	const discovery = maybeHandleAgentDiscovery(request, url.pathname);
+	if (discovery) return discovery;
 
 	if (request.method === "GET" && url.pathname === "/") {
 		return new Response(landingPage(), {
