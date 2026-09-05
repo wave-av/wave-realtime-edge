@@ -182,6 +182,16 @@ async function main() {
         CF_ACCOUNT_ID: "",
       },
       stdio: ["ignore", "pipe", "pipe"],
+      // `detached: true` makes this child the leader of its OWN process group (pgid ===
+      // child.pid), so `process.kill(-child.pid, sig)` in shutdown() below (negative pid = whole
+      // group) reaches every descendant `npx`/`wrangler` fork — its own `esbuild` build-service
+      // process, the `workerd` runtime binary, AND the `docker` exec streams for
+      // RecorderContainer / MoqPublishContainer — not just the immediate process. Without this, a
+      // plain `child.kill()` only signals the single process node spawned; on Linux CI `npx`
+      // resolves through an extra shell/exec hop, so that lone SIGTERM never reached the
+      // grandchildren, which then kept running as orphans holding the piped stdout/stderr open.
+      // Ported from wave-av/wave-voice-edge, which hit and fixed this exact class first.
+      detached: true,
     },
   );
 
@@ -226,9 +236,36 @@ async function main() {
     await delay(500);
   }
 
-  const shutdown = () => {
-    if (!child.killed) {
-      child.kill("SIGTERM");
+  // Kills the whole `wrangler dev` process GROUP (see the `detached: true` comment above) —
+  // negative pid targets every process sharing child's group, not just child itself — then
+  // force-kills anything still alive after a short grace window. Previously this only called
+  // `child.kill("SIGTERM")` and relied on a `.finally(() => process.exit(...))` wrapper around
+  // main() to force the job to end (see wave-realtime-edge PR #473, run 33786449325: the gate
+  // printed "PASSED" at 17:46:51 but the job then hung with zero further output until the
+  // workflow's own `timeout-minutes: 10` force-cancelled it 14 minutes later — the RecorderContainer
+  // / MoqPublishContainer docker-backed `wrangler dev` process tree left grandchild handles open
+  // that the single un-grouped SIGTERM never reached). That ad hoc finally-based force-exit fixed
+  // the SYMPTOM (the job now always terminates) but not the ROOT CAUSE (the orphaned
+  // esbuild/workerd/docker-exec grandchildren were still left running). This is the fleet-standard
+  // fix, ported from wave-av/wave-voice-edge (scripts/ci/bundle-eval-gate.mjs), which hit and fixed
+  // this exact class first: kill the whole process group, not just the immediate child.
+  const shutdown = async () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    try {
+      process.kill(-child.pid, "SIGTERM");
+    } catch {
+      // group may already be gone (e.g. child never got a pid, or already reaped)
+    }
+    const graceDeadline = Date.now() + 3_000;
+    while (child.exitCode === null && child.signalCode === null && Date.now() < graceDeadline) {
+      await delay(100);
+    }
+    if (child.exitCode === null && child.signalCode === null) {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        // best-effort
+      }
     }
   };
 
@@ -241,24 +278,22 @@ async function main() {
   };
 
   if (failureLine || exited) {
-    shutdown();
+    await shutdown();
     cleanup();
     log("FAILED — the Worker bundle did not evaluate cleanly in workerd.");
     if (failureLine) log(`Detected failure signature: ${failureLine}`);
     if (exited) log(`wrangler dev exited early with code ${exitCode}`);
     log("--- captured output ---");
     console.log(output);
-    process.exitCode = 1;
-    return;
+    process.exit(1);
   }
 
   if (!ready) {
-    shutdown();
+    await shutdown();
     cleanup();
     log(`FAILED — 'wrangler dev' never printed "Ready on" within ${READY_TIMEOUT_MS}ms.`);
     console.log(output);
-    process.exitCode = 1;
-    return;
+    process.exit(1);
   }
 
   // The module evaluated and the dev server bound its port. Confirm it actually serves a
@@ -278,36 +313,19 @@ async function main() {
     log(`HTTP round-trip to booted worker failed: ${err}`);
   }
 
-  shutdown();
+  await shutdown();
   cleanup();
 
   if (!httpOk) {
     log("FAILED — worker process bound its port but did not answer an HTTP request.");
-    process.exitCode = 1;
-    return;
+    process.exit(1);
   }
 
   log("PASSED — Worker bundle evaluated cleanly in workerd and served a request.");
-  process.exitCode = 0;
+  process.exit(0);
 }
 
-main()
-  .catch((err) => {
-    console.error("[bundle-eval-gate] unexpected error:", err);
-    process.exitCode = 1;
-  })
-  .finally(() => {
-    // FORCE exit — do not rely on the event loop draining naturally. `wrangler dev` (this repo
-    // boots RecorderContainer + MoqPublishContainer, two real Docker-container-backed Durable
-    // Objects) can leave grandchild handles/pipes open after `child.kill("SIGTERM")` above returns
-    // — SIGTERM asks `npx wrangler dev` to stop, but does not guarantee every descendant process
-    // (docker exec streams, the workerd subprocess itself) has actually torn down its fds by the
-    // time this script reaches here. Observed live in CI (wave-realtime-edge PR #473, run
-    // 33786449325): the gate printed "PASSED" at 17:46:51 but the job then hung with zero further
-    // output until the workflow's own timeout force-cancelled it 14 minutes later at 18:00:53 —
-    // the script never called process.exit(), so Node kept the process alive waiting on whatever
-    // handle was still open. `process.exit(process.exitCode ?? 0)` makes the gate's own verdict
-    // (PASSED/FAILED, already logged and captured above) the only thing that determines the job's
-    // outcome, independent of any child process cleanup race.
-    process.exit(process.exitCode ?? 0);
-  });
+main().catch((err) => {
+  console.error("[bundle-eval-gate] unexpected error:", err);
+  process.exit(1);
+});
