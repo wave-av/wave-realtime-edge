@@ -1,0 +1,47 @@
+test/channel.test.ts
+  s_4657dee555390b::t_5c4ff6fccf18d0 1-164
+README.md
+  s_4657dee555390b::t_5a91034ddf235b 115-118
+  s_4657dee555390b::t_0c327687a3a198 47
+src/worker.ts
+  s_4657dee555390b::t_525587c07dc132 26-30
+src/channel.ts
+  s_4657dee555390b::t_9f434bff1add3b 1-24,37-172
+  s_4657dee555390b::t_5747e3bb6c13fb 25-36
+wrangler.toml
+  s_4657dee555390b::t_854e1a41b23a1c 547-560
+src/route-channel.ts
+  s_4657dee555390b::t_70c369f17666ed 1-118
+src/channel-metering.ts
+  s_4657dee555390b::t_014d278fe65a36 1-62
+test/channel-do.test.ts
+  s_4657dee555390b::t_c7b50b61fab8ff 1-57,64-226
+  s_4657dee555390b::t_f76f8b69de3d08 58-63
+test/route-channel.test.ts
+  s_4657dee555390b::t_a4692493ecc53f 1-144
+capabilities.json
+  s_4657dee555390b::t_2734f260d24f94 15-19
+src/channel-do.ts
+  s_4657dee555390b::t_f0ad4a05bd7178 1-233
+src/dispatch-helpers.ts
+  s_4657dee555390b::t_11cac139df451e 72-74
+src/route-dispatch.ts
+  s_4657dee555390b::t_bc93dfa4811d65 152-157
+  s_4657dee555390b::t_a6034264c03ab8 77-80
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "0c3b94b3520d84850044b1d7e98f9fb9b877986d",
+  "prompts": {},
+  "sessions": {
+    "s_4657dee555390b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c714314b-1edf-4e54-a112-2a97f2377df1",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jake Fineman <jakefineman@gmail.com>"
+    }
+  }
+}
