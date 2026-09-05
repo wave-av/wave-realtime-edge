@@ -6,7 +6,7 @@
  * minimal stub env/ctx so no network, Cloudflare runtime, or secrets are needed.
  *
  * Grounded in src/worker.ts as-shipped:
- *   GET /health   → 200  {ok,service,layer,protocol,version}
+ *   GET /health   → 200  {ok,service,layer,protocol,version,sha}
  *   <any other>   → 501  {error:"REALTIME_NOT_IMPLEMENTED",path}
  *
  * Auth is NOT enforced by this worker — auth/entitlement decisions are delegated
@@ -62,6 +62,24 @@ describe("GET /health", () => {
 	it("no auth required — works without Authorization header", async () => {
 		const res = await worker.fetch(req("GET", "/health"), env, ctx);
 		expect(res.status).toBe(200);
+	});
+
+	// Deploy-ordering receipt (go-live remediation, 2026-09-02): GIT_SHA is stamped at deploy time
+	// (`wrangler deploy --var GIT_SHA:<sha>`, deploy.yml) and echoed here so CI's post-deploy verify
+	// step can prove the live worker matches the commit it just deployed.
+	it("without GIT_SHA in env: version falls back to 'dev' and sha is null (local/dry-run, unchanged default)", async () => {
+		const res = await worker.fetch(req("GET", "/health"), env, ctx);
+		const body = await res.json() as Record<string, unknown>;
+		expect(body.version).toBe("dev");
+		expect(body.sha).toBeNull();
+	});
+
+	it("with GIT_SHA in env (deployed shape): echoes it as both version and sha", async () => {
+		const shaEnv = { GIT_SHA: "abc1234567890abc1234567890abc1234567890" } as never;
+		const res = await worker.fetch(req("GET", "/health"), shaEnv, ctx);
+		const body = await res.json() as Record<string, unknown>;
+		expect(body.version).toBe("abc1234567890abc1234567890abc1234567890");
+		expect(body.sha).toBe("abc1234567890abc1234567890abc1234567890");
 	});
 });
 

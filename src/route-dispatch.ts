@@ -90,12 +90,18 @@ export async function dispatch(
 	const url = new URL(request.url);
 
 	if (url.pathname === "/health") {
+		// GIT_SHA is stamped at deploy time (`wrangler deploy --var GIT_SHA:<sha>`, deploy.yml) —
+		// never committed here. Echoed as BOTH `version` (fixes the long-standing "version":"dev"
+		// stale-receipt bug) and `sha` (the exact key CI's post-deploy verify step parses, matching
+		// the wave-media-edge/wave-spoke-template fleet convention). Falls back to "dev" locally /
+		// in a dry-run where no GIT_SHA var was passed.
 		return Response.json({
 			ok: true,
 			service: "wave-realtime-edge",
 			layer: "edge",
 			protocol: "webrtc-sfu",
-			version: "dev",
+			version: env.GIT_SHA || "dev",
+			sha: env.GIT_SHA || null,
 		});
 	}
 
