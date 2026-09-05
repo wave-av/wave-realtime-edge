@@ -1,0 +1,19 @@
+test/health.test.ts
+  s_293affce3db927::t_a0d997e2de7d95 1-56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "c5803199a9124c189c278f8e9e210b04a17dbdd0",
+  "prompts": {},
+  "sessions": {
+    "s_293affce3db927": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cad921ff-40f1-4f4f-90de-90328ad7a010",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jake Fineman <jakefineman@gmail.com>"
+    }
+  }
+}
