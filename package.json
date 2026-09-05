@@ -16,7 +16,7 @@
   },
   "dependencies": {
     "@cloudflare/containers": "^0.3.7",
-    "@wave-av/spoke-chassis": "^0.20.0"
+    "@wave-av/spoke-chassis": "^0.20.1"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.0.0",
