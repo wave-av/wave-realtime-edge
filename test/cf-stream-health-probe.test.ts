@@ -19,8 +19,10 @@ function fakeKv(): CfStreamHealthKv {
 }
 
 const okEnv = { CF_API_TOKEN: "tok", CF_ACCOUNT_ID: "acct", CF_STREAM_HEALTH_PROBE_ENABLED: "1" };
-const fetchOk = () => vi.fn(async () => new Response(JSON.stringify({ result: [] }), { status: 200 })) as unknown as typeof fetch;
+const fetchOk = () => vi.fn(async () => new Response(JSON.stringify({ success: true, result: [] }), { status: 200 })) as unknown as typeof fetch;
 const fetchFailing = (status: number) => vi.fn(async () => new Response("nope", { status })) as unknown as typeof fetch;
+/** A 2xx reply whose CF envelope reports `success:false` — the "looks fine, isn't" case. */
+const fetchSuccessFalse = () => vi.fn(async () => new Response(JSON.stringify({ success: false, errors: [{ message: "nope" }] }), { status: 200 })) as unknown as typeof fetch;
 
 describe("checkCfStreamHealth — inertness", () => {
 	it("is INERT unless explicitly enabled", async () => {
@@ -109,5 +111,55 @@ describe("checkCfStreamHealth — sustain and alarm behavior", () => {
 			"cf-stream-health-alarm",
 			expect.objectContaining({ status: 500, latencyMs: expect.any(Number) }),
 		);
+	});
+
+	it("treats a 2xx reply with success:false as UNHEALTHY, not a clean read", async () => {
+		const kv = fakeKv();
+		const log = vi.fn();
+		const r = await checkCfStreamHealth(okEnv, { fetch: fetchSuccessFalse(), kv, log });
+		expect(r).toMatchObject({ ok: false, status: 200 });
+		expect(log).toHaveBeenCalledWith("cf-stream-health-probe-failed", expect.objectContaining({ status: 200 }));
+	});
+});
+
+describe("checkCfStreamHealth — KV isolation", () => {
+	it("a rejected kv.get does not abort the probe — the failure log and heartbeat still fire", async () => {
+		const log = vi.fn();
+		const kv: CfStreamHealthKv = {
+			get: async () => { throw new Error("kv down"); },
+			put: async () => undefined,
+			delete: async () => undefined,
+		};
+		const r = await checkCfStreamHealth(okEnv, { fetch: fetchFailing(503), kv, log });
+		expect(r.ok).toBe(false);
+		expect(log).toHaveBeenCalledWith("cf-stream-health-kv-error", expect.objectContaining({ error: expect.stringContaining("kv down") }));
+		expect(log).toHaveBeenCalledWith("cf-stream-health-probe-failed", expect.anything());
+		expect(log).toHaveBeenCalledWith("cf-stream-health-tick", expect.objectContaining({ ok: false }));
+	});
+
+	it("a rejected kv.put does not abort the probe — the failure log and heartbeat still fire", async () => {
+		const log = vi.fn();
+		const kv: CfStreamHealthKv = {
+			get: async () => "0",
+			put: async () => { throw new Error("kv write down"); },
+			delete: async () => undefined,
+		};
+		const r = await checkCfStreamHealth(okEnv, { fetch: fetchFailing(503), kv, log });
+		expect(r.ok).toBe(false);
+		expect(log).toHaveBeenCalledWith("cf-stream-health-kv-error", expect.objectContaining({ error: expect.stringContaining("kv write down") }));
+		expect(log).toHaveBeenCalledWith("cf-stream-health-tick", expect.objectContaining({ ok: false }));
+	});
+
+	it("a rejected kv.delete does not abort the probe — the recovery is still logged", async () => {
+		const log = vi.fn();
+		const kv: CfStreamHealthKv = {
+			get: async () => "0",
+			put: async () => undefined,
+			delete: async () => { throw new Error("kv delete down"); },
+		};
+		const r = await checkCfStreamHealth(okEnv, { fetch: fetchOk(), kv, log });
+		expect(r.ok).toBe(true);
+		expect(log).toHaveBeenCalledWith("cf-stream-health-kv-error", expect.objectContaining({ error: expect.stringContaining("kv delete down") }));
+		expect(log).toHaveBeenCalledWith("cf-stream-health-tick", expect.objectContaining({ ok: true }));
 	});
 });
