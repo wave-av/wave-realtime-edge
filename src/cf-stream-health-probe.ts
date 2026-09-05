@@ -74,7 +74,11 @@ export async function checkCfStreamHealth(env: CfStreamHealthEnv, deps: CfStream
 			{ headers: { authorization: `Bearer ${env.CF_API_TOKEN}` } },
 		);
 		status = res.status;
-		ok = res.ok;
+		// CF wraps every reply in a `{success, errors, result}` envelope (same shape cf-stream-live-client.ts
+		// checks). A 2xx with `success:false` (auth/scoping regression, malformed request) is NOT healthy —
+		// trusting `res.ok` alone would clear the sustain streak on a response that is actually an error.
+		const body = (await res.json().catch(() => ({}))) as { success?: boolean };
+		ok = res.ok && body.success === true;
 	} catch (e) {
 		errorMessage = String((e as Error)?.message ?? e).slice(0, 160);
 	}
@@ -86,9 +90,20 @@ export async function checkCfStreamHealth(env: CfStreamHealthEnv, deps: CfStream
 		// this module exists to end.
 		log("cf-stream-health-probe-failed", { status: status ?? null, error: errorMessage ?? null, latencyMs });
 
-		const prior = deps.kv ? Number((await deps.kv.get(SUSTAIN_KEY)) ?? "0") : CF_STREAM_HEALTH_SUSTAIN_TICKS - 1;
-		const streak = (Number.isFinite(prior) ? prior : 0) + 1;
-		await deps.kv?.put(SUSTAIN_KEY, String(streak), { expirationTtl: SUSTAIN_TTL_S });
+		// KV get/put are wrapped in their OWN try/catch, separate from the fetch above: a KV outage/transient
+		// error must not reject checkCfStreamHealth and skip the alarm-decision log + the heartbeat below —
+		// that would recreate exactly the "probe ran but silently did nothing" blindness this module exists to
+		// end, just one layer down (a real Stream outage coinciding with a KV hiccup would go unrecorded).
+		// On a KV error, fall back to the SAME streak the no-KV-bound branch already uses (SUSTAIN_TICKS - 1) —
+		// a KV blip degrades this tick to "as if no persistent counter were configured", not an instant alarm.
+		let streak = CF_STREAM_HEALTH_SUSTAIN_TICKS - 1;
+		try {
+			const prior = deps.kv ? Number((await deps.kv.get(SUSTAIN_KEY)) ?? "0") : streak;
+			streak = (Number.isFinite(prior) ? prior : 0) + 1;
+			await deps.kv?.put(SUSTAIN_KEY, String(streak), { expirationTtl: SUSTAIN_TTL_S });
+		} catch (e) {
+			log("cf-stream-health-kv-error", { error: String((e as Error)?.message ?? e).slice(0, 160) });
+		}
 
 		if (streak >= CF_STREAM_HEALTH_SUSTAIN_TICKS) {
 			alarmed = true;
@@ -96,8 +111,13 @@ export async function checkCfStreamHealth(env: CfStreamHealthEnv, deps: CfStream
 		}
 	} else {
 		// Any successful reading clears the streak, so a single transient blip cannot accumulate into a false
-		// alarm across separate outages.
-		if (deps.kv) await deps.kv.delete(SUSTAIN_KEY);
+		// alarm across separate outages. Same isolation as above: a KV error here must not suppress the
+		// heartbeat.
+		try {
+			if (deps.kv) await deps.kv.delete(SUSTAIN_KEY);
+		} catch (e) {
+			log("cf-stream-health-kv-error", { error: String((e as Error)?.message ?? e).slice(0, 160) });
+		}
 	}
 
 	// HEARTBEAT — one line per tick, even when everything is fine, so "the probe never fired" and "the probe
