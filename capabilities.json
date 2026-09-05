@@ -12,7 +12,11 @@
       { "protocol": "webrtc-whep", "endpoint": "https://rt.wave.online/v1/whep/subscribe", "auth": "wave-token-v1", "metered": true, "lifecycle": "alpha", "spec": "docs/api/openapi.yaml" },
       { "protocol": "http", "capability": "health", "endpoint": "https://rt.wave.online/health", "auth": "none", "metered": false, "lifecycle": "ga", "spec": "docs/api/openapi.yaml" },
       { "protocol": "http", "capability": "realtime-rooms", "endpoint": "https://rt.wave.online/v1/realtime/rooms/{room}/{intent}", "auth": "wave-token-v1", "metered": true, "lifecycle": "alpha", "spec": "docs/api/openapi.yaml" },
-      { "protocol": "websocket", "capability": "presence", "endpoint": "https://rt.wave.online/v1/realtime/rooms/{room}/presence", "auth": "wave-token-v1", "metered": false, "lifecycle": "planned", "spec": "docs/api/openapi.yaml" }
+      { "protocol": "websocket", "capability": "presence", "endpoint": "https://rt.wave.online/v1/realtime/rooms/{room}/presence", "auth": "wave-token-v1", "metered": false, "lifecycle": "planned", "spec": "docs/api/openapi.yaml" },
+      { "protocol": "websocket", "capability": "channel-connect", "endpoint": "https://rt.wave.online/v1/connect", "auth": "wave-token-v1", "metered": true, "lifecycle": "alpha", "spec": "docs/api/openapi.yaml" },
+      { "protocol": "http", "capability": "channel-publish", "endpoint": "https://rt.wave.online/v1/channels/{channel}/publish", "auth": "wave-token-v1", "metered": true, "lifecycle": "alpha", "spec": "docs/api/openapi.yaml" },
+      { "protocol": "http", "capability": "channel-presence", "endpoint": "https://rt.wave.online/v1/channels/{channel}/presence", "auth": "wave-token-v1", "metered": false, "lifecycle": "alpha", "spec": "docs/api/openapi.yaml" },
+      { "protocol": "http", "capability": "channel-history", "endpoint": "https://rt.wave.online/v1/channels/{channel}/history", "auth": "wave-token-v1", "metered": false, "lifecycle": "alpha", "spec": "docs/api/openapi.yaml" }
     ]
   },
   "consumes": {

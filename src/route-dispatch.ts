@@ -74,6 +74,10 @@ import {
 } from "./dispatch-helpers";
 import { maybeHandleV1MediaRoutes } from "./route-v1-media";
 import { maybeHandleRtkRoutes } from "./route-rtk";
+// Item #5 — the channel pub/sub plane (spec/realtime.yaml). Route matching + dispatch live in their own
+// leaf module (route-channel.ts, same seam route-rtk.ts/route-v1-media.ts already use) so this file stays
+// under the size gate.
+import { maybeHandleChannelRoutes } from "./route-channel";
 
 // Re-export Env so worker.ts (the only external consumer of this module) keeps importing it from here unchanged.
 export type { Env } from "./dispatch-helpers";
@@ -150,6 +154,12 @@ export async function dispatch(
 
 	const v1 = await maybeHandleV1MediaRoutes(request, env, ctx);
 	if (v1) return v1;
+
+	// ── Item #5 — channel pub/sub plane: GET /v1/connect (WS), POST/GET /v1/channels/{channel}/{publish,
+	// presence,history}. Gateway-gated (x-wave-internal) + org-scoped (x-wave-org → ChannelDO id) exactly
+	// like the ROOM plane above; INERT (falls through) when the CHANNEL binding is absent. ──
+	const channelRes = await maybeHandleChannelRoutes(request, env, ctx);
+	if (channelRes) return channelRes;
 
 	// ── B1 (#91-a) CF Stream Live → SFU bridge — POST /v1/stream/bridge/webhook. INERT behind
 	// STREAM_BRIDGE_ENABLED (null → falls through to the 501 catch-all). Self-auth (CF HMAC), control-only. ──
