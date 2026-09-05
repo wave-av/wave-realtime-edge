@@ -7,6 +7,7 @@ import { scheduledStreamPoll } from "./stream-bridge-poll";
 import { scheduledIngestReconcile } from "./ingest-bridge";
 import { scheduledWhipSweep, WHIP_SWEEP_CRON } from "./whip-sweep";
 import { scheduledContainerHealth } from "./container-health-alarm";
+import { scheduledCfStreamHealth } from "./cf-stream-health-probe";
 import { scheduledE3nRecordingSweep } from "./e3n-recording-sweep";
 import { buildPullSink, type Env } from "./dispatch-helpers";
 
@@ -69,6 +70,13 @@ export async function scheduledHandler(
 	// interval dwell #234 asks for while keeping this to 4 CF API reads an hour. INERT unless
 	// CONTAINER_HEALTH_ALARM_ENABLED=1 + CF_API_TOKEN/CF_ACCOUNT_ID bound. Never throws.
 	if (!isSweepOnlyTick) scheduledContainerHealth(env, ctx, env.RT_MEETING_ORG);
+
+	// infra-integration:cloudflare-stream:health-probe — CF Stream API reachability check (distinct from the
+	// container-app watchdog above and from liveStreamProbeHealth's per-session bridge check). Gated to the
+	// FIFTEEN-minute tick for the same reason: a failure must be SUSTAINED across two ticks to alarm, and this
+	// keeps it to 4 CF API reads an hour. INERT unless CF_STREAM_HEALTH_PROBE_ENABLED=1 + CF_API_TOKEN/
+	// CF_ACCOUNT_ID bound. Never throws.
+	if (!isSweepOnlyTick) scheduledCfStreamHealth(env, ctx, env.RT_MEETING_ORG);
 
 	// E3n (wre#290) auto-record→VOD completion sweep (Axis A2+B1, INERT unless E3N_AUTORECORD_ENABLED + every
 	// required binding present). Gated to the FIFTEEN-minute tick — recording completion is not latency

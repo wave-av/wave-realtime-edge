@@ -47,6 +47,8 @@ export interface Env extends EncoderEnv, ResidencySinkEnv, IngestBridgeRuntimeEn
 	// #234 — token scoped to Containers:Read ONLY (wrangler SECRET). Kept separate from CF_API_TOKEN so a
 	// read-only watchdog does not force the customer-facing Calls/Realtime token to carry a wider scope.
 	CONTAINERS_API_TOKEN?: string;
+	// infra-integration:cloudflare-stream:health-probe flag ([vars], default off) — see cf-stream-health-probe.ts.
+	CF_STREAM_HEALTH_PROBE_ENABLED?: string;
 	// E-ROOMS P4 (#73) client presence/state-sync + data channel flag ([vars], default off). Falsy/absent →
 	// GET /v1/realtime/rooms/:room/presence is inert (falls through to the 501 catch-all, UNCHANGED). Truthy
 	// ("1"/"true") → the WS-upgrade presence surface is served (the DO owns the hibernatable socket).
