@@ -131,20 +131,40 @@ jobs:
       # [env.production] block, see scripts/ci/resolve-deploy-host.mjs). canary is skipped by design:
       # [env.canary] deliberately sets `routes = []` (incident 2026-07-12 — ROUTE ISOLATION comment in
       # wrangler.toml), so it has no custom-domain host to poll.
+      #
+      # FOUR-STATE exit contract (corrected 2026-09-05, see resolve-deploy-host.mjs header comment):
+      # a bare "resolved or not" collapses "a route is declared for this env but didn't resolve"
+      # (a resolver/TOML regression — must fail closed) with "nothing is declared for this env"
+      # (canary's deliberate `routes = []` — safe to skip). Branch on the resolver's OWN exit code,
+      # not on env name or emptiness:
+      #   exit 0 = resolved — verify it below.
+      #   exit 1 = a route IS declared in this env's own scope but did not resolve — FAIL.
+      #   exit 2 = nothing declared for this env (production absent, or canary's `routes = []`) — SKIP.
+      #   else   = resolver crashed (exit 3) or an unexpected code — FAIL rather than fall through
+      #            to verification with a possibly-empty host.
       - name: post-deploy verify — proven live, not merely deployed
         env:
           TARGET_ENV: ${{ inputs.environment }}
           EXPECT_SHA: ${{ github.sha }}
         run: |
           set -e
-          HOST=$(node scripts/ci/resolve-deploy-host.mjs "$TARGET_ENV" || true)
-          if [ -z "$HOST" ]; then
-            if [ "$TARGET_ENV" = "production" ]; then
-              echo "::error::no route resolved for env 'production' in wrangler.toml after a live production deploy — refusing to silently skip the proven-live gate. Either the wrangler.toml route/routes block is missing or resolve-deploy-host.mjs failed to parse it (check for a new TOML shape it doesn't recognise). A production deploy with an unverifiable route is a FAILURE, not a pass."
-              exit 1
-            fi
-            echo "::notice::no live custom-domain route for env '$TARGET_ENV' in wrangler.toml — skipping live verification (expected for canary, see wrangler.toml ROUTE ISOLATION comment)"
+          # Capture the real exit code (NOT `|| true`, which discards it and is exactly what let
+          # the two-state bug ship) so the four states above can be told apart.
+          set +e
+          HOST=$(node scripts/ci/resolve-deploy-host.mjs "$TARGET_ENV")
+          RC=$?
+          set -e
+          if [ "$RC" = "1" ]; then
+            echo "::error::a route IS declared in wrangler.toml for env '$TARGET_ENV' but resolve-deploy-host.mjs could not resolve it after a live deploy — refusing to silently skip the proven-live gate. This means the resolver regressed or wrangler.toml's route/routes shape changed in a way it doesn't recognise (the wave-email-edge run 33994760933 defect class). A deploy with a declared-but-unverifiable route is a FAILURE, not a pass."
+            exit 1
+          fi
+          if [ "$RC" = "2" ]; then
+            echo "::notice::no route declared for env '$TARGET_ENV' in wrangler.toml — skipping live verification (expected for canary, see wrangler.toml ROUTE ISOLATION comment; incident 2026-07-12)"
             exit 0
+          fi
+          if [ "$RC" != "0" ]; then
+            echo "::error::resolve-deploy-host.mjs exited with unexpected code $RC for env '$TARGET_ENV' (expected 0, 1, or 2) — treating as a failure rather than falling through to verification with a possibly-empty host. This usually means the resolver itself crashed (exit 3 — a parser bug, a permissions error, etc.); see the resolver's own stderr in the job log above."
+            exit 1
           fi
 
           echo "Verifying https://$HOST/health reports sha == $EXPECT_SHA (timeout 120s)..."

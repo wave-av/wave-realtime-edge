@@ -10,9 +10,32 @@
 // the top-level `routes[].pattern`, not an `[env.production]` section (this repo has none).
 // `canary` deploys via `[env.canary]`, which deliberately sets `routes = []` + `workers_dev =
 // true` (incident 2026-07-12: an inherited top-level route let a canary steal the prod host) — so
-// canary has NO custom-domain host to resolve. This script exits 1/empty for canary by design;
-// deploy.yml's post-deploy verify step treats that as "skip live verification", exactly like the
-// template does for any env with no route configured yet.
+// canary has NO custom-domain host to resolve, by design, not by regression.
+//
+// FOUR-STATE exit contract (wave-foundation#1453 / wave-spoke-template#77 postmortem, corrected
+// 2026-09-05 — see wave-vision-ingest#15 gitar-bot thread, which correctly flagged the original
+// two-state fix that hard-failed ANY empty resolver output for production): a bare "resolved or
+// not" collapses two different states the caller MUST treat differently, so the resolver itself
+// now tells the caller which:
+//   exit 0 + hostname on stdout = resolved.
+//   exit 1 + empty stdout       = a route IS declared in this env's own scope, but did not
+//                                 resolve — a resolver/TOML-shape regression (the wave-email-edge
+//                                 run 33994760933 defect: a route existed and this script failed
+//                                 to parse it). Unverifiable. The caller must fail closed.
+//   exit 2 + empty stdout       = no route is declared in this env's own scope — production's
+//                                 top-level `routes` key absent, or (canary's actual, deliberate
+//                                 shape) an `[env.<name>]` section whose `routes` key is present
+//                                 but explicitly EMPTY (`routes = []`, `route = {}`) or whose
+//                                 section is absent altogether. Nothing to verify; safe to skip.
+//                                 wrangler.toml absent (ENOENT) is the same state.
+//   exit 3 + empty stdout       = this script itself crashed unexpectedly.
+//
+// The "declared" check below is scoped PER ENV exactly like the host-resolution walk above it
+// (top-level-before-first-table for production; the `[env.<name>]` section for anything else) —
+// NOT a whole-file scan. A whole-file scan would wrongly flag canary's deploys as "declared but
+// unresolved" (exit 1, hard failure) merely because PRODUCTION's top-level routes key exists
+// elsewhere in the same wrangler.toml; canary's own `routes = []` is a deliberate empty
+// declaration, the same "nothing to verify" state as no key at all, not a parse regression.
 //
 // Usage: node scripts/ci/resolve-deploy-host.mjs <production|canary>
 
@@ -76,14 +99,86 @@ export function resolveDeployHost(tomlSrc, envName) {
 	return resolveNamedEnvHost(tomlSrc, envName);
 }
 
+/** Pure: true if a `routes`/`route` key with a NON-EMPTY value is declared for `envName`'s OWN
+ *  scope — the top-level (before the first `[table]`) for "production", or the `[env.<name>]`
+ *  section (and its live subsections) for anything else. Scoped to match resolveDeployHost()'s
+ *  own walk exactly, on purpose: this is the discriminator between "a route is declared for THIS
+ *  env but didn't resolve" (exit 1, must fail closed) and "nothing is declared for THIS env"
+ *  (exit 2, safe to skip) — collapsing the scope to a whole-file scan would wrongly read
+ *  production's top-level route as "declared" while resolving canary, turning canary's
+ *  deliberate `routes = []` (ROUTE ISOLATION, incident 2026-07-12) into a hard failure.
+ *  An empty declaration (`routes = []`, `route = {}`, or a bare `routes =`/`route =` with nothing
+ *  after it) counts as NOT declared — TOML's own way of saying "explicitly no route here", the
+ *  same "nothing to verify" state as the key being absent entirely, not a parse regression. */
+export function hasDeclaredRoute(tomlSrc, envName) {
+	const lines = tomlSrc.split("\n");
+	const isRouteKeyLine = (line) => {
+		const m = /^(routes|route)\s*=\s*(.*)$/.exec(line);
+		if (!m) return false;
+		const rhs = m[2].trim();
+		return rhs !== "" && rhs !== "[]" && rhs !== "{}";
+	};
+	if (envName === "production") {
+		for (const rawLine of lines) {
+			const line = rawLine.trim();
+			if (line.startsWith("#")) continue;
+			if (line.startsWith("[")) break; // top-level keys are exhausted at the first table
+			if (isRouteKeyLine(line)) return true;
+		}
+		return false;
+	}
+	const sectionHeader = `[env.${envName}]`;
+	const subsectionPrefix = `[env.${envName}.`;
+	let inSection = false;
+	for (const rawLine of lines) {
+		const line = rawLine.trim();
+		if (line.startsWith("#")) continue;
+		if (line === sectionHeader) {
+			inSection = true;
+			continue;
+		}
+		if (inSection && line.startsWith("[")) {
+			inSection = line.startsWith(subsectionPrefix);
+			continue;
+		}
+		if (inSection && isRouteKeyLine(line)) return true;
+	}
+	return false;
+}
+
+/** Pure: given the raw wrangler.toml text (or null if wrangler.toml is absent — ENOENT) and an
+ *  env name, return `{ host, exitCode }` per the four-state exit contract in the header comment.
+ *  Kept separate from readFileSync/process.exit specifically so the exit-code decision (including
+ *  the ENOENT-as-null path) is unit-testable without spawning a subprocess. */
+export function resolveExitCode(tomlSrcOrNull, envName) {
+	if (tomlSrcOrNull === null) return { host: null, exitCode: 2 };
+	const host = resolveDeployHost(tomlSrcOrNull, envName);
+	if (host) return { host, exitCode: 0 };
+	return { host: null, exitCode: hasDeclaredRoute(tomlSrcOrNull, envName) ? 1 : 2 };
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
 	const envName = process.argv[2];
 	if (envName !== "production" && envName !== "canary") {
 		console.error("usage: resolve-deploy-host.mjs <production|canary>");
 		process.exit(1);
 	}
-	const src = readFileSync(WRANGLER_TOML, "utf8");
-	const host = resolveDeployHost(src, envName);
-	if (!host) process.exit(1);
-	process.stdout.write(host);
+	try {
+		let src = null;
+		try {
+			src = readFileSync(WRANGLER_TOML, "utf8");
+		} catch (err) {
+			if (err.code !== "ENOENT") throw err; // any OTHER read error is an unexpected crash below
+		}
+		const { host, exitCode } = resolveExitCode(src, envName);
+		if (host) process.stdout.write(host);
+		process.exit(exitCode);
+	} catch (err) {
+		// An unexpected crash (a parser bug, a permissions error reading wrangler.toml, etc.) is NOT
+		// the same state as "a route is declared but unresolved" (exit 1) — Node's default exit code
+		// for an uncaught exception is 1, which would silently conflate the two. Exit 3 is reserved
+		// for this distinct, genuinely-unexpected state.
+		console.error(`resolve-deploy-host.mjs crashed while resolving the deploy host: ${err.stack || err}`);
+		process.exit(3);
+	}
 }
