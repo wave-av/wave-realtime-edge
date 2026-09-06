@@ -134,6 +134,13 @@ export async function checkCfStreamHealth(env: CfStreamHealthEnv, deps: CfStream
 /**
  * Cron entrypoint. Best-effort and non-throwing by construction: this rides the same fifteen-minute tick as
  * the billing-adjacent sweeps, and an observability probe must never be able to take one of those down.
+ *
+ * NON-OVERLAPPING BY CONSTRUCTION, not by locking: the caller (scheduled.ts) only invokes this from the
+ * `!isSweepOnlyTick` branch, and `isSweepOnlyTick` is exactly the every-five-minute cron pattern — the SAME
+ * double-invocation hazard that #260 hit for the WHIP sweep (both the every-fifteen-minute and every-five-
+ * minute crons fire simultaneously at :00/:15/:30/:45) cannot recur here because the every-five-minute
+ * invocation never reaches this call at all. So the SUSTAIN_KEY read-increment-write above is never raced
+ * against a concurrent invocation of itself.
  */
 export function scheduledCfStreamHealth(env: CfStreamHealthEnv, ctx: ExecutionContext, kv?: CfStreamHealthKv): void {
 	ctx.waitUntil(
