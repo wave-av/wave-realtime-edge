@@ -119,6 +119,45 @@ export function resolveDeployHost(tomlSrc, envName) {
 	return resolveNamedEnvHost(tomlSrc, envName);
 }
 
+/** Pure: given the (already comment-stripped, trimmed) right-hand side of a `routes = ` /
+ *  `route = ` key on line `allLines[index]`, decide whether the value it introduces is EMPTY — a
+ *  same-line `[]` / `{}`, or a MULTILINE array/inline-table whose brackets contain nothing but
+ *  blank lines and comments before they close (e.g. `routes = [\n]`, a cosmetic reformat of
+ *  `routes = []` — the exact shape the old three-sentinel check
+ *  (`rhs !== "" && rhs !== "[]" && rhs !== "{}"`) could not see: its rhs was the bare, unbalanced
+ *  string `"["`, a fourth shape matching none of the three sentinels, so the key was misread as
+ *  non-empty ("declared"), turning canary's or production's legitimate exit-2 skip into a false
+ *  exit-1 fail-closed).
+ *
+ *  Tracks BRACKET DEPTH across as many continuation lines as it takes to close, so it is correct
+ *  regardless of how many lines the empty array/table is split across, not just one extra shape.
+ *  ANY non-bracket, non-whitespace content between the opening and closing bracket — on the key's
+ *  own line or a continuation line — counts as non-empty, matching how the `pattern = "..."`
+ *  regex in resolveProductionHost()/resolveNamedEnvHost() would find a real route inside that same
+ *  span. */
+function isRouteValueEmpty(rhs, allLines, index) {
+	const bracketDelta = (s) => {
+		let delta = 0;
+		for (const ch of s) {
+			if (ch === "[" || ch === "{") delta++;
+			else if (ch === "]" || ch === "}") delta--;
+		}
+		return delta;
+	};
+	const hasContent = (s) => s.replace(/[[\]{}]/g, "").trim() !== "";
+	if (hasContent(rhs)) return false; // real content already on the key's own line
+	let depth = bracketDelta(rhs);
+	if (depth <= 0) return true; // "[]" / "{}" / bare "" — already balanced (or never opened): empty
+	for (let i = index + 1; i < allLines.length; i++) {
+		const next = stripTrailingComment(allLines[i]).trim();
+		if (next === "") continue; // blank/fully-commented continuation line: keep looking
+		if (hasContent(next)) return false; // real content on a continuation line
+		depth += bracketDelta(next);
+		if (depth <= 0) return true; // closed with nothing but brackets/whitespace in between
+	}
+	return true; // ran off the end without closing — no content was ever found, so not "declared"
+}
+
 /** Pure: true if a `routes`/`route` key with a NON-EMPTY value is declared for `envName`'s OWN
  *  scope — the top-level (before the first `[table]`) for "production", or the `[env.<name>]`
  *  section (and its live subsections) for anything else. Scoped to match resolveDeployHost()'s
@@ -127,35 +166,35 @@ export function resolveDeployHost(tomlSrc, envName) {
  *  (exit 2, safe to skip) — collapsing the scope to a whole-file scan would wrongly read
  *  production's top-level route as "declared" while resolving canary, turning canary's
  *  deliberate `routes = []` (ROUTE ISOLATION, incident 2026-07-12) into a hard failure.
- *  An empty declaration (`routes = []`, `route = {}`, or a bare `routes =`/`route =` with nothing
- *  after it) counts as NOT declared — TOML's own way of saying "explicitly no route here", the
- *  same "nothing to verify" state as the key being absent entirely, not a parse regression. */
+ *  An empty declaration (`routes = []`, `route = {}`, a bare `routes =`/`route =` with nothing
+ *  after it, or the same split across multiple lines) counts as NOT declared — TOML's own way of
+ *  saying "explicitly no route here", the same "nothing to verify" state as the key being absent
+ *  entirely, not a parse regression; see isRouteValueEmpty() above for the multiline case this
+ *  used to get wrong. */
 export function hasDeclaredRoute(tomlSrc, envName) {
 	const lines = tomlSrc.split("\n");
-	// `line` here is ALREADY comment-stripped (via stripTrailingComment, applied by both loops
-	// below) so a trailing `# ...` on e.g. `routes = [] # no custom route` can never masquerade
-	// as part of the value and misclassify a deliberate empty declaration as non-empty
-	// (coderabbitai review, wave-realtime-edge#487).
-	const isRouteKeyLine = (line) => {
+	// `allLines`/`index` are threaded through so isRouteKeyLine() can look ahead across a multiline
+	// `routes = [ ... ]` value via isRouteValueEmpty() above.
+	const isRouteKeyLine = (allLines, index) => {
+		const line = stripTrailingComment(allLines[index]).trim();
 		const m = /^(routes|route)\s*=\s*(.*)$/.exec(line);
 		if (!m) return false;
-		const rhs = m[2].trim();
-		return rhs !== "" && rhs !== "[]" && rhs !== "{}";
+		return !isRouteValueEmpty(m[2].trim(), allLines, index);
 	};
 	if (envName === "production") {
-		for (const rawLine of lines) {
-			const line = stripTrailingComment(rawLine).trim();
+		for (let i = 0; i < lines.length; i++) {
+			const line = stripTrailingComment(lines[i]).trim();
 			if (line === "") continue;
 			if (line.startsWith("[")) break; // top-level keys are exhausted at the first table
-			if (isRouteKeyLine(line)) return true;
+			if (isRouteKeyLine(lines, i)) return true;
 		}
 		return false;
 	}
 	const sectionHeader = `[env.${envName}]`;
 	const subsectionPrefix = `[env.${envName}.`;
 	let inSection = false;
-	for (const rawLine of lines) {
-		const line = stripTrailingComment(rawLine).trim();
+	for (let i = 0; i < lines.length; i++) {
+		const line = stripTrailingComment(lines[i]).trim();
 		if (line === "") continue;
 		if (line === sectionHeader) {
 			inSection = true;
@@ -165,7 +204,7 @@ export function hasDeclaredRoute(tomlSrc, envName) {
 			inSection = line.startsWith(subsectionPrefix);
 			continue;
 		}
-		if (inSection && isRouteKeyLine(line)) return true;
+		if (inSection && isRouteKeyLine(lines, i)) return true;
 	}
 	return false;
 }

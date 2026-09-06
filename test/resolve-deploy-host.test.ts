@@ -8,6 +8,11 @@
  * purpose (incident 2026-07-12) — no custom-domain host to resolve there.
  */
 import { describe, it, expect } from "vitest";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, copyFileSync, realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve, join } from "node:path";
 import {
 	resolveDeployHost,
 	resolveProductionHost,
@@ -15,6 +20,9 @@ import {
 	hasDeclaredRoute,
 	resolveExitCode,
 } from "../scripts/ci/resolve-deploy-host.mjs";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const RESOLVER_PATH = resolve(__dirname, "../scripts/ci/resolve-deploy-host.mjs");
 
 describe("resolveProductionHost — top-level routes key", () => {
 	it("finds the top-level production route (this repo's actual shape)", () => {
@@ -190,6 +198,96 @@ routes = []
 `;
 		expect(hasDeclaredRoute(toml, "production")).toBe(false);
 		expect(hasDeclaredRoute(toml, "canary")).toBe(false);
+	});
+
+	// The old isRouteKeyLine compared the route key's OWN line against exactly three sentinels
+	// (`""`, `"[]"`, `"{}"`). A multiline-reformatted empty array — `routes = [\n]` — puts only `[`
+	// on the key's own line, so its rhs was the bare, unbalanced string `"["`: a fourth shape
+	// matching none of the three sentinels, so the key was misread as non-empty ("declared"),
+	// turning a legitimate exit-2 skip into a false exit-1 fail-closed. These cover every emptiness
+	// shape: single-line `[]`/`{}`, and the multiline case the old sentinel check could not see —
+	// both at the top level (production) and under `[env.canary]` — plus a genuinely populated
+	// multiline route, so the fix doesn't overcorrect into a false negative.
+
+	it("STATE 3 (nothing declared, exit 2): single-line empty `routes = []` at the top level", () => {
+		const toml = `routes = []\n`;
+		expect(hasDeclaredRoute(toml, "production")).toBe(false);
+		expect(resolveExitCode(toml, "production")).toEqual({ host: null, exitCode: 2 });
+	});
+
+	it("STATE 3 (nothing declared, exit 2): single-line empty `route = {}` under [env.canary]", () => {
+		const toml = `[env.canary]\nroute = {}\n`;
+		expect(hasDeclaredRoute(toml, "canary")).toBe(false);
+	});
+
+	it("STATE 3 (nothing declared, exit 2): MULTILINE empty `routes = [\\n]` at the top level — the exact false-positive this file fixes (old code read this as declared/exit 1)", () => {
+		const toml = `
+name = "wave-realtime-edge"
+routes = [
+]
+`;
+		expect(hasDeclaredRoute(toml, "production")).toBe(false);
+		expect(resolveExitCode(toml, "production")).toEqual({ host: null, exitCode: 2 });
+	});
+
+	it("STATE 3 (nothing declared, exit 2): MULTILINE empty `routes = [\\n]` under [env.canary]", () => {
+		const toml = `
+[env.canary]
+routes = [
+]
+`;
+		expect(hasDeclaredRoute(toml, "canary")).toBe(false);
+		expect(resolveExitCode(toml, "canary")).toEqual({ host: null, exitCode: 2 });
+	});
+
+	it("STATE 3 (nothing declared, exit 2): MULTILINE empty inline-table with a comment continuation line before the close", () => {
+		const toml = `
+[env.canary]
+route = {
+  # nothing here yet
+}
+`;
+		expect(hasDeclaredRoute(toml, "canary")).toBe(false);
+	});
+
+	it("STATE 1 (resolved, exit 0): a genuinely populated MULTILINE routes array under [env.canary] is declared — the fix must not turn every multiline array into a false negative", () => {
+		const toml = `
+[env.canary]
+routes = [
+  { pattern = "canary.rt.wave.online", custom_domain = true }
+]
+`;
+		expect(hasDeclaredRoute(toml, "canary")).toBe(true);
+		expect(resolveExitCode(toml, "canary")).toEqual({ host: "canary.rt.wave.online", exitCode: 0 });
+	});
+});
+
+// ── exit 3 (unexpected crash) — the CLI entrypoint's fourth state ──────────────────────────────
+//
+// resolveExitCode() itself never crashes (a pure function over a string or null); exit 3 is
+// reserved for the CLI block's own try/catch around readFileSync + resolveExitCode + process.exit.
+// This repo shipped the four-state contract with no test ever driving that path — spawn the
+// actual script as a subprocess against a wrangler.toml that fails to read for a reason OTHER
+// than ENOENT (here: the path is a directory, so readFileSync throws EISDIR) and assert it exits
+// 3, not 1.
+describe("CLI entrypoint — exit 3 on an unexpected (non-ENOENT) read failure", () => {
+	it("exits 3, not 1, when wrangler.toml exists but fails to read for a non-ENOENT reason", () => {
+		// realpathSync: on macOS, os.tmpdir() resolves through a symlink (/tmp -> /private/tmp); the
+		// resolver's own `import.meta.url === file://${process.argv[1]}` entrypoint guard compares
+		// against the SYMLINK-RESOLVED module URL, so an unresolved tmp path here would silently
+		// fail that guard, skip the whole CLI block, and exit 0 — never reaching the crash path.
+		const tmpRoot = realpathSync(mkdtempSync(join(tmpdir(), "resolve-deploy-host-exit3-")));
+		const scriptDir = join(tmpRoot, "scripts", "ci");
+		mkdirSync(scriptDir, { recursive: true });
+		const scriptCopy = join(scriptDir, "resolve-deploy-host.mjs");
+		copyFileSync(RESOLVER_PATH, scriptCopy);
+		// wrangler.toml as a DIRECTORY (not a file): readFileSync throws EISDIR, a non-ENOENT error
+		// the script must NOT swallow as "absent" (exit 2) — it must fall through to the crash path.
+		mkdirSync(join(tmpRoot, "wrangler.toml"));
+		const result = spawnSync(process.execPath, [scriptCopy, "production"], { encoding: "utf8" });
+		expect(result.status).toBe(3);
+		expect(result.stdout).toBe("");
+		expect(result.stderr).toMatch(/crashed while resolving the deploy host/);
 	});
 });
 
