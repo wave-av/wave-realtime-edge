@@ -1,0 +1,24 @@
+src/cf-stream-health-probe.ts
+  s_49793c5a9de056::t_eed43a16bb8e2c 105
+  s_49793c5a9de056::t_b43c1fea6f93d4 115-118,122
+test/cf-stream-health-probe.test.ts
+  s_49793c5a9de056::t_21b8ef0b31780c 135
+  s_49793c5a9de056::t_ca86dcccc45de7 149,162,165-188
+  s_49793c5a9de056::t_6eb1db2eb5f118 189
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "28b66605289ceb37031bf46b247faf613e7cf4f6",
+  "prompts": {},
+  "sessions": {
+    "s_49793c5a9de056": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d315ea56-91aa-4d81-9939-eac4eba83179",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Jake Fineman <jakefineman@gmail.com>"
+    }
+  }
+}
