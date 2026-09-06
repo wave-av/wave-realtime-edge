@@ -74,7 +74,11 @@ export async function checkCfStreamHealth(env: CfStreamHealthEnv, deps: CfStream
 			{ headers: { authorization: `Bearer ${env.CF_API_TOKEN}` } },
 		);
 		status = res.status;
-		ok = res.ok;
+		// CF wraps every reply in a `{success, errors, result}` envelope (same shape cf-stream-live-client.ts
+		// checks). A 2xx with `success:false` (auth/scoping regression, malformed request) is NOT healthy —
+		// trusting `res.ok` alone would clear the sustain streak on a response that is actually an error.
+		const body = (await res.json().catch(() => ({}))) as { success?: boolean };
+		ok = res.ok && body.success === true;
 	} catch (e) {
 		errorMessage = String((e as Error)?.message ?? e).slice(0, 160);
 	}
@@ -86,9 +90,26 @@ export async function checkCfStreamHealth(env: CfStreamHealthEnv, deps: CfStream
 		// this module exists to end.
 		log("cf-stream-health-probe-failed", { status: status ?? null, error: errorMessage ?? null, latencyMs });
 
-		const prior = deps.kv ? Number((await deps.kv.get(SUSTAIN_KEY)) ?? "0") : CF_STREAM_HEALTH_SUSTAIN_TICKS - 1;
-		const streak = (Number.isFinite(prior) ? prior : 0) + 1;
-		await deps.kv?.put(SUSTAIN_KEY, String(streak), { expirationTtl: SUSTAIN_TTL_S });
+		// KV get/put are wrapped in their OWN try/catch, separate from the fetch above: a KV outage/transient
+		// error must not reject checkCfStreamHealth and skip the alarm-decision log + the heartbeat below —
+		// that would recreate exactly the "probe ran but silently did nothing" blindness this module exists to
+		// end, just one layer down (a real Stream outage coinciding with a KV hiccup would go unrecorded).
+		// The NO-KV-bound branch (deps.kv undefined) always alarms on the very first unhealthy tick — with no
+		// persisted counter there is nothing TO accumulate, so it fails loud instead of silently under-counting.
+		// A KV ERROR while KV IS bound must degrade to that SAME fail-loud floor, not to something weaker: the
+		// prior version of this fallback merely reused the pre-increment seed (SUSTAIN_TICKS - 1, i.e. one shy
+		// of the threshold), which meant a REAL outage that coincided with a persistent KV failure (kv.get or
+		// kv.put rejecting on every tick) could never reach the alarm threshold at all — an outage silently
+		// never paging (cubic, PR #486). Force the streak to the threshold in the catch instead.
+		let streak = CF_STREAM_HEALTH_SUSTAIN_TICKS - 1;
+		try {
+			const prior = deps.kv ? Number((await deps.kv.get(SUSTAIN_KEY)) ?? "0") : streak;
+			streak = (Number.isFinite(prior) ? prior : 0) + 1;
+			await deps.kv?.put(SUSTAIN_KEY, String(streak), { expirationTtl: SUSTAIN_TTL_S });
+		} catch (e) {
+			streak = CF_STREAM_HEALTH_SUSTAIN_TICKS;
+			log("cf-stream-health-kv-error", { op: "sustain", error: String((e as Error)?.message ?? e).slice(0, 160) });
+		}
 
 		if (streak >= CF_STREAM_HEALTH_SUSTAIN_TICKS) {
 			alarmed = true;
@@ -96,8 +117,16 @@ export async function checkCfStreamHealth(env: CfStreamHealthEnv, deps: CfStream
 		}
 	} else {
 		// Any successful reading clears the streak, so a single transient blip cannot accumulate into a false
-		// alarm across separate outages.
-		if (deps.kv) await deps.kv.delete(SUSTAIN_KEY);
+		// alarm across separate outages. Same isolation as above: a KV error here must not suppress the
+		// heartbeat. If the delete itself fails (KV outage/transient error), the stale streak key is left in
+		// place — bounded by SUSTAIN_TTL_S (1h) above, so a recovery-time KV hiccup can cause at most one
+		// early alarm on the very next failure (never a permanently stuck alarm). `op: "delete"` on the log
+		// line disambiguates this recovery-path failure from the sustain-path one above.
+		try {
+			if (deps.kv) await deps.kv.delete(SUSTAIN_KEY);
+		} catch (e) {
+			log("cf-stream-health-kv-error", { op: "delete", error: String((e as Error)?.message ?? e).slice(0, 160) });
+		}
 	}
 
 	// HEARTBEAT — one line per tick, even when everything is fine, so "the probe never fired" and "the probe
@@ -111,6 +140,13 @@ export async function checkCfStreamHealth(env: CfStreamHealthEnv, deps: CfStream
 /**
  * Cron entrypoint. Best-effort and non-throwing by construction: this rides the same fifteen-minute tick as
  * the billing-adjacent sweeps, and an observability probe must never be able to take one of those down.
+ *
+ * NON-OVERLAPPING BY CONSTRUCTION, not by locking: the caller (scheduled.ts) only invokes this from the
+ * `!isSweepOnlyTick` branch, and `isSweepOnlyTick` is exactly the every-five-minute cron pattern — the SAME
+ * double-invocation hazard that #260 hit for the WHIP sweep (both the every-fifteen-minute and every-five-
+ * minute crons fire simultaneously at :00/:15/:30/:45) cannot recur here because the every-five-minute
+ * invocation never reaches this call at all. So the SUSTAIN_KEY read-increment-write above is never raced
+ * against a concurrent invocation of itself.
  */
 export function scheduledCfStreamHealth(env: CfStreamHealthEnv, ctx: ExecutionContext, kv?: CfStreamHealthKv): void {
 	ctx.waitUntil(

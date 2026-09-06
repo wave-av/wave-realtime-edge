@@ -19,8 +19,10 @@ function fakeKv(): CfStreamHealthKv {
 }
 
 const okEnv = { CF_API_TOKEN: "tok", CF_ACCOUNT_ID: "acct", CF_STREAM_HEALTH_PROBE_ENABLED: "1" };
-const fetchOk = () => vi.fn(async () => new Response(JSON.stringify({ result: [] }), { status: 200 })) as unknown as typeof fetch;
+const fetchOk = () => vi.fn(async () => new Response(JSON.stringify({ success: true, result: [] }), { status: 200 })) as unknown as typeof fetch;
 const fetchFailing = (status: number) => vi.fn(async () => new Response("nope", { status })) as unknown as typeof fetch;
+/** A 2xx reply whose CF envelope reports `success:false` — the "looks fine, isn't" case. */
+const fetchSuccessFalse = () => vi.fn(async () => new Response(JSON.stringify({ success: false, errors: [{ message: "nope" }] }), { status: 200 })) as unknown as typeof fetch;
 
 describe("checkCfStreamHealth — inertness", () => {
 	it("is INERT unless explicitly enabled", async () => {
@@ -108,6 +110,104 @@ describe("checkCfStreamHealth — sustain and alarm behavior", () => {
 		expect(log).toHaveBeenCalledWith(
 			"cf-stream-health-alarm",
 			expect.objectContaining({ status: 500, latencyMs: expect.any(Number) }),
+		);
+	});
+
+	it("treats a 2xx reply with success:false as UNHEALTHY, not a clean read", async () => {
+		const kv = fakeKv();
+		const log = vi.fn();
+		const r = await checkCfStreamHealth(okEnv, { fetch: fetchSuccessFalse(), kv, log });
+		expect(r).toMatchObject({ ok: false, status: 200 });
+		expect(log).toHaveBeenCalledWith("cf-stream-health-probe-failed", expect.objectContaining({ status: 200 }));
+	});
+});
+
+describe("checkCfStreamHealth — KV isolation", () => {
+	it("a rejected kv.get does not abort the probe — the failure log and heartbeat still fire", async () => {
+		const log = vi.fn();
+		const kv: CfStreamHealthKv = {
+			get: async () => { throw new Error("kv down"); },
+			put: async () => undefined,
+			delete: async () => undefined,
+		};
+		const r = await checkCfStreamHealth(okEnv, { fetch: fetchFailing(503), kv, log });
+		expect(r.ok).toBe(false);
+		// Regression guard for the cubic P1 finding on PR #486: a KV error while KV IS bound must fail
+		// loud (alarm immediately), matching the no-KV-bound branch's policy — not silently under-count.
+		expect(r.alarmed).toBe(true);
+		expect(log).toHaveBeenCalledWith("cf-stream-health-kv-error", expect.objectContaining({ op: "sustain", error: expect.stringContaining("kv down") }));
+		expect(log).toHaveBeenCalledWith("cf-stream-health-probe-failed", expect.anything());
+		expect(log).toHaveBeenCalledWith("cf-stream-health-tick", expect.objectContaining({ ok: false }));
+	});
+
+	it("a rejected kv.put does not abort the probe — the failure log and heartbeat still fire", async () => {
+		const log = vi.fn();
+		const kv: CfStreamHealthKv = {
+			get: async () => "0",
+			put: async () => { throw new Error("kv write down"); },
+			delete: async () => undefined,
+		};
+		const r = await checkCfStreamHealth(okEnv, { fetch: fetchFailing(503), kv, log });
+		expect(r.ok).toBe(false);
+		expect(r.alarmed).toBe(true);
+		expect(log).toHaveBeenCalledWith("cf-stream-health-kv-error", expect.objectContaining({ op: "sustain", error: expect.stringContaining("kv write down") }));
+		expect(log).toHaveBeenCalledWith("cf-stream-health-tick", expect.objectContaining({ ok: false }));
+	});
+
+	it("a real outage that coincides with a PERSISTENT kv.get failure still alarms on every tick (cubic P1, PR #486)", async () => {
+		// Before the fix, a KV error's fallback streak was seeded at SUSTAIN_TICKS - 1 (one shy of the
+		// alarm threshold) and never incremented past it while kv.get kept rejecting — so a real Stream
+		// outage that coincided with a persistent KV outage could NEVER alarm, across any number of ticks.
+		// Simulate three consecutive unhealthy ticks, each with a rejecting kv.get, and assert every one
+		// of them alarms (matches the no-KV-bound branch's fail-loud policy).
+		const log = vi.fn();
+		const kv: CfStreamHealthKv = {
+			get: async () => { throw new Error("kv down"); },
+			put: async () => undefined,
+			delete: async () => undefined,
+		};
+		for (let tick = 0; tick < 3; tick++) {
+			const r = await checkCfStreamHealth(okEnv, { fetch: fetchFailing(503), kv, log });
+			expect(r.ok).toBe(false);
+			expect(r.alarmed).toBe(true);
+		}
+	});
+
+	it("a rejected kv.delete does not abort the probe — the recovery is still logged", async () => {
+		const log = vi.fn();
+		const kv: CfStreamHealthKv = {
+			get: async () => "0",
+			put: async () => undefined,
+			delete: async () => { throw new Error("kv delete down"); },
+		};
+		const r = await checkCfStreamHealth(okEnv, { fetch: fetchOk(), kv, log });
+		expect(r.ok).toBe(true);
+		expect(log).toHaveBeenCalledWith("cf-stream-health-kv-error", expect.objectContaining({ op: "delete", error: expect.stringContaining("kv delete down") }));
+		expect(log).toHaveBeenCalledWith("cf-stream-health-tick", expect.objectContaining({ ok: true }));
+	});
+
+	it("a failed kv.delete leaves a stale streak that is bounded by SUSTAIN_TTL_S, not permanent", async () => {
+		// Regression guard for the codeant-ai finding on PR #486: if recovery's kv.delete() fails, the
+		// prior failure streak survives in KV (this is the whole point of the try/catch — the heartbeat
+		// must still fire). Assert the write that IS visible to us (the sustain put on the NEXT failure)
+		// still carries an expirationTtl, i.e. the module never persists an un-bounded/permanent key.
+		const log = vi.fn();
+		const store = new Map<string, string>([["cf-stream-health:consecutive-failures", "1"]]);
+		const put = vi.fn(async (k: string, v: string) => void store.set(k, v));
+		const kv: CfStreamHealthKv = {
+			get: async (k: string) => store.get(k) ?? null,
+			put,
+			delete: async () => undefined,
+		};
+		// A subsequent isolated failure (as if recovery's delete had failed on a prior tick and left "1"
+		// behind) reaches the sustain threshold (2) on this single failure rather than requiring two
+		// fresh consecutive ones — that is the documented, TTL-bounded trade-off, not an unbounded bug.
+		const r = await checkCfStreamHealth(okEnv, { fetch: fetchFailing(503), kv, log });
+		expect(r.alarmed).toBe(true);
+		expect(put).toHaveBeenCalledWith(
+			"cf-stream-health:consecutive-failures",
+			"2",
+			expect.objectContaining({ expirationTtl: expect.any(Number) }),
 		);
 	});
 });
