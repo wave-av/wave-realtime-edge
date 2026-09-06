@@ -46,18 +46,38 @@ import { dirname, resolve } from "node:path";
 const __dir = dirname(fileURLToPath(import.meta.url));
 export const WRANGLER_TOML = resolve(__dir, "../../wrangler.toml");
 
+/** Strip a trailing `# comment` from a TOML line, respecting simple double-quoted strings (a `#`
+ *  inside quotes is data, not a comment start). Not a full TOML parser — this repo's route lines
+ *  never contain an escaped quote or a `#` inside a pattern string, and this is only relied on to
+ *  keep the four-state discriminator (hasDeclaredRoute, below) from misreading `routes = [] # ...`
+ *  as a non-empty (declared) value (coderabbitai review, wave-realtime-edge#487). */
+function stripTrailingComment(line) {
+	let inQuotes = false;
+	for (let i = 0; i < line.length; i++) {
+		const ch = line[i];
+		if (ch === '"' && line[i - 1] !== "\\") inQuotes = !inQuotes;
+		else if (ch === "#" && !inQuotes) return line.slice(0, i);
+	}
+	return line;
+}
+
 /** Pure: given the raw wrangler.toml text, return the first TOP-LEVEL `routes[].pattern` (the
  *  production custom domain), or null if absent. Stops scanning at the first `[section]` header
  *  (top-level keys, by TOML convention, precede every table) so it can never match a `routes`
  *  key that appears inside e.g. `[env.canary]`. Skips `#`-comment lines — this file's own header
- *  above mentions "routes" in prose, and a naive scan of THIS file would otherwise self-match. */
+ *  above mentions "routes" in prose, and a naive scan of THIS file would otherwise self-match.
+ *  Scans for `pattern = "..."` on ANY top-level line (not requiring `routes =` on the SAME line)
+ *  so a multiline `routes = [\n  { pattern = "...", ... }\n]` array — the style used elsewhere in
+ *  this same file for `[env.<name>]` sections (see resolveNamedEnvHost below) — resolves here too;
+ *  a same-line-only match would let a merely-reformatted (not actually broken) production route
+ *  fail closed as "declared but unresolved" (coderabbitai review, wave-realtime-edge#487). */
 export function resolveProductionHost(tomlSrc) {
 	const lines = tomlSrc.split("\n");
 	for (const rawLine of lines) {
-		const line = rawLine.trim();
-		if (line.startsWith("#")) continue;
+		const line = stripTrailingComment(rawLine).trim();
+		if (line === "" || line.startsWith("#")) continue;
 		if (line.startsWith("[")) break; // reached the first table — top-level keys are exhausted
-		const m = /^routes\s*=\s*\[.*?pattern\s*=\s*"([^"/]+)/.exec(line);
+		const m = /pattern\s*=\s*"([^"/]+)/.exec(line);
 		if (m) return m[1];
 	}
 	return null;
@@ -112,6 +132,10 @@ export function resolveDeployHost(tomlSrc, envName) {
  *  same "nothing to verify" state as the key being absent entirely, not a parse regression. */
 export function hasDeclaredRoute(tomlSrc, envName) {
 	const lines = tomlSrc.split("\n");
+	// `line` here is ALREADY comment-stripped (via stripTrailingComment, applied by both loops
+	// below) so a trailing `# ...` on e.g. `routes = [] # no custom route` can never masquerade
+	// as part of the value and misclassify a deliberate empty declaration as non-empty
+	// (coderabbitai review, wave-realtime-edge#487).
 	const isRouteKeyLine = (line) => {
 		const m = /^(routes|route)\s*=\s*(.*)$/.exec(line);
 		if (!m) return false;
@@ -120,8 +144,8 @@ export function hasDeclaredRoute(tomlSrc, envName) {
 	};
 	if (envName === "production") {
 		for (const rawLine of lines) {
-			const line = rawLine.trim();
-			if (line.startsWith("#")) continue;
+			const line = stripTrailingComment(rawLine).trim();
+			if (line === "") continue;
 			if (line.startsWith("[")) break; // top-level keys are exhausted at the first table
 			if (isRouteKeyLine(line)) return true;
 		}
@@ -131,8 +155,8 @@ export function hasDeclaredRoute(tomlSrc, envName) {
 	const subsectionPrefix = `[env.${envName}.`;
 	let inSection = false;
 	for (const rawLine of lines) {
-		const line = rawLine.trim();
-		if (line.startsWith("#")) continue;
+		const line = stripTrailingComment(rawLine).trim();
+		if (line === "") continue;
 		if (line === sectionHeader) {
 			inSection = true;
 			continue;

@@ -52,6 +52,20 @@ routes = [{ pattern = "rt.wave.online", custom_domain = true }]
 		const toml = `name = "x"\n[vars]\nFOO = "bar"\n`;
 		expect(resolveProductionHost(toml)).toBeNull();
 	});
+
+	it("resolves a MULTILINE top-level routes array — a cosmetic reformat (not a config regression) must not fail closed (coderabbitai review, #487)", () => {
+		const toml = `
+routes = [
+  { pattern = "rt.wave.online", custom_domain = true }
+]
+`;
+		expect(resolveProductionHost(toml)).toBe("rt.wave.online");
+	});
+
+	it("ignores a trailing inline comment on the routes line", () => {
+		const toml = `routes = [{ pattern = "rt.wave.online", custom_domain = true }] # prod domain\n`;
+		expect(resolveProductionHost(toml)).toBe("rt.wave.online");
+	});
 });
 
 describe("resolveNamedEnvHost — [env.<name>] section (used for canary)", () => {
@@ -141,6 +155,30 @@ routes = [{ zone_name = "wave.online" }]
 `;
 		expect(resolveNamedEnvHost(toml, "canary")).toBeNull();
 		expect(hasDeclaredRoute(toml, "canary")).toBe(true);
+	});
+
+	it("STATE 1 (resolved, exit 0): a MULTILINE top-level routes array resolves AND counts as declared — a cosmetic reformat must not fail closed (coderabbitai review, #487: previously resolveProductionHost returned null for this shape while hasDeclaredRoute returned true, producing a false exit 1 on a valid production config)", () => {
+		const toml = `
+routes = [
+  { pattern = "rt.wave.online", custom_domain = true }
+]
+`;
+		expect(resolveProductionHost(toml)).toBe("rt.wave.online");
+		expect(resolveExitCode(toml, "production")).toEqual({ host: "rt.wave.online", exitCode: 0 });
+	});
+
+	it("STATE 3 (nothing declared, exit 2): a trailing inline comment on an empty routes declaration must NOT be misread as a non-empty value (coderabbitai review, #487: routes = [] # note previously counted as declared because the comment survived into the RHS comparison)", () => {
+		const toml = `routes = [] # no custom route\n`;
+		expect(hasDeclaredRoute(toml, "production")).toBe(false);
+		expect(resolveExitCode(toml, "production")).toEqual({ host: null, exitCode: 2 });
+	});
+
+	it("STATE 3 (nothing declared, exit 2): canary's routes = [] with a trailing comment is still an explicit empty declaration, not a regression", () => {
+		const toml = `
+[env.canary]
+routes = [] # ROUTE ISOLATION, see incident 2026-07-12
+`;
+		expect(hasDeclaredRoute(toml, "canary")).toBe(false);
 	});
 
 	it("ignores commented-out route mentions", () => {
