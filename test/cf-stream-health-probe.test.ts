@@ -132,6 +132,9 @@ describe("checkCfStreamHealth — KV isolation", () => {
 		};
 		const r = await checkCfStreamHealth(okEnv, { fetch: fetchFailing(503), kv, log });
 		expect(r.ok).toBe(false);
+		// Regression guard for the cubic P1 finding on PR #486: a KV error while KV IS bound must fail
+		// loud (alarm immediately), matching the no-KV-bound branch's policy — not silently under-count.
+		expect(r.alarmed).toBe(true);
 		expect(log).toHaveBeenCalledWith("cf-stream-health-kv-error", expect.objectContaining({ op: "sustain", error: expect.stringContaining("kv down") }));
 		expect(log).toHaveBeenCalledWith("cf-stream-health-probe-failed", expect.anything());
 		expect(log).toHaveBeenCalledWith("cf-stream-health-tick", expect.objectContaining({ ok: false }));
@@ -146,8 +149,28 @@ describe("checkCfStreamHealth — KV isolation", () => {
 		};
 		const r = await checkCfStreamHealth(okEnv, { fetch: fetchFailing(503), kv, log });
 		expect(r.ok).toBe(false);
+		expect(r.alarmed).toBe(true);
 		expect(log).toHaveBeenCalledWith("cf-stream-health-kv-error", expect.objectContaining({ op: "sustain", error: expect.stringContaining("kv write down") }));
 		expect(log).toHaveBeenCalledWith("cf-stream-health-tick", expect.objectContaining({ ok: false }));
+	});
+
+	it("a real outage that coincides with a PERSISTENT kv.get failure still alarms on every tick (cubic P1, PR #486)", async () => {
+		// Before the fix, a KV error's fallback streak was seeded at SUSTAIN_TICKS - 1 (one shy of the
+		// alarm threshold) and never incremented past it while kv.get kept rejecting — so a real Stream
+		// outage that coincided with a persistent KV outage could NEVER alarm, across any number of ticks.
+		// Simulate three consecutive unhealthy ticks, each with a rejecting kv.get, and assert every one
+		// of them alarms (matches the no-KV-bound branch's fail-loud policy).
+		const log = vi.fn();
+		const kv: CfStreamHealthKv = {
+			get: async () => { throw new Error("kv down"); },
+			put: async () => undefined,
+			delete: async () => undefined,
+		};
+		for (let tick = 0; tick < 3; tick++) {
+			const r = await checkCfStreamHealth(okEnv, { fetch: fetchFailing(503), kv, log });
+			expect(r.ok).toBe(false);
+			expect(r.alarmed).toBe(true);
+		}
 	});
 
 	it("a rejected kv.delete does not abort the probe — the recovery is still logged", async () => {

@@ -94,14 +94,20 @@ export async function checkCfStreamHealth(env: CfStreamHealthEnv, deps: CfStream
 		// error must not reject checkCfStreamHealth and skip the alarm-decision log + the heartbeat below —
 		// that would recreate exactly the "probe ran but silently did nothing" blindness this module exists to
 		// end, just one layer down (a real Stream outage coinciding with a KV hiccup would go unrecorded).
-		// On a KV error, fall back to the SAME streak the no-KV-bound branch already uses (SUSTAIN_TICKS - 1) —
-		// a KV blip degrades this tick to "as if no persistent counter were configured", not an instant alarm.
+		// The NO-KV-bound branch (deps.kv undefined) always alarms on the very first unhealthy tick — with no
+		// persisted counter there is nothing TO accumulate, so it fails loud instead of silently under-counting.
+		// A KV ERROR while KV IS bound must degrade to that SAME fail-loud floor, not to something weaker: the
+		// prior version of this fallback merely reused the pre-increment seed (SUSTAIN_TICKS - 1, i.e. one shy
+		// of the threshold), which meant a REAL outage that coincided with a persistent KV failure (kv.get or
+		// kv.put rejecting on every tick) could never reach the alarm threshold at all — an outage silently
+		// never paging (cubic, PR #486). Force the streak to the threshold in the catch instead.
 		let streak = CF_STREAM_HEALTH_SUSTAIN_TICKS - 1;
 		try {
 			const prior = deps.kv ? Number((await deps.kv.get(SUSTAIN_KEY)) ?? "0") : streak;
 			streak = (Number.isFinite(prior) ? prior : 0) + 1;
 			await deps.kv?.put(SUSTAIN_KEY, String(streak), { expirationTtl: SUSTAIN_TTL_S });
 		} catch (e) {
+			streak = CF_STREAM_HEALTH_SUSTAIN_TICKS;
 			log("cf-stream-health-kv-error", { op: "sustain", error: String((e as Error)?.message ?? e).slice(0, 160) });
 		}
 
