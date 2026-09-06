@@ -132,7 +132,7 @@ describe("checkCfStreamHealth — KV isolation", () => {
 		};
 		const r = await checkCfStreamHealth(okEnv, { fetch: fetchFailing(503), kv, log });
 		expect(r.ok).toBe(false);
-		expect(log).toHaveBeenCalledWith("cf-stream-health-kv-error", expect.objectContaining({ error: expect.stringContaining("kv down") }));
+		expect(log).toHaveBeenCalledWith("cf-stream-health-kv-error", expect.objectContaining({ op: "sustain", error: expect.stringContaining("kv down") }));
 		expect(log).toHaveBeenCalledWith("cf-stream-health-probe-failed", expect.anything());
 		expect(log).toHaveBeenCalledWith("cf-stream-health-tick", expect.objectContaining({ ok: false }));
 	});
@@ -146,7 +146,7 @@ describe("checkCfStreamHealth — KV isolation", () => {
 		};
 		const r = await checkCfStreamHealth(okEnv, { fetch: fetchFailing(503), kv, log });
 		expect(r.ok).toBe(false);
-		expect(log).toHaveBeenCalledWith("cf-stream-health-kv-error", expect.objectContaining({ error: expect.stringContaining("kv write down") }));
+		expect(log).toHaveBeenCalledWith("cf-stream-health-kv-error", expect.objectContaining({ op: "sustain", error: expect.stringContaining("kv write down") }));
 		expect(log).toHaveBeenCalledWith("cf-stream-health-tick", expect.objectContaining({ ok: false }));
 	});
 
@@ -159,7 +159,32 @@ describe("checkCfStreamHealth — KV isolation", () => {
 		};
 		const r = await checkCfStreamHealth(okEnv, { fetch: fetchOk(), kv, log });
 		expect(r.ok).toBe(true);
-		expect(log).toHaveBeenCalledWith("cf-stream-health-kv-error", expect.objectContaining({ error: expect.stringContaining("kv delete down") }));
+		expect(log).toHaveBeenCalledWith("cf-stream-health-kv-error", expect.objectContaining({ op: "delete", error: expect.stringContaining("kv delete down") }));
 		expect(log).toHaveBeenCalledWith("cf-stream-health-tick", expect.objectContaining({ ok: true }));
+	});
+
+	it("a failed kv.delete leaves a stale streak that is bounded by SUSTAIN_TTL_S, not permanent", async () => {
+		// Regression guard for the codeant-ai finding on PR #486: if recovery's kv.delete() fails, the
+		// prior failure streak survives in KV (this is the whole point of the try/catch — the heartbeat
+		// must still fire). Assert the write that IS visible to us (the sustain put on the NEXT failure)
+		// still carries an expirationTtl, i.e. the module never persists an un-bounded/permanent key.
+		const log = vi.fn();
+		const store = new Map<string, string>([["cf-stream-health:consecutive-failures", "1"]]);
+		const put = vi.fn(async (k: string, v: string) => void store.set(k, v));
+		const kv: CfStreamHealthKv = {
+			get: async (k: string) => store.get(k) ?? null,
+			put,
+			delete: async () => undefined,
+		};
+		// A subsequent isolated failure (as if recovery's delete had failed on a prior tick and left "1"
+		// behind) reaches the sustain threshold (2) on this single failure rather than requiring two
+		// fresh consecutive ones — that is the documented, TTL-bounded trade-off, not an unbounded bug.
+		const r = await checkCfStreamHealth(okEnv, { fetch: fetchFailing(503), kv, log });
+		expect(r.alarmed).toBe(true);
+		expect(put).toHaveBeenCalledWith(
+			"cf-stream-health:consecutive-failures",
+			"2",
+			expect.objectContaining({ expirationTtl: expect.any(Number) }),
+		);
 	});
 });

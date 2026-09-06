@@ -102,7 +102,7 @@ export async function checkCfStreamHealth(env: CfStreamHealthEnv, deps: CfStream
 			streak = (Number.isFinite(prior) ? prior : 0) + 1;
 			await deps.kv?.put(SUSTAIN_KEY, String(streak), { expirationTtl: SUSTAIN_TTL_S });
 		} catch (e) {
-			log("cf-stream-health-kv-error", { error: String((e as Error)?.message ?? e).slice(0, 160) });
+			log("cf-stream-health-kv-error", { op: "sustain", error: String((e as Error)?.message ?? e).slice(0, 160) });
 		}
 
 		if (streak >= CF_STREAM_HEALTH_SUSTAIN_TICKS) {
@@ -112,11 +112,14 @@ export async function checkCfStreamHealth(env: CfStreamHealthEnv, deps: CfStream
 	} else {
 		// Any successful reading clears the streak, so a single transient blip cannot accumulate into a false
 		// alarm across separate outages. Same isolation as above: a KV error here must not suppress the
-		// heartbeat.
+		// heartbeat. If the delete itself fails (KV outage/transient error), the stale streak key is left in
+		// place — bounded by SUSTAIN_TTL_S (1h) above, so a recovery-time KV hiccup can cause at most one
+		// early alarm on the very next failure (never a permanently stuck alarm). `op: "delete"` on the log
+		// line disambiguates this recovery-path failure from the sustain-path one above.
 		try {
 			if (deps.kv) await deps.kv.delete(SUSTAIN_KEY);
 		} catch (e) {
-			log("cf-stream-health-kv-error", { error: String((e as Error)?.message ?? e).slice(0, 160) });
+			log("cf-stream-health-kv-error", { op: "delete", error: String((e as Error)?.message ?? e).slice(0, 160) });
 		}
 	}
 
