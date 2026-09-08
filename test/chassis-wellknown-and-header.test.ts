@@ -117,12 +117,17 @@ describe("#490 — adopting the chassis header set does not break what this host
 
 	it("the served landing page carries NO executable inline <script> for script-src 'self' to break", async () => {
 		const html = await (await req("/")).text();
-		const tags = html.match(/<script[^>]*>/g) ?? [];
+		// Case-INSENSITIVE on purpose (CodeQL js/bad-tag-filter, caught on this very test): HTML tag
+		// names are case-insensitive, so a lower-case-only pattern would let an added `<SCRIPT>` slip
+		// past this guard — the test would stay green while the page silently broke, which is exactly
+		// the failure mode this block exists to catch. Same for the attribute tests below, and the
+		// ld+json `type` is matched with either quote style.
+		const tags = html.match(/<script[^>]*>/gi) ?? [];
 		expect(tags.length, "expected the shell's script tags to be present").toBeGreaterThan(0);
 		// Executable == neither an external src (permitted by 'self') nor an ld+json DATA block
 		// (browsers never execute it and CSP never gates it).
 		const executableInline = tags.filter(
-			(t) => !/\bsrc=/.test(t) && !/type\s*=\s*"application\/ld\+json"/.test(t),
+			(t) => !/\bsrc\s*=/i.test(t) && !/type\s*=\s*["']application\/ld\+json["']/i.test(t),
 		);
 		expect(
 			executableInline,
@@ -131,8 +136,8 @@ describe("#490 — adopting the chassis header set does not break what this host
 				"'sha256-…' from that same string at runtime, and admit exactly that hash in script-src.",
 		).toEqual([]);
 		// Every executable script must be same-origin, which `script-src 'self'` permits.
-		for (const t of tags.filter((x) => /\bsrc=/.test(x))) {
-			expect(t, `${t} must be a same-origin src`).toMatch(/src="\//);
+		for (const t of tags.filter((x) => /\bsrc\s*=/i.test(x))) {
+			expect(t, `${t} must be a same-origin src`).toMatch(/src\s*=\s*["']\//i);
 		}
 	});
 
@@ -153,8 +158,8 @@ describe("#490 — adopting the chassis header set does not break what this host
 		// does not gate them. Likewise the newly-added `permissions-policy: camera=(), microphone=()`
 		// is safe because no page this worker serves captures media — asserted, not assumed.
 		const html = await (await req("/")).text();
-		expect(/new WebSocket\(/.test(html), "page opens a browser WebSocket — re-check connect-src").toBe(false);
-		expect(/getUserMedia|mediaDevices/.test(html), "page captures media — re-check permissions-policy").toBe(false);
+		expect(/new\s+WebSocket\s*\(/i.test(html), "page opens a browser WebSocket — re-check connect-src").toBe(false);
+		expect(/getUserMedia|mediaDevices/i.test(html), "page captures media — re-check permissions-policy").toBe(false);
 	});
 });
 
