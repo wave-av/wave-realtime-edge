@@ -19,7 +19,7 @@
 // always carried the stamp — `/_wave/nav.js → 200 x-chassis 0.20.2` — which is why the fork, not
 // the chassis, is the defect. The test below asserts BOTH so the distinction stays proven.
 import { describe, it, expect } from "vitest";
-import { CHASSIS_VERSION } from "@wave-av/spoke-chassis";
+import { CHASSIS_VERSION, CHASSIS_CSP, DEFAULT_CSP } from "@wave-av/spoke-chassis";
 import { dispatch } from "../src/route-dispatch";
 
 const env = {} as import("../src/dispatch-helpers").Env;
@@ -97,6 +97,64 @@ describe("#490 defect B — the x-chassis version stamp is present and non-empty
 		expect(res.headers.get("permissions-policy")).toBeTruthy();
 		// The per-response cache decision must still win: SEC carries no cache-control.
 		expect(res.headers.get("cache-control")).toBe("public,max-age=3600");
+	});
+});
+
+describe("#490 — adopting the chassis header set does not break what this host serves", () => {
+	// HAZARD CLASS (hit by a sibling spoke on the same class of work): the canonical chassis CSP is
+	// `script-src 'self'`, so stamping the chassis header set onto a page that carries an INLINE
+	// <script> hardens the header and silently stops that script executing — the page still returns
+	// 200, nothing goes red, and no test notices. These assertions are the guard for this host.
+	//
+	// Why this swap is safe HERE, measured rather than assumed: at the pinned chassis the CSP is
+	// BYTE-IDENTICAL to the `DEFAULT_CSP` this worker already served, so the swap changes no CSP
+	// directive at all. The first assertion is a DRIFT ALARM — if a future chassis bump makes the two
+	// diverge, it fails and forces a re-check of the page against the new policy instead of shipping
+	// a silent breakage.
+	it("the chassis CSP is identical to the DEFAULT_CSP this worker already served (drift alarm)", () => {
+		expect(CHASSIS_CSP).toBe(DEFAULT_CSP);
+	});
+
+	it("the served landing page carries NO executable inline <script> for script-src 'self' to break", async () => {
+		const html = await (await req("/")).text();
+		const tags = html.match(/<script[^>]*>/g) ?? [];
+		expect(tags.length, "expected the shell's script tags to be present").toBeGreaterThan(0);
+		// Executable == neither an external src (permitted by 'self') nor an ld+json DATA block
+		// (browsers never execute it and CSP never gates it).
+		const executableInline = tags.filter(
+			(t) => !/\bsrc=/.test(t) && !/type\s*=\s*"application\/ld\+json"/.test(t),
+		);
+		expect(
+			executableInline,
+			"An inline <script> was added to a page served under `script-src 'self'`. It will NOT " +
+				"execute. Do not reach for 'unsafe-inline': hoist the script to a const, derive a " +
+				"'sha256-…' from that same string at runtime, and admit exactly that hash in script-src.",
+		).toEqual([]);
+		// Every executable script must be same-origin, which `script-src 'self'` permits.
+		for (const t of tags.filter((x) => /\bsrc=/.test(x))) {
+			expect(t, `${t} must be a same-origin src`).toMatch(/src="\//);
+		}
+	});
+
+	it("script-src stays 'self' while style-src KEEPS 'unsafe-inline' (the page has an inline <style>)", async () => {
+		const csp = (await req("/")).headers.get("content-security-policy") ?? "";
+		const directive = (name: string) =>
+			csp.split(";").map((s) => s.trim()).find((s) => s.startsWith(`${name} `)) ?? "";
+		// Scoped to script-src ON PURPOSE. `style-src 'unsafe-inline'` is canonical chassis CSP by
+		// design — the shell ships its CSS as an inline <style> — so an assertion forbidding
+		// 'unsafe-inline' anywhere would be wrong and would fail on correct code.
+		expect(directive("script-src")).toBe("script-src 'self'");
+		expect(directive("style-src")).toContain("'unsafe-inline'");
+	});
+
+	it("the page needs no extra connect-src: it opens no browser WebSocket and captures no media", async () => {
+		// rt's wss:// surfaces are ones CLIENTS dial against the API (and ones the Worker dials
+		// server-side); they are not fetches made BY this marketing page, so `connect-src 'self'`
+		// does not gate them. Likewise the newly-added `permissions-policy: camera=(), microphone=()`
+		// is safe because no page this worker serves captures media — asserted, not assumed.
+		const html = await (await req("/")).text();
+		expect(/new WebSocket\(/.test(html), "page opens a browser WebSocket — re-check connect-src").toBe(false);
+		expect(/getUserMedia|mediaDevices/.test(html), "page captures media — re-check permissions-policy").toBe(false);
 	});
 });
 
