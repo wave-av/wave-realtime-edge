@@ -39,9 +39,10 @@ describe("discovery routes — the paths that used to 501", () => {
 		expect(res.headers.get("content-type")).toContain("xml");
 		const body = await res.text();
 		expect(body).toContain("<loc>https://rt.wave.online/</loc>");
-		// /status and /transparency are chassis defaults rt does NOT serve — advertising them would be
-		// a fabricated sitemap. If rt ever serves them, add them to RT_SITEMAP_PATHS and this flips.
-		expect(body).not.toContain("/status");
+		// /status is now served (status-routes.ts, 2026-09-08) and belongs in the sitemap.
+		expect(body).toContain("<loc>https://rt.wave.online/status</loc>");
+		// /transparency is still a chassis default rt does NOT serve — advertising it would be a
+		// fabricated sitemap. If rt ever serves it, add it to RT_SITEMAP_PATHS and this flips.
 		expect(body).not.toContain("/transparency");
 	});
 

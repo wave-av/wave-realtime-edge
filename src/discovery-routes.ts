@@ -45,11 +45,12 @@ const headers = (contentType: string, cache = "public,max-age=3600"): Record<str
 });
 
 // ── /sitemap.xml ─────────────────────────────────────────────────────────────────────────────────
-// The chassis's DEFAULT_SITEMAP_PATHS is ["/", "/pricing", "/status", "/transparency"], but rt serves
-// NONE of the latter three (they still 501 — see SCOPE). Advertising a path this host does not serve
-// would be a fabricated sitemap, which is worse than a small one. rt has exactly ONE indexable HTML
-// page today, so that is exactly what the sitemap lists. Add a path here when rt serves it, not before.
-const RT_SITEMAP_PATHS = ["/"];
+// The chassis's DEFAULT_SITEMAP_PATHS is ["/", "/pricing", "/status", "/transparency"]. rt serves
+// "/" and, as of status-routes.ts (2026-09-08), "/status" too — /pricing and /transparency still 501
+// (see SCOPE) and stay OUT until this host actually serves them. Advertising a path this host does not
+// serve would be a fabricated sitemap, which is worse than a small one. Add a path here only after
+// confirming rt serves it, not before (test/discovery-routes.test.ts asserts the absent two).
+const RT_SITEMAP_PATHS = ["/", "/status"];
 
 // ── /.well-known/x402 ────────────────────────────────────────────────────────────────────────────
 // The payment-discovery document. GROUNDING — every route and every price below was measured, not
