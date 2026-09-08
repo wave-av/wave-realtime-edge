@@ -1,0 +1,27 @@
+test/chassis-wellknown-and-header.test.ts
+  s_4657dee555390b::t_095c0db3dfe639 1-12,15-125
+  s_4657dee555390b::t_da4714683d936a 13-14
+src/sec-headers.ts
+  s_4657dee555390b::t_aa654821dcf67e 3-4,6-12,17-19,21-26,28-46,55-57
+  s_4657dee555390b::t_83464bd98295c8 13-16
+  s_4657dee555390b::t_d40c1e47b07782 47-52,54
+src/chassis-passthrough.ts
+  s_4657dee555390b::t_1986b05f4babc2 105-122
+  s_4657dee555390b::t_355def4f9286f0 27-84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "1d2fadde9067990795309510deb2e3c85f9cb8e4",
+  "prompts": {},
+  "sessions": {
+    "s_4657dee555390b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c714314b-1edf-4e54-a112-2a97f2377df1",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jake Fineman <jakefineman@gmail.com>"
+    }
+  }
+}
