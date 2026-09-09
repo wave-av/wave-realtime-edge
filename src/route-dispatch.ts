@@ -53,6 +53,9 @@ import { maybeHandleAgentDiscovery } from "./agent-discovery";
 // Front-door + crawler/commerce surfaces: GET|HEAD "/" (the WOW landing, moved here 2026-09-03),
 // /robots.txt, /sitemap.xml, /favicon.{ico,svg}, /.well-known/x402 — all on the chassis header floor.
 import { maybeHandleDiscoveryRoutes } from "./discovery-routes";
+// /status, /feed.xml, /index.json (fleet-conformance sweep, 2026-09-08) — see status-routes.ts for
+// why these needed their own leaf module (rt's own /llms.txt already advertised them; they 501'd).
+import { maybeHandleStatusRoutes } from "./status-routes";
 // Env shape, route-match constants, and the auth/deps/sink plumbing — extracted to a leaf module (task #56) so
 // neither file exceeds 800 lines. dispatch-helpers.ts imports nothing from here (no cycle).
 import {
@@ -133,6 +136,12 @@ export async function dispatch(
 	// to the chassis below, which is the only thing that can serve those. Both seams stay live.
 	const discoveryFiles = maybeHandleDiscoveryRoutes(request, url.pathname);
 	if (discoveryFiles) return discoveryFiles;
+
+	// /status, /feed.xml, /index.json — same tier as above (must never reach the 501). See
+	// status-routes.ts for the grounding: these are the chassis's own bare defaults / a hand-built
+	// document, never a fabricated claim about a dependency this edge never checks.
+	const statusRoutes = maybeHandleStatusRoutes(request, url.pathname, env);
+	if (statusRoutes) return statusRoutes;
 
 	// Chassis passthrough (public GETs only, plus POST /_wave/e for the funnel beacon).
 	// See src/chassis-passthrough.ts for the full seam + audit receipt.

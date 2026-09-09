@@ -47,20 +47,26 @@ const chassis = makeFetch(landingPage, markSvg(ACCENT_HEX), {
 // page's own manifest 501'd.
 //
 // DELIBERATELY NOT CLAIMED (each already works, or is a decision this fix should not make):
-//   · /.well-known/x402, /.well-known/agent-card.json, /llms.txt, /skill.md — rt already serves these
-//     LOCALLY (discovery-routes.ts / agent-discovery.ts) with grounded, rt-specific bodies. The x402
-//     document in particular was hand-grounded against measured routes and prices and is served
-//     no-store; handing it to the generic chassis renderer would swap a verified price document for
-//     a derived one.
-//   · /status, /transparency, /pricing — rt does not serve them, and discovery-routes.ts deliberately
-//     keeps them OUT of RT_SITEMAP_PATHS on the grounds that advertising a path this host does not
-//     serve is a fabricated claim. The chassis's default /status would also report "operational"
-//     unconditionally, since rt passes no `opts.status` probe — an ungrounded health claim.
+//   · /.well-known/x402, /.well-known/agent-card.json, /llms.txt, /skill.md, /status, /index.json,
+//     /feed.xml — rt already serves these LOCALLY (discovery-routes.ts / agent-discovery.ts /
+//     status-routes.ts) with grounded, rt-specific bodies. The x402 document in particular was
+//     hand-grounded against measured routes and prices and is served no-store; /index.json is a
+//     hand-built document (NOT the chassis's stock `indexJson()`, which hard-codes /transparency and
+//     /openapi.json/pricing.json into every output — see status-routes.ts for why that would fabricate
+//     three new false promises). /status uses the chassis's OWN bare "edge alive, no dependency
+//     probed" default (verified live against a conforming peer — see status-routes.ts); it is served
+//     LOCALLY rather than via this passthrough so it can carry `env.GIT_SHA` as `version`, which the
+//     generic chassis renderer here has no access to. Handing any of these seven to the generic
+//     chassis renderer would swap a verified, rt-specific body for a derived one.
+//   · /transparency, /pricing — rt genuinely does not serve them (still 501, measured 2026-09-08), and
+//     discovery-routes.ts deliberately keeps /transparency OUT of RT_SITEMAP_PATHS (and status-routes.ts
+//     keeps it out of its hand-built /index.json) on the grounds that advertising a path this host does
+//     not serve is a fabricated claim. rt's own /llms.txt still names "Transparency" as a surface and
+//     that promise is ALSO still false — a real, separately-verified defect, but out of scope for the
+//     status/feed/index fix (tracked as a follow-up, not silently left inconsistent without this note).
 //   · /pricing.json, /openapi.json — commerce documents derived from `meta`. rt's priced surface went
 //     through a documented three-source grounding rule; a generated price document that never did is
 //     a billing-correctness risk, not a discovery fix.
-//   · /index.json, /feed.xml — content-index and Atom surfaces for a host with exactly one indexable
-//     page. Nothing to index; consistent with RT_SITEMAP_PATHS = ["/"].
 //   · /healthz — the chassis alias returns `{ok:true}`, while rt's own /health returns a richer body
 //     (service, layer, protocol, version, sha). A second liveness surface with a DIFFERENT shape is a
 //     monitoring decision for this host's owner, not something to slip into a discovery fix.
