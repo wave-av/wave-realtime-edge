@@ -8,6 +8,7 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- WHIP and WHEP resource PATCH/DELETE now require the caller org to match the resource owner. A request from another org is treated like an unknown resource (PATCH 404, DELETE 204 with no meter, KV, or upstream side effects), matching WHEP subscribe's tenant isolation.
 - `pr-agent` lane: fork-triggered `/` commands are now refused, and the AI
   call's budget fits inside its step. Three defects, one of them only visible
   once the first was fixed.

@@ -282,7 +282,13 @@ async function handlePublish(request: Request, env: WhipEnv, deps: WhipDeps, org
  * v1 is SFU-only: CF Realtime negotiates ICE end-to-end with the publisher, so an edge trickle PATCH is a
  * protocol-conformant ACK (204 No Content) — we validate the content-type and resource, and return 204.
  */
-async function handlePatch(request: Request, env: WhipEnv, _deps: WhipDeps, resourceId: string): Promise<Response> {
+async function handlePatch(
+	request: Request,
+	env: WhipEnv,
+	_deps: WhipDeps,
+	resourceId: string,
+	org: string,
+): Promise<Response> {
 	if (!RESOURCE_ID.test(resourceId)) {
 		return jsonError("WHIP_BAD_RESOURCE", "invalid WHIP resource id", 404);
 	}
@@ -295,7 +301,8 @@ async function handlePatch(request: Request, env: WhipEnv, _deps: WhipDeps, reso
 		);
 	}
 	const resource = await loadResource(env.RT_MEETING_ORG, resourceId);
-	if (!resource) {
+	// Same-org only: a foreign-org resource is indistinguishable from missing (no existence leak).
+	if (!resource || resource.org !== org) {
 		return jsonError("WHIP_RESOURCE_GONE", "no such WHIP resource", 404);
 	}
 	// 204 No Content — the trickle is accepted (SFU handles ICE end-to-end with the publisher).
@@ -306,13 +313,15 @@ async function handlePatch(request: Request, env: WhipEnv, _deps: WhipDeps, reso
  * DELETE /v1/whip/resource/{id} — teardown. Close the SFU session (best-effort), emit the teardown meter
  * (`wave_whip_ingest_minutes`, idempotency = resourceId, FAIL-OPEN), and clear the resource record. 204.
  */
-async function handleDelete(env: WhipEnv, deps: WhipDeps, resourceId: string): Promise<Response> {
+async function handleDelete(env: WhipEnv, deps: WhipDeps, resourceId: string, org: string): Promise<Response> {
 	if (!RESOURCE_ID.test(resourceId)) {
 		return jsonError("WHIP_BAD_RESOURCE", "invalid WHIP resource id", 404);
 	}
 	const resource = await loadResource(env.RT_MEETING_ORG, resourceId);
-	// Idempotent teardown: an unknown/already-torn-down resource is a clean 204 (no error), never a 404 storm.
-	if (!resource) return new Response(null, { status: 204 });
+	// Idempotent teardown: unknown, already-torn-down, OR a foreign-org id is a clean 204 with no
+	// side effects (no meter, no KV delete, no recorder finalize). Cross-org matches unknown so
+	// the caller cannot probe whether a resource id exists in another tenant.
+	if (!resource || resource.org !== org) return new Response(null, { status: 204 });
 
 	// Emit the duration meter for the publish session FIRST (fail-open) — before we drop the record, so the
 	// idempotency key (resourceId) and the org/startedAt are still in hand. A meter failure never blocks teardown.
@@ -367,8 +376,8 @@ export async function handleWhip(
 	const m = url.pathname.match(RESOURCE_ROUTE);
 	if (m) {
 		const resourceId = m[1];
-		if (request.method === "PATCH") return handlePatch(request, env, deps, resourceId);
-		if (request.method === "DELETE") return handleDelete(env, deps, resourceId);
+		if (request.method === "PATCH") return handlePatch(request, env, deps, resourceId, org);
+		if (request.method === "DELETE") return handleDelete(env, deps, resourceId, org);
 		return jsonError("WHIP_METHOD_NOT_ALLOWED", "WHIP resource accepts PATCH (trickle) or DELETE (teardown)", 405);
 	}
 

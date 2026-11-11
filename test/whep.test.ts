@@ -297,6 +297,42 @@ describe("handleWhep — PATCH/DELETE on the resource", () => {
 		expect(res!.status).toBe(204);
 		expect(meterCalls.length).toBe(0);
 	});
+
+	it("PATCH of a foreign-org resource is 404 (no Stream proxy, indistinguishable from missing)", async () => {
+		const { deps, relayCalls } = mockDeps();
+		const env = whepEnv();
+		await handleWhep(whepReq("POST", SUB, { "content-type": "application/sdp" }, OFFER_SDP), env, "org_A", deps);
+		const before = relayCalls.length;
+		const res = await handleWhep(
+			whepReq("PATCH", "/v1/whep/resource/wep00000001", { "content-type": "application/trickle-ice-sdpfrag" }, "a=candidate:..."),
+			env,
+			"org_B",
+			deps,
+		);
+		expect(res!.status).toBe(404);
+		expect(((await res!.json()) as { error: string }).error).toBe("WHEP_RESOURCE_GONE");
+		expect(relayCalls.filter((c) => c.method === "PATCH").length).toBe(0);
+		expect(relayCalls.length).toBe(before);
+	});
+
+	it("DELETE of a foreign-org resource is an idempotent 204 (no meter, no Stream DELETE, no KV delete)", async () => {
+		const { deps, meterCalls, relayCalls } = mockDeps();
+		const env = whepEnv({
+			GATEWAY_BASE_URL: "https://api.wave.online",
+			WAVE_SERVICE_TOKEN: "svc-token",
+		});
+		await handleWhep(whepReq("POST", SUB, { "content-type": "application/sdp" }, OFFER_SDP), env, "org_A", deps);
+		const kv = env.RT_MEETING_ORG as WhepKv & { store: Map<string, string> };
+		expect(kv.store.has("whep:wep00000001")).toBe(true);
+		const res = await handleWhep(whepReq("DELETE", "/v1/whep/resource/wep00000001"), env, "org_B", deps);
+		expect(res!.status).toBe(204);
+		expect(meterCalls.length).toBe(0);
+		expect(relayCalls.some((c) => c.method === "DELETE")).toBe(false);
+		expect(kv.store.has("whep:wep00000001")).toBe(true);
+		const owner = await handleWhep(whepReq("DELETE", "/v1/whep/resource/wep00000001"), env, "org_A", deps);
+		expect(owner!.status).toBe(204);
+		expect(kv.store.has("whep:wep00000001")).toBe(false);
+	});
 });
 
 describe("resolveStreamPlaybackUrl — template substitution + code fallback", () => {
