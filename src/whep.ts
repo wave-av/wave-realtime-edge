@@ -322,7 +322,13 @@ async function handleSubscribe(request: Request, env: WhepEnv, deps: WhepDeps, o
  * Proxies the trickle frag to the upstream Stream WHEP resource (best-effort), then returns the protocol-conformant
  * 204 ACK. (Stream negotiates ICE end-to-end; a relay failure never fails the trickle ack.)
  */
-async function handlePatch(request: Request, env: WhepEnv, deps: WhepDeps, resourceId: string): Promise<Response> {
+async function handlePatch(
+	request: Request,
+	env: WhepEnv,
+	deps: WhepDeps,
+	resourceId: string,
+	org: string,
+): Promise<Response> {
 	if (!RESOURCE_ID.test(resourceId)) {
 		return jsonError("WHEP_BAD_RESOURCE", "invalid WHEP resource id", 404);
 	}
@@ -335,7 +341,8 @@ async function handlePatch(request: Request, env: WhepEnv, deps: WhepDeps, resou
 		);
 	}
 	const resource = await loadResource(env.RT_MEETING_ORG, resourceId);
-	if (!resource) {
+	// Same-org only: a foreign-org resource is indistinguishable from missing (no existence leak).
+	if (!resource || resource.org !== org) {
 		return jsonError("WHEP_RESOURCE_GONE", "no such WHEP resource", 404);
 	}
 	// Proxy the trickle frag to the Stream WHEP resource (best-effort, fail-open). The 204 ACK is the trickle
@@ -360,13 +367,15 @@ async function handlePatch(request: Request, env: WhepEnv, deps: WhepDeps, resou
  * idempotency = resourceId, FAIL-OPEN), proxy a DELETE to the upstream Stream WHEP resource (best-effort), and
  * clear the resource record. 204.
  */
-async function handleDelete(env: WhepEnv, deps: WhepDeps, resourceId: string): Promise<Response> {
+async function handleDelete(env: WhepEnv, deps: WhepDeps, resourceId: string, org: string): Promise<Response> {
 	if (!RESOURCE_ID.test(resourceId)) {
 		return jsonError("WHEP_BAD_RESOURCE", "invalid WHEP resource id", 404);
 	}
 	const resource = await loadResource(env.RT_MEETING_ORG, resourceId);
-	// Idempotent teardown: an unknown/already-torn-down resource is a clean 204 (no error), never a 404 storm.
-	if (!resource) return new Response(null, { status: 204 });
+	// Idempotent teardown: unknown, already-torn-down, OR a foreign-org id is a clean 204 with no
+	// side effects (no meter, no upstream DELETE, no KV delete). Cross-org matches unknown so the
+	// caller cannot probe whether a resource id exists in another tenant.
+	if (!resource || resource.org !== org) return new Response(null, { status: 204 });
 
 	// Emit the duration meter for the subscribe session FIRST (fail-open) — before we drop the record, so the
 	// idempotency key (resourceId) and the org/startedAt are still in hand. A meter failure never blocks teardown.
@@ -421,8 +430,8 @@ export async function handleWhep(
 	const m = url.pathname.match(RESOURCE_ROUTE);
 	if (m) {
 		const resourceId = m[1];
-		if (request.method === "PATCH") return handlePatch(request, env, deps, resourceId);
-		if (request.method === "DELETE") return handleDelete(env, deps, resourceId);
+		if (request.method === "PATCH") return handlePatch(request, env, deps, resourceId, org);
+		if (request.method === "DELETE") return handleDelete(env, deps, resourceId, org);
 		return jsonError("WHEP_METHOD_NOT_ALLOWED", "WHEP resource accepts PATCH (trickle) or DELETE (teardown)", 405);
 	}
 
