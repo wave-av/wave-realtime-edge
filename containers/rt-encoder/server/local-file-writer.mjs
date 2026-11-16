@@ -12,7 +12,7 @@
 
 import { createWriteStream } from "node:fs";
 import { mkdir, unlink } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve, relative, sep, isAbsolute } from "node:path";
 
 const EBML_MAGIC = [0x1a, 0x45, 0xdf, 0xa3]; // Matroska/WebM DocType header → the .webm extension
 
@@ -45,7 +45,13 @@ export class LocalFileWriter {
     if (this.closed || part.length === 0) return;
     if (!this.stream) {
       const ext = extFor(part);
-      this.path = join(this.dir, this.session.org, "realtime-recordings", this.session.sessionId, `recording.${ext}`);
+      const baseFull = resolve(this.dir);
+      const target = join(baseFull, this.session.org, "realtime-recordings", this.session.sessionId, `recording.${ext}`);
+      const rel = relative(baseFull, target);
+      if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+        throw new Error("Invalid file path");
+      }
+      this.path = target;
       await mkdir(dirname(this.path), { recursive: true });
       this.stream = createWriteStream(this.path);
     }
